@@ -13,6 +13,8 @@
 
 ## Что понадобится
 
+- `ffmpeg` в PATH — из него демон делает кадры-превью для гифок и видео; без него в контексте останутся пометки «preview unavailable».
+
 - Rust (stable, `cargo`) и Node.js — для сборки и `node --check`.
 - `omo` в `PATH` (пакет `omo-ai`): демон поднимает им хост-сессию бота.
 - Токен бота от [@BotFather](https://t.me/BotFather).

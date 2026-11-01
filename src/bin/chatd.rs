@@ -981,6 +981,12 @@ async fn track_loop(
 }
 
 async fn cmd_run() -> Result<()> {
+    // Fail fast on missing required config, BEFORE any network call: a daemon
+    // without a chat id starts, logs, and silently drops every incoming
+    // message — the "looks healthy but deaf" failure this extraction exists to
+    // avoid. required_cfg names the variable in the error.
+    required_cfg("CHATBOT_TOKEN_FILE")?;
+    required_cfg("CHATBOT_CHAT_ID")?;
     let state = state_dir();
     // The database thread starts before any unit needs it; a broken database
     // fails here, visibly, instead of inside the worker.
@@ -1101,7 +1107,15 @@ async fn ingest_loop(
                 // Contract: every await (media download, ffmpeg preview) happens
                 // BEFORE the database closure; the closure receives a finished
                 // packet and does dedup+insert+prune atomically.
-                let prep = prepare_message(&msg, &st, strict).await.ok().flatten();
+                let prep = match prepare_message(&msg, &st, strict).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Never swallow this: a config/IO failure here means the
+                        // message is lost, and silence would hide it.
+                        dlog(&format!("prepare message failed: {e:#}"));
+                        None
+                    }
+                };
                 let out = match prep {
                     Some(prep) => {
                         let st2 = st.clone();

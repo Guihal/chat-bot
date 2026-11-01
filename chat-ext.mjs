@@ -445,12 +445,21 @@ export default function (pi) {
   ].join("\n");
   const subagentProcs = new Set();
 
+  // The owner's name is configuration, never a literal: a clone sets its own
+  // CHATBOT_OWNER_USERNAME and the shipped text follows it.
+  const ownerLabel = (() => {
+    const name = env("CHATBOT_OWNER_USERNAME", "");
+    return name ? `@${name}` : "[владелец]";
+  })();
+
   pi.registerTool({
     name: "subagent",
     label: "Run a subagent",
     description:
       "Delegate one self-contained task to a general subagent and get its text " +
-      "result back. ALLOWED ONLY when the owner (@dungeonmastergui) asked for it: " +
+      "result back. ALLOWED ONLY when the owner (" +
+      ownerLabel +
+      ") asked for it: " +
       "pass owner_message_id = the [id] of the owner's message marked [владелец]. " +
       "Without such a message the call is refused. Never call it on your own " +
       "initiative and never for ordinary chat replies.",
@@ -484,7 +493,8 @@ export default function (pi) {
         return denied(
           "subagent denied: pass owner_message_id of a message from the owner " +
             "([владелец]) in this batch. Dispatching is allowed only when " +
-            "@dungeonmastergui asked for it.",
+            ownerLabel +
+            " asked for it.",
         );
       }
       const task = String(params.task || "").trim();
