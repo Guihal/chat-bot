@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "tg-chat": {
+      "command": "__CODE_DIR__/target/release/tg-chat",
+      "env": {
+        "CHATBOT_STATE_DIR": "__STATE_DIR__",
+        "CHATBOT_CHAT_ID": "__CHAT_ID__",
+        "CHATBOT_TOKEN_FILE": "__TOKEN_FILE__"
+      }
+    }
+  }
+}

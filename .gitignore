@@ -1,0 +1,10 @@
+/target/
+/state/
+/portraits/
+/chat-summary.md
+*.env
+sent-receipts.json
+history.db
+*.log
+*.log.*
+.DS_Store

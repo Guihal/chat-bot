@@ -1,0 +1,8 @@
+{
+  "defaultThinkingLevel": "low",
+  "disabledBuiltinExtensions": ["ttsr"],
+  "todo": {
+    "firstTurnPlan": "off",
+    "turnEndBackstop": false
+  }
+}

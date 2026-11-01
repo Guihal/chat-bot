@@ -1,0 +1,22 @@
+[Unit]
+# Template for running the daemon under systemd. Adjust WorkingDirectory and
+# ExecStart to the absolute path of YOUR checkout, then:
+#   sudo cp deploy/chat-bot.service /etc/systemd/system/chat-bot.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now chat-bot.service
+# The env file holds every CHATBOT_* value (see deploy/chat-bot.env.example) and
+# must not be world-readable.
+Description=Telegram chat-bot daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/chat-bot
+EnvironmentFile=/etc/chat-bot/chat-bot.env
+ExecStart=/opt/chat-bot/target/release/chatd run
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
