@@ -1092,6 +1092,22 @@ fn ext_source() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("chat-ext.mjs")
 }
 
+/// Staged next to the launch spec and loaded by the same host as chat-ext.mjs.
+const PHASE_STRIP_FILE: &str = "muse-spark-phase-strip.ts";
+
+fn phase_strip_source() -> PathBuf {
+    for base in [cfg("CHATBOT_CWD", ""), ".".to_string()] {
+        if base.is_empty() {
+            continue;
+        }
+        let p = Path::new(&base).join(PHASE_STRIP_FILE);
+        if p.exists() {
+            return p;
+        }
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(PHASE_STRIP_FILE)
+}
+
 pub fn write_launch_spec(state: &str, include_ext: bool) -> Result<PathBuf> {
     let state_path = Path::new(state);
     std::fs::create_dir_all(state_path)?;
@@ -1100,10 +1116,18 @@ pub fn write_launch_spec(state: &str, include_ext: bool) -> Result<PathBuf> {
         let src = std::fs::read(&src_path)
             .with_context(|| format!("chat-ext.mjs read: {}", src_path.display()))?;
         std::fs::write(state_path.join("chat-ext.mjs"), src)?;
+        // The phase-strip extension ships with the bot so the muse-spark
+        // provider no longer dead-ends on a replayed `phase` marker. Launch-spec
+        // extension paths must resolve inside the spec dir, hence the copy.
+        let strip_path = phase_strip_source();
+        let strip = std::fs::read(&strip_path)
+            .with_context(|| format!("muse-spark-phase-strip.ts read: {}", strip_path.display()))?;
+        std::fs::write(state_path.join(PHASE_STRIP_FILE), strip)?;
     }
     let mut exts = vec![];
     if include_ext {
         exts.push("./chat-ext.mjs".to_string());
+        exts.push(format!("./{PHASE_STRIP_FILE}"));
     }
     let mut spec = json!({
         "spec_version": 1,
