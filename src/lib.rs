@@ -1105,7 +1105,7 @@ pub fn write_launch_spec(state: &str, include_ext: bool) -> Result<PathBuf> {
     if include_ext {
         exts.push("./chat-ext.mjs".to_string());
     }
-    let spec = json!({
+    let mut spec = json!({
         "spec_version": 1,
         "core": {"session_runtime": "in-process", "multi_session": true, "extensions": exts},
         "env": {
@@ -1115,6 +1115,18 @@ pub fn write_launch_spec(state: &str, include_ext: bool) -> Result<PathBuf> {
             "OMO_CHATBOT_API_BASE": api_base(),
         },
     });
+    // A persistent host never idle-exits, which is what keeps the bot alive
+    // between messages — but the summary host uses a scratch socket and is
+    // closed after summarize, so making IT persistent would strand a whole
+    // supervisor+child pair at an unreachable path. Only the chat host gets it.
+    if include_ext {
+        if let Some(env) = spec.get_mut("env").and_then(|e| e.as_object_mut()) {
+            env.insert(
+                "SENPI_RPC_HOST_COLD_START".to_string(),
+                json!("persistent"),
+            );
+        }
+    }
     let spec_path = state_path.join(if include_ext { "launch-spec.json" } else { "launch-spec-summary.json" });
     std::fs::write(&spec_path, serde_json::to_string(&spec)?)?;
     Ok(spec_path)
@@ -1134,6 +1146,10 @@ pub async fn ensure_host_on(state: &str, include_ext: bool, sock: &str) -> Resul
         std::fs::create_dir_all(dir)?;
     }
     let agent_dir = cfg("CHATBOT_AGENT_DIR", "");
+    // Whether a host was already serving this socket decides whether the ensure
+    // spawns a NEW generation (which loads the staged extension) or merely
+    // reuses a live one (which keeps the extension it was spawned with).
+    let pre_alive = host_alive();
     let mut cmd = tokio::process::Command::new("omo");
     cmd.arg("host").arg("ensure").arg("--launch-spec").arg(&spec_path).arg("--socket").arg(&sock);
     if !agent_dir.is_empty() {
@@ -1149,7 +1165,57 @@ pub async fn ensure_host_on(state: &str, include_ext: bool, sock: &str) -> Resul
             String::from_utf8_lossy(&out.stderr).trim().chars().rev().take(200).collect::<String>()
         ));
     }
+    if include_ext && !pre_alive {
+        // Only a fresh generation runs the staged file. Recording the hash after
+        // a REUSE would claim the new code is live while the old extension keeps
+        // serving — that false match is exactly what the reload guard must not
+        // believe.
+        if let Ok(h) = ext_hash() {
+            store_host_ext_hash(state, &h);
+        }
+    }
     Ok(spec_path)
+}
+
+/// Hash of the extension source that a launch spec stages.
+pub fn ext_hash() -> Result<String> {
+    let src = std::fs::read(ext_source())?;
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(&src);
+    Ok(format!("{:x}", h.finalize())[..16].to_string())
+}
+
+pub fn stored_host_ext_hash(state: &str) -> Option<String> {
+    std::fs::read_to_string(Path::new(state).join("host-ext.sha"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+pub fn store_host_ext_hash(state: &str, hash: &str) {
+    let _ = std::fs::write(Path::new(state).join("host-ext.sha"), hash);
+}
+
+/// Stop the host that owns `sock`. Needed because a live host keeps the
+/// extension it was spawned with: with the idle exit gone, nothing else would
+/// ever reload a changed chat-ext.mjs.
+pub async fn stop_host_on(sock: &str) -> Result<()> {
+    let out = tokio::process::Command::new("omo")
+        .arg("host")
+        .arg("stop")
+        .arg("--force")
+        .arg("--socket")
+        .arg(sock)
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "omo host stop: rc={} {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim().chars().rev().take(200).collect::<String>()
+        ));
+    }
+    Ok(())
 }
 
 pub async fn ensure_host(state: &str) -> Result<PathBuf> {

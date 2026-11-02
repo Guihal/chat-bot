@@ -214,8 +214,36 @@ async fn admit_loop(
         &mut inbound_rx,
     )
     .await;
+    // The host process dies on its own (observed 2026-11-02: ``extension
+    // disconnected`` at 12:24:33, and the missing socket was noticed only at
+    // 12:33:28, when a message arrived — nine minutes of a mute bot). The host
+    // is now persistent (no idle SIGTERM), so this tick is the CRASH fallback:
+    // it re-ensures a genuinely dead host before the next delivery.
+    let watch_secs: u64 = cfg("CHATBOT_HOST_WATCH_SEC", "15").parse().unwrap_or(15);
+    let mut host_tick = tokio::time::interval(Duration::from_secs(watch_secs.max(5)));
+    host_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = host_tick.tick() => {
+                if !host_alive() {
+                    dlog(&format!(
+                        "host watchdog: socket missing ({}), re-ensuring host",
+                        host_socket()
+                    ));
+                    match ensure_session(&system_path, Some(&ref_)).await {
+                        Ok(s) => {
+                            // No settle here: a freshly ensured idle session never
+                            // emits turn_end, so waiting for one would hold the
+                            // only admit loop (and any queued message) for the
+                            // whole budget. Delivery paths settle when they
+                            // actually opened a turn.
+                            dlog(&format!("host watchdog: host re-ensured, session {s}"));
+                            sid = Some(s);
+                        }
+                        Err(e) => dlog(&format!("host watchdog: re-ensure failed: {e:#}")),
+                    }
+                }
+            }
             job = jobs.recv() => match job {
                 Some(job) => {
                     let res = admit_job(&db, &state, &mut sid, &system_path, &ref_, &admitted_tx, &inboxed_tx, &out_tx, &mut inbound_rx, job).await;
@@ -1002,6 +1030,23 @@ async fn cmd_run() -> Result<()> {
     required_cfg("CHATBOT_TOKEN_FILE")?;
     required_cfg("CHATBOT_CHAT_ID")?;
     let state = state_dir();
+    // A live host keeps the extension it was spawned with, and the 15-minute
+    // idle exit that used to reload it implicitly is gone (the host is now
+    // persistent). So restart the generation whenever the staged extension
+    // differs from the one the running host was started with; otherwise a
+    // deploy would keep serving stale tool code silently.
+    if host_alive() {
+        match ext_hash() {
+            Ok(cur) if stored_host_ext_hash(&state).as_deref() != Some(cur.as_str()) => {
+                dlog("extension changed since the host started; restarting host generation");
+                if let Err(e) = stop_host_on(&host_socket()).await {
+                    dlog(&format!("host stop failed: {e:#}"));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => dlog(&format!("extension hash failed: {e:#}")),
+        }
+    }
     // The database thread starts before any unit needs it; a broken database
     // fails here, visibly, instead of inside the worker.
     let db = Db::open(&state)?;
