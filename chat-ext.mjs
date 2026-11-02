@@ -749,9 +749,15 @@ export default function (pi) {
   let controlBuf = "";
   let controlRetry = null;
   let controlAttempt = 0;
+  // A session replacement/reload leaves this extension instance with a stale
+  // ctx: every admit then throws StaleExtensionContextError. Such an instance
+  // is dead for delivery, so it must STOP answering and release the socket —
+  // the live instance (it gets its own session_start) then becomes the one the
+  // daemon serves. Re-armed only by a fresh session_start.
+  let controlDead = false;
 
   function connectControl() {
-    if (controlSock || controlRetry) return;
+    if (controlSock || controlRetry || controlDead) return;
     const sock = net.connect({ path: controlSockPath });
     sock.setEncoding("utf8");
     sock.on("connect", () => {
@@ -918,17 +924,31 @@ export default function (pi) {
       reportDeliveryStates();
       return res.kind;
     } catch (e) {
+      const text = String(e);
+      const stale =
+        text.includes("StaleExtensionContextError") ||
+        text.includes("stale after session replacement");
       emit({
         kind: "admit_error",
         delivery_id: deliveryId,
-        error: String(e).slice(0, 200),
+        stale,
+        error: text.slice(0, 200),
       });
+      if (stale) {
+        // This instance can never admit again: disconnect and stay quiet so a
+        // live instance can take the socket. The daemon retries the batch.
+        controlDead = true;
+        emit({ kind: "control_stale", delivery_id: deliveryId });
+        closeControl();
+      }
       return "error";
     }
   }
 
   connectControl();
   pi.on("session_start", () => {
+    // A fresh session may re-bind this instance: it is usable again.
+    controlDead = false;
     connectControl();
   });
 }
