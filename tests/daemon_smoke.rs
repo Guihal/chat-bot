@@ -122,17 +122,28 @@ fn seed_mirror(state: &str) {
     kv_set(&con, "self_id", "550001").unwrap();
     kv_set(&con, "self_username", "smokebot").unwrap();
     con.execute(
-        "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id) VALUES(7,4800,1700000000,556,'smoker','Smoke','seeded gif caption',NULL,'','gif_seed_file','gif_seed_unique')",
+        "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind) VALUES(7,4800,1700000000,556,'smoker','Smoke','seeded gif caption',NULL,'','gif_seed_file','gif_seed_unique','animation')",
+        [],
+    )
+    .unwrap();
+    // Same shape, different Telegram kind: a video with a file_id must never
+    // reach the gif catalog (crystal M1: gifs and videos are not the same).
+    con.execute(
+        "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind) VALUES(8,4801,1700000100,556,'smoker','Smoke','seeded video caption',NULL,'','video_seed_file','video_seed_unique','video')",
         [],
     )
     .unwrap();
 }
 
 fn start_daemon(api_base: &str) -> Daemon {
+    // Tests in this file run in parallel: a per-process counter keeps their
+    // state dirs distinct (a wall-clock/elapsed stamp collided and the two
+    // daemons shared one sqlite file).
+    static SMOKE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "chatd-smoke-{}-{}",
         std::process::id(),
-        Instant::now().elapsed().as_nanos()
+        SMOKE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -222,6 +233,28 @@ fn wait_ready(daemon: &Daemon) {
     panic!("daemon did not open {} in time", daemon.sock.display());
 }
 
+fn chatd_log_tail(daemon: &Daemon) -> String {
+    let body = std::fs::read_to_string(Path::new(&daemon.state).join("chatd.log"))
+        .unwrap_or_default();
+    let tail: Vec<char> = body.chars().rev().take(2500).collect();
+    tail.into_iter().rev().collect()
+}
+
+fn open_control_stream(sock: &Path, wait: Duration) -> UnixStream {
+    let deadline = Instant::now() + wait;
+    loop {
+        match UnixStream::connect(sock) {
+            Ok(s) => return s,
+            Err(e) => {
+                if Instant::now() > deadline {
+                    panic!("connect control socket: {e}");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 fn row_count_with_text(daemon: &Daemon, text: &str) -> i64 {
     let con = rusqlite::Connection::open(Path::new(&daemon.state).join("history.db")).unwrap();
     con.query_row(
@@ -264,6 +297,10 @@ fn daemon_serves_control_calls_and_ingests() {
     assert!(
         text.contains("gif_seed_file") && text.contains("seeded gif caption"),
         "gif_list returned: {text}"
+    );
+    assert!(
+        !text.contains("video_seed_file") && !text.contains("seeded video caption"),
+        "a video leaked into the gif registry: {text}"
     );
     assert!(elapsed < Duration::from_secs(5), "gif_list took {elapsed:?}");
 
@@ -326,4 +363,95 @@ fn daemon_serves_control_calls_and_ingests() {
         1,
         "120-second dedup window no longer collapses the duplicate"
     );
+}
+
+/// The control frame is the contract between the daemon and the extension:
+/// `batch_ids` is what makes an out-of-batch `reply_to` refusable, and the batch
+/// text must show the nearest parent's text (crystal M1: replies are rendered
+/// "ответ на такое-то сообщение", one hop only).
+#[test]
+fn push_frame_carries_batch_ids_and_reply_parent() {
+    let api = start_fake_api();
+    let daemon = start_daemon(&api.base);
+    wait_ready(&daemon);
+    // Be the connected extension BEFORE the batch flushes: the daemon writes the
+    // push to whoever holds the control socket.
+    let stream = open_control_stream(&daemon.sock, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    // The admit unit waits for the previous run to settle before serving jobs
+    // (a real extension emits this on turn_end). Without it the first batch
+    // would sit behind a 180 s boot settle; a settled turn is what the harness
+    // would have anyway.
+    std::fs::write(
+        Path::new(&daemon.state).join("events.jsonl"),
+        "{\"kind\":\"turn_end\"}\n",
+    )
+    .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    {
+        let mut q = api.queue.lock().unwrap();
+        q.push(json!({
+            "update_id": 9301,
+            "message": {
+                "message_id": 4900,
+                "date": now,
+                "chat": {"id": -100},
+                "from": {"id": 557, "username": "smoker", "first_name": "Smoke"},
+                "text": "родительский текст"
+            }
+        }));
+        q.push(json!({
+            "update_id": 9302,
+            "message": {
+                "message_id": 4901,
+                "date": now + 1,
+                "chat": {"id": -100},
+                "from": {"id": 557, "username": "smoker", "first_name": "Smoke"},
+                "text": "ответ на него",
+                "reply_to_message": {
+                    "message_id": 4900,
+                    "date": now,
+                    "from": {"id": 557, "username": "smoker", "first_name": "Smoke"},
+                    "text": "родительский текст"
+                }
+            }
+        }));
+    }
+    let mut reader = BufReader::new(stream);
+    let push = loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => panic!(
+                "control socket closed before a push; log tail: {}",
+                chatd_log_tail(&daemon)
+            ),
+            Ok(_) => {
+                let v: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+                if let Some(p) = v.get("push") {
+                    break p.clone();
+                }
+            }
+            Err(e) => panic!(
+                "no push frame within 15s: {e}; log tail: {}",
+                chatd_log_tail(&daemon)
+            ),
+        }
+    };
+    let ids = push
+        .get("batch_ids")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        ids.iter().any(|v| v.as_i64() == Some(4901)),
+        "batch_ids missing the incoming id: {push}"
+    );
+    let text = push.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        text.contains("(ответ на [4900] @smoker: «родительский текст»)"),
+        "reply parent not rendered one hop deep: {text}"
+    );
+    assert!(text.contains("ответ на него"), "incoming text missing: {text}");
 }

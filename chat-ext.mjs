@@ -23,12 +23,16 @@
  * - Exactly-once sends across session restarts: receipts are cached in
  *   `<state>/sent-receipts.json` keyed by delivery_id; a re-admitted batch
  *   replays cached receipts without re-sending.
- * - `chat_send` also sends local media (`media_path`, from a batch `[file]`
- *   marker): image -> sendPhoto, video -> sendVideo, anything else ->
- *   sendDocument, with `text` as the caption.
+ * - `chat_send` sends one message per call and at most ONE media attachment
+ *   per turn: a chat GIF by `gif_file_id` (sendAnimation), a sticker by
+ *   `sticker_file_id` (sendSticker, no caption possible), or a local file by
+ *   `media_path` (`.gif` -> sendAnimation, image/* -> sendPhoto, video/* ->
+ *   sendVideo, anything else -> sendDocument). The three are mutually
+ *   exclusive; a second media call in the same turn is refused.
  * - `gif_list` reads the FULL deduplicated GIF registry through the daemon
  *   (`{"call":{"op":"gif_list"}}` / `{"return":...}` on the same control
- *   socket) — the extension still never opens sqlite itself.
+ *   socket) — only rows Telegram delivered as `animation`, never videos.
+ *   The extension still never opens sqlite itself.
  * - `subagent` is the ONLY dispatch path and it is structurally gated: the
  *   daemon marks owner-authored message ids (`owner_msgs`) in each push, and
  *   the tool refuses unless the caller names one of them (`owner_message_id`).
@@ -50,6 +54,76 @@ import net from "node:net";
 import path from "node:path";
 
 const SKIP_TOKEN = "[skip]";
+
+// ---- send classification (pure, unit-tested) ----
+// One chat_send carries at most ONE media attachment: a GIF from the catalog,
+// a sticker by file_id, or a local media file. Text-only calls and these three
+// are the only shapes; anything else is refused instead of guessing which
+// argument the model meant.
+export const MAX_MEDIA_PER_TURN = 1;
+export const TURN_MEDIA_ERROR =
+  "error: за ход можно отправить только одно медиа (гифку, стикер или файл) — второе не отправлено; захочешь ещё — следующим ходом";
+export const STICKER_TEXT_ERROR =
+  "error: стикер не принимает подпись — отправь текст отдельным chat_send без sticker_file_id";
+
+export function classifyChatSend(params) {
+  const p = params || {};
+  const gif = p.gif_file_id ? String(p.gif_file_id) : "";
+  const sticker = p.sticker_file_id ? String(p.sticker_file_id) : "";
+  const media = p.media_path ? String(p.media_path) : "";
+  const chosen = [gif ? "gif" : "", sticker ? "sticker" : "", media ? "media" : ""].filter(
+    Boolean,
+  );
+  if (chosen.length > 1)
+    return {
+      error: "error: gif_file_id, sticker_file_id и media_path взаимоисключающие",
+    };
+  if (!chosen.length) return { target: "text" };
+  // Telegram's sendSticker takes no caption; silently dropping the text would
+  // lose it, so the caller must send it as its own message.
+  if (chosen[0] === "sticker" && String(p.text || "").trim())
+    return { error: STICKER_TEXT_ERROR };
+  return { target: chosen[0] };
+}
+
+// One media attachment per turn: the hard, machine-checkable half of
+// "кидать активнее, но не перебарщивать" (the persona carries the judgement).
+export function allowsAnotherMedia(count) {
+  return Number(count) < MAX_MEDIA_PER_TURN;
+}
+
+// 45 MB stays under the Bot API upload ceiling; larger files are refused
+// before reading them so a huge batch file cannot stall the turn.
+const MEDIA_MAX_BYTES = 45 * 1024 * 1024;
+const MIME_BY_EXT = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+  ".mp4": "video/mp4",
+  ".mov": "video/quicktime",
+  ".webm": "video/webm",
+  ".mkv": "video/x-matroska",
+  ".mp3": "audio/mpeg",
+  ".ogg": "audio/ogg",
+  ".pdf": "application/pdf",
+};
+
+// Upload target by file type. A `.gif` goes out as an ANIMATION (Telegram
+// shows it as a looping gif), not as a still photo; only other images use
+// sendPhoto.
+export function mediaSpec(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const mime = MIME_BY_EXT[ext] || "application/octet-stream";
+  if (ext === ".gif")
+    return { method: "sendAnimation", field: "animation", mime };
+  if (mime.startsWith("image/"))
+    return { method: "sendPhoto", field: "photo", mime };
+  if (mime.startsWith("video/"))
+    return { method: "sendVideo", field: "video", mime };
+  return { method: "sendDocument", field: "document", mime };
+}
 
 function env(name, fallback) {
   // Host launch-spec env only allows (SENPI|OMO|PI)_[A-Z0-9_]+ keys, so the
@@ -80,13 +154,23 @@ export default function (pi) {
   // nobody else's message can open dispatch.
   let ownerMsgs = new Set();
 
+  // Incoming message ids of the CURRENT turn: filled from every pushed batch
+  // (`batch_ids`), cleared on turn_end. `chat_send` accepts `reply_to` only from
+  // this set, so a model can never quote the 50-message history window, the GIF
+  // catalog or a message from an earlier turn. An empty set (old daemon) keeps
+  // the previous unchecked behaviour.
+  let batchIds = new Set();
+
 
   // Delivery ids admitted by drain and served by the current turn. The daemon
   // serializes batches (one turn at a time), so this normally holds exactly one.
   let activeDeliveries = [];
-  // (reply_to, text, gif) -> receipt for the current turn (cross-turn replay
-  // is served from the receipts file below).
+  // (reply_to, text, gif, sticker, media) -> receipt for the current turn
+  // (cross-turn replay is served from the receipts file below).
   let turnSends = new Map();
+  // Media attachments already sent in this turn: the hard "не перебарщивать"
+  // bound (one per turn), reset on both turn boundaries.
+  let turnMediaCount = 0;
 
   function emit(ev) {
     try {
@@ -147,40 +231,18 @@ export default function (pi) {
     }
   }
 
-  function receiptKey(deliveryId, replyTo, text, gifFileId, mediaPath) {
-    return `${deliveryId}::${replyTo === null || replyTo === undefined ? "" : replyTo}::${text}::${gifFileId || ""}::${mediaPath || ""}`;
+  function receiptKey(
+    deliveryId,
+    replyTo,
+    text,
+    gifFileId,
+    stickerFileId,
+    mediaPath,
+  ) {
+    return `${deliveryId}::${replyTo === null || replyTo === undefined ? "" : replyTo}::${text}::${gifFileId || ""}::${stickerFileId || ""}::${mediaPath || ""}`;
   }
 
   // ---- media upload (Attachment 3) ----
-  // 45 MB stays under the Bot API upload ceiling; larger files are refused
-  // before reading them so a huge batch file cannot stall the turn.
-  const MEDIA_MAX_BYTES = 45 * 1024 * 1024;
-  const MIME_BY_EXT = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-    ".mp4": "video/mp4",
-    ".mov": "video/quicktime",
-    ".webm": "video/webm",
-    ".mkv": "video/x-matroska",
-    ".mp3": "audio/mpeg",
-    ".ogg": "audio/ogg",
-    ".pdf": "application/pdf",
-  };
-
-  function mediaSpec(filePath) {
-    const mime =
-      MIME_BY_EXT[path.extname(filePath).toLowerCase()] ||
-      "application/octet-stream";
-    if (mime.startsWith("image/"))
-      return { method: "sendPhoto", field: "photo", mime };
-    if (mime.startsWith("video/"))
-      return { method: "sendVideo", field: "video", mime };
-    return { method: "sendDocument", field: "document", mime };
-  }
-
   async function botApiForm(method, form) {
     const url = `${apiBase}/bot${readToken()}/${method}`;
     const res = await fetch(url, { method: "POST", body: form });
@@ -240,29 +302,42 @@ export default function (pi) {
     label: "Send chat message",
     description:
       "The ONLY way to send a message to the Telegram chat. Call once per message " +
-      "with the reply target and optionally a GIF file_id or a local media file " +
-      "(media_path from a batch [file] marker). A turn that calls no chat_send " +
-      "sends nothing (silence). Never emit chat text outside this tool.",
+      "with the reply target and AT MOST ONE media argument per turn: a chat GIF " +
+      "(gif_file_id), a sticker by file_id (sticker_file_id, no caption), or a " +
+      "local media file (media_path from a batch [file] marker). A turn that " +
+      "calls no chat_send sends nothing (silence). Never emit chat text outside " +
+      "this tool.",
     parameters: {
       type: "object",
       properties: {
         text: {
           type: "string",
-          description: "Message text (caption when gif_file_id or media_path is set).",
+          description:
+            "Message text (caption when gif_file_id or media_path is set; a " +
+            "sticker cannot carry a caption — send the text separately).",
         },
         reply_to: {
           type: "integer",
-          description: "message_id to reply to (from the [id] markers).",
+          description:
+            "message_id to reply to — MUST be one of this batch's [id] markers; " +
+            "ids from the history block or the GIF catalog are not reply targets.",
         },
         gif_file_id: {
           type: "string",
           description: "file_id of a chat GIF from the batch GIF catalog.",
         },
+        sticker_file_id: {
+          type: "string",
+          description:
+            "file_id of a sticker from a batch [sticker] line; sent with " +
+            "sendSticker, so it takes no caption.",
+        },
         media_path: {
           type: "string",
           description:
             "Absolute path of a local media file from a batch [file] marker " +
-            "(photo -> sendPhoto, video -> sendVideo, otherwise sendDocument).",
+            "(.gif -> sendAnimation, photo -> sendPhoto, video -> sendVideo, " +
+            "otherwise sendDocument).",
         },
       },
       additionalProperties: false,
@@ -274,24 +349,47 @@ export default function (pi) {
         .replace(/^\s*\[reply:\d+\]\s*/, "")
         .replace(/\[gif:\d+\]/g, "")
         .trim();
-      const replyTo =
+      const requestedReplyTo =
         params.reply_to === undefined || params.reply_to === null
           ? null
           : Number(params.reply_to);
+      let replyTo = requestedReplyTo;
+      let replyDropped = false;
+      if (
+        replyTo !== null &&
+        batchIds.size > 0 &&
+        !batchIds.has(replyTo)
+      ) {
+        // A quote outside this batch is exactly the "ancient message" failure:
+        // drop the quote but keep the answer (exactly-once send is preserved and
+        // the model is told what happened).
+        emit({
+          kind: "chat_send_reply_dropped",
+          toolCallId,
+          reply_to: replyTo,
+          valid: [...batchIds],
+        });
+        replyDropped = true;
+        replyTo = null;
+      }
+      const dropNote = replyDropped
+        ? `\nsent without quote: reply_to ${requestedReplyTo} is not in this batch (valid: ${[
+            ...batchIds,
+          ].join(", ")})`
+        : "";
       const gifFileId = params.gif_file_id ? String(params.gif_file_id) : "";
+      const stickerFileId = params.sticker_file_id
+        ? String(params.sticker_file_id)
+        : "";
       const mediaPath = params.media_path ? String(params.media_path) : "";
-      if (gifFileId && mediaPath) {
+      const classified = classifyChatSend({ ...params, text });
+      if (classified.error) {
         return {
-          content: [
-            {
-              type: "text",
-              text: "error: gif_file_id and media_path are mutually exclusive",
-            },
-          ],
+          content: [{ type: "text", text: classified.error }],
           isError: true,
         };
       }
-      if (!text.trim() && !gifFileId && !mediaPath) {
+      if (!text.trim() && !gifFileId && !stickerFileId && !mediaPath) {
         return {
           content: [{ type: "text", text: "error: empty body, nothing sent" }],
           isError: true,
@@ -304,7 +402,7 @@ export default function (pi) {
           ],
         };
       }
-      const turnKey = `${replyTo === null ? "" : replyTo}::${text}::${gifFileId}::${mediaPath}`;
+      const turnKey = `${replyTo === null ? "" : replyTo}::${text}::${gifFileId}::${stickerFileId}::${mediaPath}`;
       if (turnSends.has(turnKey)) {
         return {
           content: [
@@ -317,7 +415,9 @@ export default function (pi) {
       // identifies this turn's batch.
       const cached = loadReceipts();
       for (const id of activeDeliveries) {
-        const hit = cached[receiptKey(id, replyTo, text, gifFileId, mediaPath)];
+        const hit = cached[
+          receiptKey(id, replyTo, text, gifFileId, stickerFileId, mediaPath)
+        ];
         if (hit) {
           turnSends.set(turnKey, hit);
           emit({
@@ -326,8 +426,17 @@ export default function (pi) {
             delivery_id: id,
             receipt: hit,
           });
-          return { content: [{ type: "text", text: JSON.stringify(hit) }] };
+          return {
+            content: [{ type: "text", text: JSON.stringify(hit) + dropNote }],
+          };
         }
+      }
+      const isMediaSend = Boolean(gifFileId || stickerFileId || mediaPath);
+      if (isMediaSend && !allowsAnotherMedia(turnMediaCount)) {
+        return {
+          content: [{ type: "text", text: TURN_MEDIA_ERROR }],
+          isError: true,
+        };
       }
       let sent;
       if (gifFileId) {
@@ -335,6 +444,12 @@ export default function (pi) {
         if (text.trim()) p.caption = text.slice(0, 1024);
         if (replyTo !== null) p.reply_to_message_id = replyTo;
         sent = await botApi("sendAnimation", p);
+      } else if (stickerFileId) {
+        // sendSticker takes no caption: classifyChatSend already refused a
+        // sticker call that carried text, so nothing is dropped here.
+        const p = { chat_id: chatId, sticker: stickerFileId };
+        if (replyTo !== null) p.reply_to_message_id = replyTo;
+        sent = await botApi("sendSticker", p);
       } else if (mediaPath) {
         let stat = null;
         try {
@@ -373,11 +488,17 @@ export default function (pi) {
         sent = await botApi("sendMessage", p);
       }
       const receipt = { message_id: sent.message_id, reply_to: replyTo, text };
+      if (isMediaSend) turnMediaCount += 1;
       turnSends.set(turnKey, receipt);
       for (const id of activeDeliveries)
-        saveReceipt(receiptKey(id, replyTo, text, gifFileId, mediaPath), receipt);
+        saveReceipt(
+          receiptKey(id, replyTo, text, gifFileId, stickerFileId, mediaPath),
+          receipt,
+        );
       emit({ kind: "chat_send_result", toolCallId, receipt });
-      return { content: [{ type: "text", text: JSON.stringify(receipt) }] };
+      return {
+        content: [{ type: "text", text: JSON.stringify(receipt) + dropNote }],
+      };
     },
   });
 
@@ -385,10 +506,11 @@ export default function (pi) {
     name: "gif_list",
     label: "List chat GIFs",
     description:
-      "Full deduplicated list of GIFs seen in this chat (file_id + caption), " +
-      "ordered newest first, served by the bot daemon. The batch catalog is " +
-      "capped; use this when the needed GIF is not in it. Send one with " +
-      "chat_send(gif_file_id=...).",
+      "Full deduplicated list of GIFs seen in this chat (file_id, caption, and " +
+      "the moment it was used), ordered newest first, served by the bot daemon. " +
+      "Only real animations — videos from the chat are not listed. The batch " +
+      "catalog is capped; use this when the needed GIF is not in it. Send one " +
+      "with chat_send(gif_file_id=...).",
     parameters: {
       type: "object",
       properties: {
@@ -590,6 +712,7 @@ export default function (pi) {
 
   pi.on("turn_start", (ev) => {
     turnSends = new Map();
+    turnMediaCount = 0;
     startTyping();
     emit({ kind: "turn_start", turnIndex: ev.turnIndex });
     emit({ kind: "agent_activity", phase: "working" });
@@ -603,9 +726,12 @@ export default function (pi) {
       chat_sends: [...turnSends.values()],
     });
     activeDeliveries = [];
+    turnMediaCount = 0;
     // A dispatch permission lives only for the turn whose batch carried the
     // owner's message: never leave it standing for a later turn.
     ownerMsgs = new Set();
+    // Reply targets are likewise per-turn: the next turn's batch re-fills them.
+    batchIds = new Set();
     emit({ kind: "agent_activity", phase: "stopped" });
   });
 
@@ -880,6 +1006,12 @@ export default function (pi) {
     for (const id of Array.isArray(push.owner_msgs) ? push.owner_msgs : []) {
       const n = Number(id);
       if (Number.isInteger(n) && n > 0) ownerMsgs.add(n);
+    }
+    // Incoming ids of this batch are the only legal `reply_to` targets for the
+    // turn. A steer batch in the same turn extends them; turn_end clears them.
+    for (const id of Array.isArray(push.batch_ids) ? push.batch_ids : []) {
+      const n = Number(id);
+      if (Number.isInteger(n) && n > 0) batchIds.add(n);
     }
     const kind = admitDelivery(deliveryId, text, push.deliverAs || "steer");
     if (!controlSock) return;

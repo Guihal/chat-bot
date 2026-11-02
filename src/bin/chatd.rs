@@ -162,6 +162,10 @@ enum Out {
         /// them for the turn and the `subagent` tool demands one as proof that
         /// the request really came from the owner.
         owner_msgs: Vec<i64>,
+        /// Incoming message_ids of this batch; `chat_send` refuses a `reply_to`
+        /// outside them (history, GIF catalog, another turn). Empty on an old
+        /// ledger entry — the extension then disables the check.
+        batch_ids: Vec<i64>,
     },
 }
 
@@ -299,8 +303,8 @@ async fn control_loop(
         loop {
             tokio::select! {
                 msg = out_rx.recv() => match msg {
-                    Some(Out::Push { delivery_id, text, owner_msgs }) => {
-                        let frame = json!({"push": {"delivery_id": delivery_id, "text": text, "deliverAs": "steer", "owner_msgs": owner_msgs}});
+                    Some(Out::Push { delivery_id, text, owner_msgs, batch_ids }) => {
+                        let frame = json!({"push": {"delivery_id": delivery_id, "text": text, "deliverAs": "steer", "owner_msgs": owner_msgs, "batch_ids": batch_ids}});
                         let ok = match serde_json::to_string(&frame) {
                             Ok(s) => wr.write_all(format!("{s}\n").as_bytes()).await.is_ok() && wr.flush().await.is_ok(),
                             Err(_) => false,
@@ -462,6 +466,7 @@ async fn admit_job(
         &sig,
         &text,
         &owners,
+        &ids,
     )
     .await
 }
@@ -481,6 +486,7 @@ async fn deliver_sig(
     sig: &str,
     text: &str,
     owners: &[i64],
+    ids: &[i64],
 ) -> Result<()> {
     let first = Duration::from_secs_f64(cfg("CHATBOT_ADMIT_FIRST_SEC", "8").parse().unwrap_or(8.0));
     let rest = Duration::from_secs_f64(cfg("CHATBOT_ADMIT_SEC", "10").parse().unwrap_or(10.0));
@@ -500,6 +506,7 @@ async fn deliver_sig(
                 delivery_id: sig.to_string(),
                 text: text.to_string(),
                 owner_msgs: owners.to_vec(),
+                batch_ids: ids.to_vec(),
             })
             .is_err()
         {
@@ -561,11 +568,12 @@ async fn recover_batch(
     // the same batch: one closure for both.
     let state_for_db = state.to_string();
     let sig_for_db = sig.to_string();
-    let (text, owners) = db
+    let (text, owners, ids) = db
         .call(move |con| {
             let text = push_pending(&state_for_db, con, &sig_for_db)?;
             let owners = pending_owner_ids(con, &sig_for_db);
-            Ok((text, owners))
+            let ids = pending_batch_ids(con, &sig_for_db);
+            Ok((text, owners, ids))
         })
         .await?;
     let text = match text {
@@ -605,7 +613,7 @@ async fn recover_batch(
         dlog(&format!("recover {sig}: re-pushing (no session change)"));
     }
     let _ = inboxed_tx.send(sig.to_string());
-    deliver_sig(db, sid_slot, system_path, ref_, admitted_tx, out_tx, inbound_rx, sig, &text, &owners).await
+    deliver_sig(db, sid_slot, system_path, ref_, admitted_tx, out_tx, inbound_rx, sig, &text, &owners, &ids).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -700,8 +708,13 @@ async fn recover_pending(
         ));
         let _ = inboxed_tx.send(sig.clone());
         let sig_db = sig.clone();
-        let owners = db
-            .call(move |con| Ok(pending_owner_ids(con, &sig_db)))
+        let (owners, ids) = db
+            .call(move |con| {
+                Ok((
+                    pending_owner_ids(con, &sig_db),
+                    pending_batch_ids(con, &sig_db),
+                ))
+            })
             .await
             .unwrap_or_default();
         if deliver_sig(
@@ -715,6 +728,7 @@ async fn recover_pending(
             &sig,
             &text,
             &owners,
+            &ids,
         )
         .await
         .is_err()

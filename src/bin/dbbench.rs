@@ -21,9 +21,12 @@ const NEW_INDEXES: [&str; 5] = [
     "idx_messages_date",
     "idx_messages_answered",
     "idx_messages_author_window",
-    "idx_messages_gifs",
+    "idx_messages_animations",
 ];
 
+// The legacy statement is the pre-`media_kind` SQL with ONLY the honesty fix
+// applied: both sides must return the same rows, otherwise this comparison
+// measures a behaviour change instead of the index.
 const GIF_PAGE_LEGACY: &str = "WITH grouped AS (
    SELECT COALESCE(NULLIF(file_unique_id,''), file_id) AS dedup_key,
           file_id, text, date, message_id,
@@ -31,12 +34,12 @@ const GIF_PAGE_LEGACY: &str = "WITH grouped AS (
             PARTITION BY COALESCE(NULLIF(file_unique_id,''), file_id)
             ORDER BY date DESC, message_id DESC) AS rn
    FROM messages
-   WHERE file_id IS NOT NULL AND file_id <> ''
+   WHERE media_kind='animation' AND file_id IS NOT NULL AND file_id <> ''
  )
  SELECT file_id, text FROM grouped WHERE rn = 1
  ORDER BY date DESC, message_id DESC LIMIT ? OFFSET ?";
 const GIF_COUNT_LEGACY: &str =
-    "SELECT COUNT(DISTINCT COALESCE(NULLIF(file_unique_id,''), file_id)) FROM messages WHERE file_id IS NOT NULL AND file_id <> ''";
+    "SELECT COUNT(DISTINCT COALESCE(NULLIF(file_unique_id,''), file_id)) FROM messages WHERE media_kind='animation' AND file_id IS NOT NULL AND file_id <> ''";
 const MSG_BY_ID_LEGACY: &str =
     "SELECT message_id,user_id,username FROM messages WHERE message_id=? LIMIT 1";
 const RECENT_LEGACY: &str =
@@ -114,15 +117,17 @@ fn seed(con: &Connection, rows: i64) -> Result<()> {
     con.execute("BEGIN", [])?;
     {
         let mut ins = con.prepare(
-            "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         )?;
         for i in 0..rows {
             let user_idx = i % 40;
-            let (file_id, file_unique_id) = if i % 20 == 0 {
+            // Seeded GIF rows are real animations (the only kind the registry
+            // now accepts); everything else carries no kind at all.
+            let (file_id, file_unique_id, media_kind) = if i % 20 == 0 {
                 let n = i / 20;
-                (format!("fid_{n}"), format!("uniq_{n}"))
+                (format!("fid_{n}"), format!("uniq_{n}"), Some("animation"))
             } else {
-                (String::new(), String::new())
+                (String::new(), String::new(), None)
             };
             let reply_to: Option<i64> = if i % 31 == 0 && i > 7 { Some(1000 + i - 7) } else { None };
             ins.execute(params![
@@ -136,7 +141,8 @@ fn seed(con: &Connection, rows: i64) -> Result<()> {
                 reply_to,
                 "",
                 file_id,
-                file_unique_id
+                file_unique_id,
+                media_kind
             ])?;
         }
     }
@@ -144,7 +150,7 @@ fn seed(con: &Connection, rows: i64) -> Result<()> {
     kv_set(con, "self_id", "2033")?;
     kv_set(con, "self_username", "bot")?;
     let mut ins = con.prepare(
-        "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
     )?;
     for i in 0..(rows / 41).max(1) {
         let q = 793 + i * 151;
@@ -159,7 +165,8 @@ fn seed(con: &Connection, rows: i64) -> Result<()> {
             Some(1000 + q),
             "",
             "",
-            ""
+            "",
+            Option::<&str>::None
         ])?;
     }
     Ok(())

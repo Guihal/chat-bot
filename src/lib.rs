@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS messages(
   reply_to INTEGER,
   media_path TEXT,
   file_id TEXT,
-  file_unique_id TEXT
+  file_unique_id TEXT,
+  media_kind TEXT
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   text, username, content='messages', content_rowid='update_id'
@@ -202,7 +203,8 @@ pub fn ensure_indexes(con: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date DESC, message_id DESC);
          CREATE INDEX IF NOT EXISTS idx_messages_answered ON messages(user_id, date DESC, reply_to) WHERE reply_to IS NOT NULL;
          CREATE INDEX IF NOT EXISTS idx_messages_author_window ON messages(username, date DESC);
-         CREATE INDEX IF NOT EXISTS idx_messages_gifs ON messages(date DESC, message_id DESC, file_unique_id, text, file_id) WHERE file_id IS NOT NULL AND file_id <> '';",
+         DROP INDEX IF EXISTS idx_messages_gifs;
+         CREATE INDEX IF NOT EXISTS idx_messages_animations ON messages(date DESC, message_id DESC, file_unique_id, text, file_id) WHERE media_kind='animation' AND file_id IS NOT NULL AND file_id <> '';",
     )?;
     Ok(())
 }
@@ -229,6 +231,11 @@ pub fn db(state: &str) -> Result<Connection> {
     // Historic rows have no file_unique_id (Bot API cannot derive one from a
     // file_id); the gif registry falls back to file_id for those.
     let _ = con.execute("ALTER TABLE messages ADD COLUMN file_unique_id TEXT", []);
+    // Telegram's message field the media arrived in (`animation` = gif,
+    // `video`, `photo`, `sticker`, ...). NULL on historic rows and on the
+    // bot's own mirrored sends: the kind is only knowable at ingest, and a
+    // row without it is honestly NOT a gif (see GIF_PAGE_SQL).
+    let _ = con.execute("ALTER TABLE messages ADD COLUMN media_kind TEXT", []);
     // A missing index costs latency, not correctness: log instead of refusing to
     // start when the file is momentarily write-locked.
     if let Err(e) = ensure_indexes(&con) {
@@ -264,6 +271,11 @@ pub struct BatchMsg {
     pub text: String,
     pub reply_to: Option<i64>,
     pub media_path: String,
+    /// Telegram media field (`animation`, `video`, `photo`, `sticker`, ...);
+    /// empty for a text message. Distinguishes a gif from a video on the way in.
+    pub media_kind: String,
+    /// Telegram file_id of the media, so a sticker can be re-sent verbatim.
+    pub file_id: String,
     pub to_me: bool,
     /// Author is the owner (`CHATBOT_OWNER_USERNAME` / `CHATBOT_OWNER_ID`).
     /// Subagent dispatch is structurally gated on owner-authored messages,
@@ -303,7 +315,43 @@ pub struct PreparedMessage {
     pub media_path: String,
     pub file_id: String,
     pub file_unique_id: String,
+    /// Telegram field the media arrived in (`animation` = gif, `video`,
+    /// `photo`, `sticker`, ...); empty when the message had no media.
+    pub media_kind: String,
     pub cross: bool,
+}
+
+/// The Telegram message field that carried an update's media, in the daemon's
+/// precedence order. `animation` is what Telegram calls a GIF; `video` is a
+/// real video, `sticker` a sticker. This distinction exists ONLY on the
+/// incoming message: file_id/file_unique_id cannot be classified afterwards
+/// (Telegram serves `.mp4` for both animation and video), so the field name is
+/// stored as `media_kind` and never guessed from the bytes.
+pub fn pick_media(msg: &Value) -> Option<(String, Value)> {
+    for key in [
+        "photo",
+        "animation",
+        "video",
+        "document",
+        "sticker",
+        "voice",
+        "audio",
+        "video_note",
+    ] {
+        if let Some(obj) = msg.get(key) {
+            let o = if obj.is_array() {
+                obj.as_array()
+                    .and_then(|a| a.last().cloned())
+                    .unwrap_or(json!(null))
+            } else {
+                obj.clone()
+            };
+            if o.get("file_id").and_then(|v| v.as_str()).is_some() {
+                return Some((key.to_string(), o));
+            }
+        }
+    }
+    None
 }
 
 /// Parse one update and fetch its media. Returns None when the message does not
@@ -363,22 +411,9 @@ pub async fn prepare_message(
     let mut media_path = String::new();
     let mut file_id = String::new();
     let mut file_unique_id = String::new();
-    // Media kinds: photo/animation/video/document/sticker + voice/audio/video_note.
-    let mut picked: Option<(String, Value)> = None;
-    for key in ["photo", "animation", "video", "document", "sticker", "voice", "audio", "video_note"] {
-        if let Some(obj) = msg.get(key) {
-            let o = if obj.is_array() {
-                obj.as_array().unwrap().last().cloned().unwrap_or(json!(null))
-            } else {
-                obj.clone()
-            };
-            if o.get("file_id").and_then(|v| v.as_str()).is_some() {
-                picked = Some((key.to_string(), o));
-                break;
-            }
-        }
-    }
-    if let Some((key, obj)) = picked {
+    let mut media_kind = String::new();
+    if let Some((key, obj)) = pick_media(msg) {
+        media_kind = key.clone();
         let fid = obj.get("file_id").and_then(|v| v.as_str()).unwrap_or("");
         file_id = fid.to_string();
         file_unique_id = obj
@@ -388,7 +423,12 @@ pub async fn prepare_message(
             .to_string();
         let duration = obj.get("duration").and_then(|v| v.as_i64());
         let mime = obj.get("mime_type").and_then(|v| v.as_str()).unwrap_or("");
-        if key == "voice" || key == "audio" {
+        // A sticker is marker-only: it is re-sent by file_id through
+        // `sendSticker`, and downloading it would only feed the old
+        // misclassification (a .webm sticker was previewed and called a gif).
+        if key == "sticker" {
+            text.push_str(" [sticker]");
+        } else if key == "voice" || key == "audio" {
             // Marker-only: agent read tool cannot render audio; keep file_id
             // for future STT, never download.
             let secs = duration.map(|d| format!("{d}")).unwrap_or_else(|| "?".to_string());
@@ -424,21 +464,26 @@ pub async fn prepare_message(
                         || mime.to_lowercase().starts_with("video/")
                         || mime.to_lowercase() == "image/gif";
                     if is_video_kind || ext_video || mime_video {
+                        // One preview frame is all the agent needs to read.
+                        // The TEXT marker follows the Telegram kind, so a
+                        // document that happens to be a video is shown as
+                        // [video] and never leaves as a gif-catalog entry
+                        // (media_kind stays `document`).
                         match preview_frame(&p, Duration::from_secs(60)).await {
                             Ok(f) => {
                                 media_path = f;
-                                text.push_str(" [gif]");
+                                let label = if key == "animation" { "gif" } else { "video" };
+                                text.push_str(&format!(" [{label}]"));
                             }
                             Err(e) => {
                                 dlog(&format!("frame failed: {e}"));
                                 media_path = String::new();
-                                text.push_str(" [animation, preview unavailable]");
+                                text.push_str(&format!(" [{key}, preview unavailable]"));
                             }
                         }
-                    } else if key == "sticker"
-                        && (p.to_lowercase().ends_with(".tgs") || mime.contains("tgsticker"))
-                    {
-                        text.push_str(" [animated sticker]");
+                    } else if key == "photo" {
+                        media_path = p;
+                        text.push_str(" [photo]");
                     } else {
                         media_path = p;
                     }
@@ -472,6 +517,7 @@ pub async fn prepare_message(
         media_path,
         file_id,
         file_unique_id,
+        media_kind,
         cross,
     }))
 }
@@ -497,6 +543,7 @@ pub fn store_prepared(
         media_path,
         file_id,
         file_unique_id,
+        media_kind,
         cross,
     } = prep.clone();
     if !text.trim().is_empty() && !username.is_empty() {
@@ -525,8 +572,8 @@ pub fn store_prepared(
         }
     }
     let res = con.execute(
-        "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        params![update_id, message_id, date, user_id, username, first_name, text, reply_to, media_path, file_id, file_unique_id],
+        "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        params![update_id, message_id, date, user_id, username, first_name, text, reply_to, media_path, file_id, file_unique_id, media_kind],
     );
     if res.is_err() {
         return Ok(None);
@@ -541,6 +588,8 @@ pub fn store_prepared(
         text,
         reply_to,
         media_path,
+        file_id,
+        media_kind,
         to_me: false,
         owner,
     }))
@@ -587,16 +636,103 @@ pub fn maybe_prune_media_n(state: &str, keep: usize, trigger: usize) {
     }
 }
 
-pub fn format_batch(batch: &[BatchMsg]) -> String {
-    let mut lines = vec![];
-    for m in batch {
-        let who = if !m.username.is_empty() {
-            format!("@{}", m.username)
-        } else if !m.first_name.is_empty() {
-            m.first_name.clone()
+/// Display name used in rendered batch/context lines (`@user`, first name, id).
+fn display_who(username: &str, first_name: &str, user_id: Option<i64>) -> String {
+    if !username.is_empty() {
+        format!("@{username}")
+    } else if !first_name.is_empty() {
+        first_name.to_string()
+    } else {
+        user_id.map(|u| u.to_string()).unwrap_or_default()
+    }
+}
+
+/// Nearest parent of a reply, rendered next to the incoming message. Only ONE
+/// hop is resolved: the crystal requires "только последнее из цепочки реплаев".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReplyParent {
+    pub who: String,
+    pub text: String,
+    /// Parent carried media but no text: rendered as `[file]`.
+    pub media: bool,
+}
+
+/// One parent text is capped so a long quoted message cannot flood the batch.
+const REPLY_PARENT_CAP: usize = 120;
+
+/// The batch header tells the model which ids are answer targets: history (the
+/// context window, the GIF catalog) uses the same `[id]` shape, and without
+/// this line those ids looked like reply targets.
+const BATCH_HEADER: &str = "Пачка: это сообщения, на которые можно ответить. reply_to — только id из этой пачки; id из контекста выше и каталога гифок — история, не цель ответа.";
+
+fn one_line_capped(text: &str, cap: usize) -> String {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut: String = joined.chars().take(cap).collect();
+    if joined.chars().count() > cap {
+        format!("{cut}…")
+    } else {
+        cut
+    }
+}
+
+/// Resolve the nearest parent of every reply in `batch` from the mirror.
+/// One targeted PK lookup per distinct reply target (a batch is normally a few
+/// rows); `format_batch` stays a pure render function over the returned map.
+/// A missing parent is not invented: the renderer says so honestly.
+pub fn reply_parents(con: &Connection, batch: &[BatchMsg]) -> Result<HashMap<i64, ReplyParent>> {
+    let mut ids: Vec<i64> = batch.iter().filter_map(|m| m.reply_to).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut out = HashMap::new();
+    for id in ids {
+        let row: Option<(Option<String>, Option<String>, Option<i64>, Option<String>, Option<String>)> = con
+            .prepare_cached(
+                "SELECT username,first_name,user_id,text,media_path FROM messages WHERE message_id=? LIMIT 1",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_row([id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+            })
+            .ok();
+        if let Some((username, first_name, user_id, text, media)) = row {
+            let username = username.unwrap_or_default();
+            let first_name = first_name.unwrap_or_default();
+            out.insert(
+                id,
+                ReplyParent {
+                    who: display_who(&username, &first_name, user_id),
+                    text: text.unwrap_or_default(),
+                    media: !media.unwrap_or_default().is_empty(),
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Message body as the model sees it. A sticker has no caption and no media
+/// file, so its file_id is the only way to re-send it: print it next to the
+/// `[sticker]` marker.
+fn message_body(text: &str, media_kind: &str, file_id: &str) -> String {
+    if media_kind == "sticker" && !file_id.is_empty() {
+        if text.trim().is_empty() {
+            format!("[sticker] file_id={file_id}")
         } else {
-            m.user_id.map(|u| u.to_string()).unwrap_or_default()
-        };
+            format!("{text} file_id={file_id}")
+        }
+    } else {
+        text.to_string()
+    }
+}
+
+pub fn format_batch(batch: &[BatchMsg], parents: &HashMap<i64, ReplyParent>) -> String {
+    if batch.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![BATCH_HEADER.to_string()];
+    for m in batch {
+        let who = display_who(&m.username, &m.first_name, m.user_id);
         let mut head = format!("[{}] {}:", m.message_id, who);
         if m.to_me {
             head.push_str(" [к тебе]");
@@ -605,10 +741,31 @@ pub fn format_batch(batch: &[BatchMsg]) -> String {
             head.push_str(" [владелец]");
         }
         if let Some(r) = m.reply_to {
-            head.push_str(&format!(" (reply to {r})"));
+            let marker = match parents.get(&r) {
+                Some(p) => {
+                    let body = if !p.text.trim().is_empty() {
+                        format!("«{}»", one_line_capped(&p.text, REPLY_PARENT_CAP))
+                    } else if p.media {
+                        "[file]".to_string()
+                    } else {
+                        "без текста".to_string()
+                    };
+                    let who = if p.who.trim().is_empty() {
+                        format!("[{r}]")
+                    } else {
+                        format!("[{r}] {}:", p.who.trim())
+                    };
+                    format!(" (ответ на {who} {body})")
+                }
+                None => format!(" (ответ на [{r}]: сообщения нет в базе)"),
+            };
+            head.push_str(&marker);
         }
-        if !m.text.is_empty() {
-            lines.push(format!("{head} {}", m.text));
+        if !m.text.is_empty() || (m.media_kind == "sticker" && !m.file_id.is_empty()) {
+            lines.push(format!(
+                "{head} {}",
+                message_body(&m.text, &m.media_kind, &m.file_id)
+            ));
         }
         if !m.media_path.is_empty() {
             lines.push(format!("{head} [file] {} -- read it via read tool", m.media_path));
@@ -625,6 +782,10 @@ pub struct GifEntry {
     pub file_id: String,
     /// Caption text of the freshest message showing this GIF (may be empty).
     pub text: String,
+    /// What was being discussed when the GIF was dropped: the text of the
+    /// message it answered, else of the message right before it. This is the
+    /// honest hint of WHEN the GIF fits; empty when the chat left none.
+    pub context: String,
 }
 
 /// Caps a caption so one long message cannot flood the batch context.
@@ -640,50 +801,63 @@ fn gif_one_line(text: &str) -> String {
     }
 }
 
-/// Deduplicated GIF registry: key rule, ordering and page+total in one pass.
+/// Deduplicated GIF registry: only rows Telegram itself delivered as
+/// `animation` (a real GIF) — never a video, photo, document or sticker that
+/// merely carries a file_id. Historic rows have no `media_kind` and are
+/// therefore excluded: the kind cannot be recovered from file_id after the
+/// fact, and calling a video a GIF is worse than a shorter registry.
 ///
-/// Dedup key: `file_unique_id` when present, else `file_id`. Historic rows have
-/// no `file_unique_id` (the Bot API cannot convert file_id -> file_unique_id),
-/// so their key is the file_id: re-sent copies of the same GIF collapse, two
-/// messages carrying the very same file_id collapse, and a GIF the bot itself
-/// re-sent with a fresh file_id is listed twice until a new ingest with
-/// file_unique_id appears.
+/// Dedup key: `file_unique_id` when present, else `file_id`.
 ///
 /// The page and the registry total come from one pass: `COUNT(*) OVER ()`
 /// rides along with the page instead of the second full scan `gif_count`
 /// used to pay. Kept as a constant so `dbbench` explains exactly this text.
 pub const GIF_PAGE_SQL: &str = "WITH grouped AS (
            SELECT COALESCE(NULLIF(file_unique_id,''), file_id) AS dedup_key,
-                  file_id, text, date, message_id,
+                  file_id, text, date, message_id, reply_to,
                   ROW_NUMBER() OVER (
                     PARTITION BY COALESCE(NULLIF(file_unique_id,''), file_id)
                     ORDER BY date DESC, message_id DESC) AS rn
            FROM messages
-           WHERE file_id IS NOT NULL AND file_id <> ''
+           WHERE media_kind='animation' AND file_id IS NOT NULL AND file_id <> ''
          ),
          page AS (
-           SELECT file_id, text, date, message_id, COUNT(*) OVER () AS total
+           SELECT file_id, text, date, message_id, reply_to, COUNT(*) OVER () AS total
            FROM grouped WHERE rn = 1
            ORDER BY date DESC, message_id DESC LIMIT ? OFFSET ?
          )
-         SELECT file_id, text, total FROM page ORDER BY date DESC, message_id DESC";
+         SELECT file_id, text, total,
+                COALESCE(
+                  (SELECT NULLIF(TRIM(substr(m2.text,1,120)),'')
+                     FROM messages m2 WHERE m2.message_id = page.reply_to LIMIT 1),
+                  (SELECT NULLIF(TRIM(substr(m3.text,1,120)),'')
+                     FROM messages m3
+                    WHERE (m3.date, m3.message_id) < (page.date, page.message_id)
+                      AND m3.text IS NOT NULL AND TRIM(m3.text) <> ''
+                    ORDER BY m3.date DESC, m3.message_id DESC LIMIT 1),
+                  ''
+                ) AS context
+         FROM page ORDER BY date DESC, message_id DESC";
 
 pub fn gif_page(con: &Connection, offset: i64, limit: i64) -> Result<(Vec<GifEntry>, i64)> {
     let offset = offset.max(0);
     let limit = limit.clamp(1, 500);
     let mut stmt = con.prepare_cached(GIF_PAGE_SQL)?;
-    let rows: Vec<(String, Option<String>, i64)> = stmt
-        .query_map(params![limit, offset], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    let rows: Vec<(String, Option<String>, i64, Option<String>)> = stmt
+        .query_map(params![limit, offset], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
         .flatten()
         .collect();
     let total = rows.first().map(|r| r.2).unwrap_or(0);
     Ok((
         rows.into_iter()
             .enumerate()
-            .map(|(i, (file_id, text, _))| GifEntry {
+            .map(|(i, (file_id, text, _, context))| GifEntry {
                 idx: offset + i as i64 + 1,
                 file_id,
                 text: gif_one_line(text.as_deref().unwrap_or("")),
+                context: gif_one_line(context.as_deref().unwrap_or("")),
             })
             .collect(),
         total,
@@ -699,22 +873,27 @@ pub fn gif_registry(con: &Connection, offset: i64, limit: i64) -> Result<Vec<Gif
 pub fn gif_count(con: &Connection) -> Result<i64> {
     Ok(con
         .prepare_cached(
-            "SELECT COUNT(DISTINCT COALESCE(NULLIF(file_unique_id,''), file_id)) FROM messages WHERE file_id IS NOT NULL AND file_id <> ''",
+            "SELECT COUNT(DISTINCT COALESCE(NULLIF(file_unique_id,''), file_id)) FROM messages WHERE media_kind='animation' AND file_id IS NOT NULL AND file_id <> ''",
         )?
         .query_row([], |r| r.get(0))?)
 }
 
 fn gif_entry_line(e: &GifEntry) -> String {
+    let mut line = format!("[gif:{}] file_id={}", e.idx, e.file_id);
     if e.text.is_empty() {
-        format!("[gif:{}] file_id={} · (без описания)", e.idx, e.file_id)
+        line.push_str(" · (без подписи)");
     } else {
-        format!("[gif:{}] file_id={} · «{}»", e.idx, e.file_id, e.text)
+        line.push_str(&format!(" · «{}»", e.text));
     }
+    if !e.context.is_empty() {
+        line.push_str(&format!(" · момент: «{}»", e.context));
+    }
+    line
 }
 
-/// Batch-context catalog: at most `limit` deduplicated GIFs with captions.
-/// The full list is served on demand by the `gif_list` tool through the
-/// daemon (`gif_list_text`).
+/// Batch-context catalog: at most `limit` deduplicated GIFs with captions and
+/// the `момент` hint. The full list is served on demand by the `gif_list` tool
+/// through the daemon (`gif_list_text`).
 pub fn gif_catalog(con: &Connection, limit: i64) -> Result<String> {
     let entries = gif_registry(con, 0, limit)?;
     if entries.is_empty() {
@@ -722,7 +901,7 @@ pub fn gif_catalog(con: &Connection, limit: i64) -> Result<String> {
     }
     let lines: Vec<String> = entries.iter().map(gif_entry_line).collect();
     Ok(format!(
-        "Уже побывавшие в чате гифки (чтобы отправить — передай file_id в параметр gif_file_id тула chat_send, текст рядом станет подписью). Полный список — тул gif_list:\n{}",
+        "Гифки, уже побывавшие в чате (только настоящие анимации; подпись — что было под гифкой, момент — на что её отвечали, подсказка, когда уместно). Чтобы отправить — передай file_id в параметр gif_file_id тула chat_send, текст рядом станет подписью. Полный список — тул gif_list:\n{}",
         lines.join("\n")
     ))
 }
@@ -730,7 +909,7 @@ pub fn gif_catalog(con: &Connection, limit: i64) -> Result<String> {
 /// Full-registry frame for the daemon `gif_list` call (read-only).
 pub fn gif_list_text(entries: &[GifEntry], total: i64) -> String {
     if entries.is_empty() {
-        return "Гифок в истории пока нет.".to_string();
+        return "Гифок в истории пока нет (только подтверждённые анимации; старые записи без типа не угадываются).".to_string();
     }
     let lines: Vec<String> = entries.iter().map(gif_entry_line).collect();
     format!(
@@ -1031,10 +1210,14 @@ pub async fn recreate_session(sid: &str, system_path: &str, ref_: Option<&str>, 
 
 // ---------- context blocks ----------
 
-/// One recent message row: (message_id, user_id, username, first_name, text, media_path).
+/// One recent message row: (message_id, user_id, username, first_name, text, media_path,
+/// media_kind, file_id). New fields are APPENDED so positional readers (dbbench)
+/// keep their indexes.
 pub type RecentRow = (
     Option<i64>,
     Option<i64>,
+    Option<String>,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -1045,7 +1228,7 @@ pub type RecentRow = (
 /// block AND the window anchor) so the same rows are no longer read twice.
 pub fn recent_rows(con: &Connection, n: i64) -> Result<Vec<RecentRow>> {
     let mut stmt = con.prepare_cached(
-        "SELECT message_id,user_id,username,first_name,text,media_path FROM messages ORDER BY date DESC, message_id DESC LIMIT ?",
+        "SELECT message_id,user_id,username,first_name,text,media_path,media_kind,file_id FROM messages ORDER BY date DESC, message_id DESC LIMIT ?",
     )?;
     let rows: Vec<RecentRow> = stmt
         .query_map([n], |r| {
@@ -1056,6 +1239,8 @@ pub fn recent_rows(con: &Connection, n: i64) -> Result<Vec<RecentRow>> {
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
             ))
         })?
         .flatten()
@@ -1073,7 +1258,7 @@ pub fn render_recent_context(
     answered: &HashSet<i64>,
 ) -> String {
     let mut blocks = vec![];
-    for (mid, uid, user, first, text, media) in rows.iter().rev() {
+    for (mid, uid, user, first, text, media, media_kind, file_id) in rows.iter().rev() {
         if let Some(m) = mid {
             if batch_ids.contains(m) {
                 continue;
@@ -1094,11 +1279,16 @@ pub fn render_recent_context(
             head.push_str(" [на это уже отвечено — не отвечать]");
         }
         let mut chunk = vec![];
-        if let Some(t) = text {
-            if !t.is_empty() {
-                let c: String = t.chars().take(cap).collect();
-                chunk.push(format!("{head} {c}"));
-            }
+        let kind = media_kind.clone().unwrap_or_default();
+        let fid = file_id.clone().unwrap_or_default();
+        let body = if kind == "sticker" && !fid.is_empty() {
+            message_body(text.as_deref().unwrap_or(""), &kind, &fid)
+        } else {
+            text.clone().unwrap_or_default()
+        };
+        if !body.trim().is_empty() {
+            let c: String = body.chars().take(cap).collect();
+            chunk.push(format!("{head} {c}"));
         }
         if let Some(m) = media {
             if !m.is_empty() {
@@ -1386,17 +1576,37 @@ pub fn batch_rows_by_ids(con: &Connection, ids: &[Value]) -> Result<Vec<BatchMsg
             Some(m) => m,
             None => continue,
         };
-        let row: Option<(Option<i64>, Option<i64>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)> = con
+        let row: Option<(
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = con
             .prepare_cached(
-                "SELECT message_id,user_id,username,first_name,text,reply_to,media_path FROM messages WHERE message_id=? LIMIT 1",
+                "SELECT message_id,user_id,username,first_name,text,reply_to,media_path,media_kind,file_id FROM messages WHERE message_id=? LIMIT 1",
             )
             .and_then(|mut stmt| {
                 stmt.query_row([mid_int], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
                 })
             })
             .ok();
-        if let Some((m, u, un, f, t, r, mp)) = row {
+        if let Some((m, u, un, f, t, r, mp, kind, fid)) = row {
             let username = un.unwrap_or_default();
             out.push(BatchMsg {
                 message_id: m.unwrap_or(mid_int),
@@ -1407,6 +1617,8 @@ pub fn batch_rows_by_ids(con: &Connection, ids: &[Value]) -> Result<Vec<BatchMsg
                 text: t.unwrap_or_default(),
                 reply_to: r,
                 media_path: mp.unwrap_or_default(),
+                media_kind: kind.unwrap_or_default(),
+                file_id: fid.unwrap_or_default(),
                 to_me: false,
             });
         }
@@ -1460,6 +1672,7 @@ pub fn regen_text(state: &str, con: &Connection, sig: &str) -> Result<Option<Str
     let context = recent_context_with(con, &id_set, 50, 300, &answered)?;
     let guard = answered_guard(con, 5)?;
     let catalog = gif_catalog(con, 20)?;
+    let parents = reply_parents(con, &rows)?;
     let mut parts = vec![];
     if !context.is_empty() {
         parts.push(context);
@@ -1470,7 +1683,7 @@ pub fn regen_text(state: &str, con: &Connection, sig: &str) -> Result<Option<Str
     if !catalog.is_empty() {
         parts.push(catalog);
     }
-    parts.push(format_batch(&rows));
+    parts.push(format_batch(&rows, &parents));
     Ok(Some(parts.join("\n")))
 }
 
@@ -1494,6 +1707,21 @@ pub fn activity_phase(ev: &Value) -> Option<bool> {
 /// same owner set instead of guessing.
 pub fn pending_owner_ids(con: &Connection, sig: &str) -> Vec<i64> {
     let raw = kv_get(con, &format!("pending_owner:{sig}"), "");
+    if raw.is_empty() {
+        return vec![];
+    }
+    serde_json::from_str::<Vec<Value>>(&raw)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .collect()
+}
+
+/// Incoming message ids of a pending batch, as written to the ledger at admit
+/// time. The extension needs them to refuse a `reply_to` that names anything
+/// outside this batch (history window, GIF catalog, another turn).
+pub fn pending_batch_ids(con: &Connection, sig: &str) -> Vec<i64> {
+    let raw = kv_get(con, &format!("pending_batch_ids:{sig}"), "");
     if raw.is_empty() {
         return vec![];
     }
@@ -1601,6 +1829,7 @@ pub fn build_batch_text(
     let context = render_recent_context(&rows, &batch_ids, 50, 300, self_id, &answered);
     let guard = answered_guard(con, 5)?;
     let catalog = gif_catalog(con, 20)?;
+    let parents = reply_parents(con, &batch)?;
     let mut parts = vec![];
     if !context.is_empty() {
         parts.push(context);
@@ -1611,7 +1840,7 @@ pub fn build_batch_text(
     if !catalog.is_empty() {
         parts.push(catalog);
     }
-    parts.push(format_batch(&batch));
+    parts.push(format_batch(&batch, &parents));
     let text = parts.join("\n");
     let sig = batch_sig(&text);
     let ids: Vec<i64> = batch.iter().map(|m| m.message_id).collect();
@@ -1785,11 +2014,62 @@ mod tests {
             text: "hi".into(),
             reply_to: None,
             media_path: "".into(),
+            media_kind: "".into(),
+            file_id: "".into(),
             to_me: true,
             owner: false,
         }];
-        let s = format_batch(&b);
+        let s = format_batch(&b, &HashMap::new());
         assert!(s.contains("[1] @u: [к тебе] hi"));
+    }
+
+    #[test]
+    fn format_batch_renders_reply_parent_text_and_cap() {
+        let mut m = mk_batch_msg(102, "мой ответ");
+        m.reply_to = Some(101);
+        let long = "длинный родитель ".repeat(30);
+        let mut parents = HashMap::new();
+        parents.insert(
+            101,
+            ReplyParent {
+                who: "@u".into(),
+                text: long,
+                media: false,
+            },
+        );
+        let s = format_batch(&[m], &parents);
+        assert!(s.contains("(ответ на [101] @u: «длинный родитель"), "got: {s}");
+        assert!(s.contains('…'), "parent text was not capped: {s}");
+        let body = s.split('«').nth(1).unwrap().split('»').next().unwrap();
+        assert!(
+            body.chars().count() <= REPLY_PARENT_CAP + 1,
+            "cap exceeded: {} chars",
+            body.chars().count()
+        );
+    }
+
+    #[test]
+    fn format_batch_renders_media_missing_parent_and_header() {
+        assert!(format_batch(&[], &HashMap::new()).is_empty());
+        let mut m = mk_batch_msg(102, "x");
+        m.reply_to = Some(101);
+        let missing = format_batch(&[m.clone()], &HashMap::new());
+        assert!(missing.contains("(ответ на [101]: сообщения нет в базе)"), "got: {missing}");
+        let mut parents = HashMap::new();
+        parents.insert(
+            101,
+            ReplyParent {
+                who: "@u".into(),
+                text: "".into(),
+                media: true,
+            },
+        );
+        assert!(format_batch(&[m], &parents).contains("(ответ на [101] @u: [file])"));
+        let header = format_batch(&[mk_batch_msg(1, "hi")], &HashMap::new());
+        assert!(
+            header.contains("reply_to — только id из этой пачки"),
+            "batch header missing: {header}"
+        );
     }
 
     #[test]
@@ -1884,16 +2164,69 @@ mod tests {
             text: text.into(),
             reply_to: None,
             media_path: "".into(),
+            media_kind: "".into(),
+            file_id: "".into(),
             to_me: true,
             owner: false,
         }
     }
 
     #[test]
+    fn media_kind_markers_and_sticker_file_id() {
+        let mut photo = mk_batch_msg(1, "подпись [photo]");
+        photo.media_kind = "photo".into();
+        photo.media_path = "/s/media/p.jpg".into();
+        let rendered = format_batch(&[photo], &HashMap::new());
+        assert!(rendered.contains("[photo]"), "got: {rendered}");
+        assert!(rendered.contains("[file] /s/media/p.jpg"), "got: {rendered}");
+
+        let mut gif = mk_batch_msg(2, "[gif]");
+        gif.media_kind = "animation".into();
+        gif.media_path = "/s/media/a_frame.jpg".into();
+        assert!(format_batch(&[gif], &HashMap::new()).contains("[gif]"));
+
+        let mut video = mk_batch_msg(3, "[video]");
+        video.media_kind = "video".into();
+        video.media_path = "/s/media/v_frame.jpg".into();
+        assert!(format_batch(&[video], &HashMap::new()).contains("[video]"));
+
+        // A sticker has no caption and no media file: its file_id must be in
+        // the rendered line, otherwise the model cannot re-send it.
+        let mut sticker = mk_batch_msg(4, "[sticker]");
+        sticker.media_kind = "sticker".into();
+        sticker.file_id = "sticker_fid_1".into();
+        let s = format_batch(&[sticker], &HashMap::new());
+        assert!(s.contains("[sticker]") && s.contains("file_id=sticker_fid_1"), "got: {s}");
+    }
+
+    #[test]
+    fn pick_media_detects_every_kind() {
+        assert_eq!(pick_media(&json!({"text": "hi"})), None);
+        for (key, value) in [
+            ("photo", json!([{"file_id": "p1", "file_size": 1}])),
+            ("animation", json!({"file_id": "a1"})),
+            ("video", json!({"file_id": "v1"})),
+            ("document", json!({"file_id": "d1"})),
+            ("sticker", json!({"file_id": "s1"})),
+            ("voice", json!({"file_id": "o1"})),
+            ("audio", json!({"file_id": "m1"})),
+            ("video_note", json!({"file_id": "n1"})),
+        ] {
+            let msg = json!({ key: value });
+            let (kind, obj) = pick_media(&msg).unwrap_or_else(|| panic!("{key} not picked"));
+            assert_eq!(kind, key);
+            assert!(obj.get("file_id").is_some(), "{key} lost its file_id");
+        }
+        // A photo arrives as an array: the last (largest) size wins.
+        let (_, biggest) = pick_media(&json!({"photo": [{"file_id": "small"}, {"file_id": "big"}]})).unwrap();
+        assert_eq!(biggest.get("file_id").and_then(|v| v.as_str()), Some("big"));
+    }
+
+    #[test]
     fn format_batch_marks_owner() {
         let mut m = mk_batch_msg(5, "слушай");
         m.owner = true;
-        let s = format_batch(&[m]);
+        let s = format_batch(&[m], &HashMap::new());
         assert!(s.contains("[владелец] слушай"), "got: {s}");
     }
 
@@ -1984,46 +2317,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let state = dir.to_string_lossy().to_string();
         let con = db(&state).unwrap();
-        let ins = |uid: i64, mid: i64, date: i64, fid: &str, fu: &str, text: &str| {
+        fn ins_with_reply(
+            con: &Connection,
+            uid: i64,
+            mid: i64,
+            date: i64,
+            fid: &str,
+            fu: &str,
+            text: &str,
+            reply: Option<i64>,
+            kind: &str,
+        ) {
+            let kind: Option<&str> = if kind.is_empty() { None } else { Some(kind) };
             con.execute(
-                "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id) VALUES (?,?,?,7,'u','U',?,NULL,'',?,?)",
-                params![uid, mid, date, text, fid, fu],
+                "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind) VALUES (?,?,?,7,'u','U',?,?,'',?,?,?)",
+                params![uid, mid, date, text, reply, fid, fu, kind],
             )
             .unwrap();
+        }
+        let ins = |uid: i64, mid: i64, date: i64, fid: &str, fu: &str, text: &str, kind: &str| {
+            ins_with_reply(&con, uid, mid, date, fid, fu, text, None, kind);
         };
         // Same unique id twice: one row, freshest caption wins.
-        ins(1, 501, 1000, "fid_a_old", "uniq_a", "старая подпись");
-        ins(2, 502, 2000, "fid_a_new", "uniq_a", "новая подпись");
+        ins(1, 500, 900, "", "", "про кота", "");
+        ins(2, 501, 1000, "fid_a_old", "uniq_a", "старая подпись", "animation");
+        ins(3, 502, 2000, "fid_a_new", "uniq_a", "новая подпись", "animation");
         // Historical rows without file_unique_id dedupe by file_id.
-        ins(3, 903, 9170, "fid_b", "", "");
-        ins(4, 904, 9240, "fid_b", "", "повтор с тем же file_id");
-        ins(5, 905, 9190, "fid_c", "uniq_c", "третья гифка");
+        ins(4, 903, 9170, "fid_b", "", "", "animation");
+        ins(5, 904, 9240, "fid_b", "", "повтор с тем же file_id", "animation");
+        ins(6, 905, 9190, "fid_c", "uniq_c", "третья гифка", "animation");
+        // A gif that answered a message: its context is that message's text.
+        ins_with_reply(&con, 7, 906, 9300, "fid_d", "uniq_d", "гифка в ответ на кота", Some(500), "animation");
+        // NOT gifs, whatever file_id they carry: video, sticker, document,
+        // and a historic row whose kind is unknown.
+        ins(8, 907, 9400, "fid_video", "uniq_v", "видео", "video");
+        ins(9, 908, 9410, "fid_sticker", "uniq_s", "стикер", "sticker");
+        ins(10, 909, 9420, "fid_doc", "uniq_doc", "документ", "document");
+        ins(11, 910, 9430, "fid_legacy", "uniq_l", "старая строка без типа", "");
 
         let all = gif_registry(&con, 0, 20).unwrap();
-        assert_eq!(all.len(), 3, "dedup failed: {all:?}");
-        assert_eq!(all[0].file_id, "fid_b", "newest first");
-        assert_eq!(all[0].text, "повтор с тем же file_id");
-        assert_eq!(all[1].file_id, "fid_c");
-        assert_eq!(all[2].file_id, "fid_a_new");
-        assert_eq!(all[2].text, "новая подпись", "freshest caption of the group wins");
+        assert_eq!(all.len(), 4, "non-animations leaked into the registry: {all:?}");
+        assert_eq!(all[0].file_id, "fid_d", "newest first");
+        assert_eq!(all[0].context, "про кота", "reply text is the moment: {all:?}");
+        assert_eq!(all[1].file_id, "fid_b");
+        assert_eq!(all[1].text, "повтор с тем же file_id");
+        assert_eq!(all[1].context, "третья гифка", "previous message is the fallback moment");
+        assert_eq!(all[2].file_id, "fid_c");
+        assert_eq!(all[2].context, "новая подпись");
+        assert_eq!(all[3].file_id, "fid_a_new");
+        assert_eq!(all[3].text, "новая подпись", "freshest caption of the group wins");
+        assert_eq!(all[3].context, "старая подпись");
         assert_eq!(all[0].idx, 1);
-        assert_eq!(all[2].idx, 3);
+        assert_eq!(all[3].idx, 4);
 
         let two = gif_registry(&con, 0, 2).unwrap();
         assert_eq!(two.len(), 2);
-        assert_eq!(two[1].file_id, "fid_c");
+        assert_eq!(two[1].file_id, "fid_b");
         let page = gif_registry(&con, 2, 2).unwrap();
-        assert_eq!(page.len(), 1);
-        assert_eq!(page[0].file_id, "fid_a_new");
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].file_id, "fid_c");
         assert_eq!(page[0].idx, 3);
 
         let cat = gif_catalog(&con, 2).unwrap();
         assert_eq!(cat.matches("[gif:").count(), 2);
         assert!(cat.contains("«третья гифка»"), "captions are shown: {cat}");
+        assert!(cat.contains("момент: «"), "moment hint is shown: {cat}");
         let list = gif_list_text(&gif_registry(&con, 0, 200).unwrap(), gif_count(&con).unwrap());
-        assert_eq!(list.matches("[gif:").count(), 3);
-        assert!(list.contains("3 из 3"));
-        assert_eq!(gif_count(&con).unwrap(), 3);
+        assert_eq!(list.matches("[gif:").count(), 4);
+        assert!(list.contains("4 из 4"));
+        assert_eq!(gif_count(&con).unwrap(), 4);
+        for not_a_gif in ["fid_video", "fid_sticker", "fid_doc", "fid_legacy"] {
+            assert!(!list.contains(not_a_gif), "{not_a_gif} leaked: {list}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
