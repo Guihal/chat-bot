@@ -390,17 +390,17 @@ pub fn verdict_for(
 /// A Telegram message is one line: collapse whitespace, drop JSON bodies (the
 /// reader needs the fact, not the payload) and cut on a word boundary.
 const ALERT_NOTIFY_MAX: usize = 200;
-/// A bare cause (`db_failure` and friends) is suppressed while it keeps firing
-/// and is CLOSED by expiry — that is what gives it a recovery line without
-/// hooks in db.rs/ledger.rs. Transition causes (`alert_transition`) are never
-/// TTL-closed: their owner is the false edge.
+/// A bare cause (a database failure of one kind) is suppressed while the SAME
+/// entity keeps failing and is CLOSED by expiry, which is what gives it a
+/// recovery line. Transition causes are never TTL-closed: their owner is the
+/// false edge, and their closure mode is persisted (see `close` in the state).
 const ALERT_ACTIVE_TTL_SECS: i64 = 900;
 /// How long one notifier call may take before it is killed and counted failed.
 const NOTIFY_TIMEOUT_SECS: u64 = 10;
 /// A failed notifier is retried by the next sweep, but not forever.
 const NOTIFY_MAX_TRIES: u32 = 5;
-/// Kinds that are EVENTS, not states: each occurrence is its own news and is
-/// never suppressed. `send_unknown` fires per send, so TTL gifts nothing there.
+/// Kinds that are EVENTS, not states: each occurrence is its own news, so they
+/// are neither suppressed nor ever closed (an event cannot "recover").
 const ALERT_EVENT_KINDS: &[&str] = &["send_unknown"];
 
 fn alert_line(kind: &str, detail: &str) -> String {
@@ -408,7 +408,7 @@ fn alert_line(kind: &str, detail: &str) -> String {
 }
 
 pub fn alert_notify_text(kind: &str, detail: &str) -> String {
-    let mut collapsed = String::with_capacity(detail.len());
+    let mut collapsed = String::new();
     let mut in_braces = false;
     for ch in detail.chars() {
         match ch {
@@ -448,35 +448,66 @@ pub fn alert_notify_text(kind: &str, detail: &str) -> String {
     alert_line(kind, &body)
 }
 
+/// The suppression identity of a bare cause: the KIND plus the failing ENTITY,
+/// taken from the head of the detail (`db_failure` reports `context: error`, so
+/// two different contexts are two different causes). Without the entity half,
+/// a second, genuinely different failure would be swallowed for the whole TTL.
+fn cause_key(kind: &str, detail: &str) -> String {
+    let head = detail.split(':').next().unwrap_or("").trim();
+    let entity: String = head.chars().take(40).collect();
+    if entity.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind}|{entity}")
+    }
+}
+
+/// How a cause is allowed to close. Persisted, because the edge gate itself is
+/// memory-only: after a restart a `run_failed:<sig>` armed before the restart
+/// must not be handed to the TTL sweep, which would claim it recovered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloseMode {
+    Ttl,
+    Edge,
+}
+
 fn gate() -> &'static Mutex<HashMap<String, bool>> {
     static GATE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
     GATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One writer for `notify-state.json`. `alert_to`, the notifier threads and the
+/// sweep all mutate it; without this lock a stale snapshot overwrites a `pending`
+/// entry written a moment earlier and the promised retry is lost.
+fn state_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn notify_state_path(state: &str) -> std::path::PathBuf {
     std::path::Path::new(state).join("notify-state.json")
 }
 
-/// Suppression marks that must survive a restart (`Restart=always` would
-/// otherwise re-send the same line every 15 s during a crash loop) plus the
-/// notifier lines that failed to go out.
 #[derive(Default)]
 struct NotifyState {
     /// cause key -> last time it was seen (unix seconds)
     seen: HashMap<String, i64>,
     /// cause key -> line still undelivered, with its attempt count
     pending: HashMap<String, (String, u32)>,
+    /// kind -> how it is allowed to close
+    close: HashMap<String, i64>,
+    /// kinds whose edge is armed, surviving a daemon restart
+    arms: HashMap<String, bool>,
 }
 
 fn load_notify_state(state: &str) -> NotifyState {
-    let path = notify_state_path(state);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return NotifyState::default();
+    let mut out = NotifyState::default();
+    let Ok(text) = std::fs::read_to_string(notify_state_path(state)) else {
+        return out;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return NotifyState::default();
+        return out;
     };
-    let mut out = NotifyState::default();
     if let Some(map) = value.get("seen").and_then(|v| v.as_object()) {
         for (k, v) in map {
             if let Some(ts) = v.as_i64() {
@@ -493,6 +524,20 @@ fn load_notify_state(state: &str) -> NotifyState {
             }
         }
     }
+    if let Some(map) = value.get("close").and_then(|v| v.as_object()) {
+        for (k, v) in map {
+            if let Some(mode) = v.as_i64() {
+                out.close.insert(k.clone(), mode);
+            }
+        }
+    }
+    if let Some(map) = value.get("arms").and_then(|v| v.as_object()) {
+        for (k, v) in map {
+            if let Some(armed) = v.as_bool() {
+                out.arms.insert(k.clone(), armed);
+            }
+        }
+    }
     out
 }
 
@@ -505,17 +550,23 @@ fn save_notify_state(state: &str, st: &NotifyState) {
     for (k, (line, tries)) in &st.pending {
         pending.insert(k.clone(), serde_json::json!({"line": line, "tries": tries}));
     }
-    let body = serde_json::json!({"seen": seen, "pending": pending}).to_string();
+    let mut close = serde_json::Map::new();
+    for (k, v) in &st.close {
+        close.insert(k.clone(), serde_json::json!(v));
+    }
+    let mut arms = serde_json::Map::new();
+    for (k, v) in &st.arms {
+        arms.insert(k.clone(), serde_json::json!(v));
+    }
+    let body = serde_json::json!({"seen": seen, "pending": pending, "close": close, "arms": arms})
+        .to_string();
     let path = notify_state_path(state);
     let tmp = path.with_extension("json.tmp");
-    // Best effort: an unwritable state dir must not stop the alert itself.
     if std::fs::write(&tmp, body).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }
 }
 
-/// Run the notifier with a deadline and report HOW it ended. Today the code
-/// spawns and forgets with stdio to /dev/null, so `rc!=0` is invisible.
 fn run_notifier(cmd: &str, line: &str) -> Result<(), String> {
     use std::process::{Command, Stdio};
     let mut child = Command::new(cmd)
@@ -556,7 +607,7 @@ fn notify_line(state: &str, key: &str, line: &str) {
     }
     match run_notifier(&cmd, line) {
         Ok(()) => {
-            // The retry (or the first attempt) went out: the waiting line is done.
+            let _guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
             let mut st = load_notify_state(state);
             if st.pending.remove(key).is_some() {
                 save_notify_state(state, &st);
@@ -564,6 +615,7 @@ fn notify_line(state: &str, key: &str, line: &str) {
         }
         Err(err) => {
             crate::dlog_at(state, &format!("notify_failed: {key} {err}"));
+            let _guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
             let mut st = load_notify_state(state);
             let tries = st.pending.get(key).map(|(_, t)| *t).unwrap_or(0) + 1;
             if tries >= NOTIFY_MAX_TRIES {
@@ -581,6 +633,12 @@ fn notify_line(state: &str, key: &str, line: &str) {
     }
 }
 
+fn spawn_notify(state: &str, key: &str, text: String) {
+    let state_owned = state.to_string();
+    let key_owned = key.to_string();
+    std::thread::spawn(move || notify_line(&state_owned, &key_owned, &text));
+}
+
 /// Emit one alert line through the daemon log and, if configured, the external
 /// notifier (`CHATBOT_NOTIFY_CMD`, receiving ONE line). A failed notifier never
 /// hides the log line and is retried by the next sweep.
@@ -589,34 +647,78 @@ pub fn alert(kind: &str, detail: &str) {
 }
 
 pub fn alert_to(state: &str, kind: &str, detail: &str) {
-    let line = alert_line(kind, detail);
-    crate::dlog_at(state, &line);
-    let now = now_secs();
-    let mut st = load_notify_state(state);
-    let seen = st.seen.get(kind).copied().unwrap_or(0);
+    alert_common(state, kind, detail, false);
+}
+
+/// Same contract as [`alert_to`], but the notifier runs INLINE. A fatal startup
+/// path (the database cannot even be opened) exits immediately, and a spawned
+/// thread dies with the process before the child command starts — the owner
+/// would get a log line and no message, which is exactly the silence this cycle
+/// exists to remove.
+pub fn alert_to_sync(state: &str, kind: &str, detail: &str) {
+    alert_common(state, kind, detail, true);
+}
+
+fn alert_common(state: &str, kind: &str, detail: &str, inline: bool) {
+    crate::dlog_at(state, &alert_line(kind, detail));
+    let text = alert_notify_text(kind, detail);
     let is_event = ALERT_EVENT_KINDS.contains(&kind);
-    // The cause is already live and has already been delivered: log only.
-    // The expiry sweep is what eventually closes it and sends `recovered`.
-    if !is_event && seen > 0 && now.saturating_sub(seen) < ALERT_ACTIVE_TTL_SECS {
-        st.seen.insert(kind.to_string(), now);
-        save_notify_state(state, &st);
+    if is_event {
+        if inline {
+            notify_line(state, kind, &text);
+        } else {
+            spawn_notify(state, kind, text);
+        }
         return;
     }
-    st.seen.insert(kind.to_string(), now);
-    save_notify_state(state, &st);
-    let notify = alert_notify_text(kind, detail);
-    let state_owned = state.to_string();
-    let kind_owned = kind.to_string();
-    // The notifier runs in its own thread: waiting inside the caller would
-    // stall a health tick on a slow HTTP client.
-    std::thread::spawn(move || notify_line(&state_owned, &kind_owned, &notify));
+    let key = cause_key(kind, detail);
+    let now = now_secs();
+    let suppressed = {
+        let _guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = load_notify_state(state);
+        let seen = st.seen.get(&key).copied().unwrap_or(0);
+        let live = seen > 0 && now.saturating_sub(seen) < ALERT_ACTIVE_TTL_SECS;
+        st.seen.insert(key.clone(), now);
+        st.close
+            .entry(kind.to_string())
+            .or_insert(CloseMode::Ttl as i64);
+        save_notify_state(state, &st);
+        live
+    };
+    if !suppressed {
+        if inline {
+            notify_line(state, &key, &text);
+        } else {
+            spawn_notify(state, &key, text);
+        }
+    }
+}
+
+pub fn db_failure(context: &str, err: &anyhow::Error) {
+    db_failure_to(&crate::state_dir(), context, err);
+}
+
+/// The bare-cause shape: `context` names the failing entity, so two different
+/// database contexts are two different causes rather than one swallowing the
+/// other for the whole suppression window.
+pub fn db_failure_to(state: &str, context: &str, err: &anyhow::Error) {
+    alert_to(state, "db_failure", &format!("{context}: {err:#}"));
+}
+
+/// Fatal-path variant: the process is about to exit, so the notifier must not be
+/// left to a background thread.
+pub fn db_failure_sync(context: &str, err: &anyhow::Error) {
+    alert_to_sync(
+        &crate::state_dir(),
+        "db_failure",
+        &format!("{context}: {err:#}"),
+    );
 }
 
 /// Persistent conditions (socket gone, disk below reserve, session mismatch,
-/// held session, stale poll) alert once per transition: the escalation is owned
-/// by the false→true edge and the recovery line by the true→false edge.
-/// A TTL sweep never closes these — that would claim "recovered" while the
-/// fault is still there, because a persistent cause does not re-alert.
+/// held session, stale poll, an undeliverable batch) alert once per transition:
+/// the escalation belongs to the false→true edge and the recovery line to the
+/// true→false edge. A TTL sweep never closes these.
 pub fn alert_transition(kind: &str, active: bool, detail: &str) {
     alert_transition_to(&crate::state_dir(), kind, active, detail);
 }
@@ -624,7 +726,7 @@ pub fn alert_transition(kind: &str, active: bool, detail: &str) {
 /// State-scoped form, so the contract can be exercised without racing the
 /// process-wide `CHATBOT_STATE_DIR`.
 pub fn alert_transition_to(state: &str, kind: &str, active: bool, detail: &str) {
-    let was_active = {
+    let (was_active, persisted_armed) = {
         let mut g = gate().lock().unwrap_or_else(|e| e.into_inner());
         let was = g.get(kind).copied().unwrap_or(false);
         if active {
@@ -632,30 +734,46 @@ pub fn alert_transition_to(state: &str, kind: &str, active: bool, detail: &str) 
         } else {
             g.remove(kind);
         }
-        was
+        drop(g);
+        let _guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = load_notify_state(state);
+        let armed = st.arms.get(kind).copied().unwrap_or(false);
+        st.arms.insert(kind.to_string(), active);
+        st.close.insert(kind.to_string(), CloseMode::Edge as i64);
+        if !active {
+            st.seen.remove(kind);
+        }
+        save_notify_state(state, &st);
+        (was, armed)
     };
     if active {
-        if !was_active {
-            alert_to(state, kind, detail);
+        // `persisted_armed` carries the edge across a restart: an outage that was
+        // already announced is not announced again by a booted daemon.
+        if !was_active && !persisted_armed {
+            // The edge owns suppression here, so the cause does not enter the
+            // TTL map at all: one announcement per outage, and closure by the
+            // false edge instead of by time.
+            crate::dlog_at(state, &alert_line(kind, detail));
+            spawn_notify(state, kind, alert_notify_text(kind, detail));
         }
-    } else if was_active {
-        // Closing the cause also clears its suppression mark, so a NEW outage
-        // of the same kind alerts immediately instead of waiting out the TTL.
+    } else if was_active || persisted_armed {
+        let recovered = format!("{kind}:recovered");
+        crate::dlog_at(state, &alert_line(&recovered, "back to normal"));
+        spawn_notify(
+            state,
+            &recovered,
+            alert_notify_text(&recovered, "back to normal"),
+        );
+        let _guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
         let mut st = load_notify_state(state);
         st.seen.remove(kind);
         save_notify_state(state, &st);
-        let recovered = format!("{kind}:recovered");
-        crate::dlog_at(state, &alert_line(&recovered, "back to normal"));
-        let notify = alert_notify_text(&recovered, "back to normal");
-        let key = recovered.clone();
-        let state_owned = state.to_string();
-        std::thread::spawn(move || notify_line(&state_owned, &key, &notify));
     }
 }
 
-/// One alert tick: close TTL-owned causes that stopped happening (emitting the
-/// recovery line once) and retry notifier lines that failed. Transition causes
-/// are skipped by construction — their owner is the false edge.
+/// One alert tick: close TTL-owned causes that stopped happening (one recovery
+/// line) and retry notifier lines that failed. Transition causes are skipped —
+/// their owner is the false edge — and so are pure events.
 pub fn sweep_alerts(state: &str) {
     let now = now_secs();
     let active_transitions: Vec<String> = {
@@ -665,42 +783,48 @@ pub fn sweep_alerts(state: &str) {
             .map(|(k, _)| k.clone())
             .collect()
     };
-    let mut st = load_notify_state(state);
-    let expired: Vec<String> = st
-        .seen
-        .iter()
-        .filter(|(k, ts)| {
-            now.saturating_sub(**ts) >= ALERT_ACTIVE_TTL_SECS && !active_transitions.contains(k)
-        })
-        .map(|(k, _)| k.clone())
-        .collect();
-    for key in expired {
-        st.seen.remove(&key);
-        let kind = format!("{key}:recovered");
+    let mut due_recovered: Vec<String> = Vec::new();
+    let due_retries: Vec<(String, String)>;
+    {
+        let _guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = load_notify_state(state);
+        let expired: Vec<String> = st
+            .seen
+            .iter()
+            .filter(|(key, ts)| {
+                let kind = key.split('|').next().unwrap_or(key);
+                let edge = st.close.get(kind).copied() == Some(CloseMode::Edge as i64);
+                let armed = st.arms.get(kind).copied().unwrap_or(false);
+                let is_event = ALERT_EVENT_KINDS.contains(&kind);
+                !edge
+                    && !armed
+                    && !is_event
+                    && !active_transitions.iter().any(|a| a == kind)
+                    && now.saturating_sub(**ts) >= ALERT_ACTIVE_TTL_SECS
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in expired {
+            st.seen.remove(&key);
+            let kind = key.split('|').next().unwrap_or(&key).to_string();
+            due_recovered.push(kind);
+        }
+        due_retries = st
+            .pending
+            .iter()
+            .map(|(k, (line, _))| (k.clone(), line.clone()))
+            .collect();
+        save_notify_state(state, &st);
+    }
+    for kind in due_recovered {
+        let text_kind = format!("{kind}:recovered");
         let detail = format!("no recurrence within {ALERT_ACTIVE_TTL_SECS}s");
-        crate::dlog_at(state, &alert_line(&kind, &detail));
-        let notify = alert_notify_text(&kind, &detail);
-        let state_owned = state.to_string();
-        std::thread::spawn(move || notify_line(&state_owned, &kind, &notify));
+        crate::dlog_at(state, &alert_line(&text_kind, &detail));
+        spawn_notify(state, &text_kind, alert_notify_text(&text_kind, &detail));
     }
-    let retries: Vec<(String, String)> = st
-        .pending
-        .iter()
-        .map(|(k, (line, _))| (k.clone(), line.clone()))
-        .collect();
-    save_notify_state(state, &st);
-    for (key, line) in retries {
-        let state_owned = state.to_string();
-        std::thread::spawn(move || notify_line(&state_owned, &key, &line));
+    for (key, line) in due_retries {
+        spawn_notify(state, &key, line);
     }
-}
-
-pub fn db_failure(context: &str, err: &anyhow::Error) {
-    db_failure_to(&crate::state_dir(), context, err);
-}
-
-pub fn db_failure_to(state: &str, context: &str, err: &anyhow::Error) {
-    alert_to(state, "db_failure", &format!("{context}: {err:#}"));
 }
 
 // ---------- daemon health unit ----------

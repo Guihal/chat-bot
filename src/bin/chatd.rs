@@ -1708,7 +1708,7 @@ async fn cmd_run() -> Result<()> {
     let db = match Db::open(&state) {
         Ok(db) => db,
         Err(e) => {
-            ops::db_failure("open", &e);
+            ops::db_failure_sync("open", &e);
             return Err(e);
         }
     };

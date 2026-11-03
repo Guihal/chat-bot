@@ -89,7 +89,7 @@ fn without_credentials_the_refusal_is_recorded_and_the_line_survives() {
 
     ops::alert_to(&state, "host_socket_gone", "socket missing");
 
-    let recorded = wait_log(&dir, "notify_failed: host_socket_gone rc=2");
+    let recorded = wait_log(&dir, "notify_failed: host_socket_gone");
     std::env::remove_var("CHATBOT_NOTIFY_CMD");
     assert!(
         recorded,

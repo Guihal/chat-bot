@@ -234,7 +234,7 @@ fn a_failing_notifier_is_recorded_and_retried() {
     let log = log_lines(&dir);
     assert!(
         log.iter()
-            .any(|l| l.contains("notify_failed: db_failure rc=2")),
+            .any(|l| l.contains("notify_failed: db_failure|open rc=2")),
         "a failed delivery must be recorded: {log:?}"
     );
     let persisted = std::fs::read_to_string(dir.join("notify-state.json")).unwrap();
@@ -250,7 +250,7 @@ fn a_failing_notifier_is_recorded_and_retried() {
     let retried = wait_calls(&dir, before + 1);
     std::env::remove_var("CHATBOT_NOTIFY_CMD");
     assert_eq!(retried.len(), before + 1, "the retry went out: {retried:?}");
-    let persisted = wait_pending_cleared(&dir, "db_failure");
+    let persisted = wait_pending_cleared(&dir, "db_failure|open");
     assert!(
         persisted.contains("\"pending\":{}"),
         "a delivered line is no longer pending: {persisted}"
@@ -332,5 +332,88 @@ fn the_two_new_persistent_causes_report_once_and_recover_once() {
         tail.iter().any(|l| l.contains("session_held:recovered"))
             && tail.iter().any(|l| l.contains("poll_stale:recovered")),
         "the notifier threads race, so compare as a set: {recovered:?}"
+    );
+}
+
+#[test]
+fn an_event_cause_is_never_closed_by_the_sweep() {
+    let _guard = env_guard();
+    let dir = temp_state("eventclear");
+    let script = stub_notifier(&dir, 0);
+    std::env::set_var("CHATBOT_NOTIFY_CMD", &script);
+    let state = dir.display().to_string();
+
+    ops::alert_to(&state, "send_unknown", "send 21 unknown");
+    let _ = wait_calls(&dir, 1);
+    settle();
+    ops::sweep_alerts(&state);
+    settle();
+    std::env::remove_var("CHATBOT_NOTIFY_CMD");
+
+    let calls = calls(&dir);
+    assert_eq!(calls.len(), 1, "an event has no recovery: {calls:?}");
+    assert!(
+        !calls.iter().any(|l| l.contains("recovered")),
+        "nothing may claim recovery: {calls:?}"
+    );
+}
+
+#[test]
+fn two_different_database_contexts_are_two_causes() {
+    let _guard = env_guard();
+    let dir = temp_state("dbctx");
+    let script = stub_notifier(&dir, 0);
+    std::env::set_var("CHATBOT_NOTIFY_CMD", &script);
+    let state = dir.display().to_string();
+
+    ops::alert_to(&state, "db_failure", "db.call: disk I/O error");
+    let _ = wait_calls(&dir, 1);
+    ops::alert_to(&state, "db_failure", "db.write: database is locked");
+    let got = wait_calls(&dir, 2);
+    std::env::remove_var("CHATBOT_NOTIFY_CMD");
+
+    assert_eq!(got.len(), 2, "a second failing entity is news: {got:?}");
+    assert!(got[0].contains("disk I/O error"), "{got:?}");
+    assert!(got[1].contains("database is locked"), "{got:?}");
+}
+
+#[test]
+fn a_persisted_edge_cause_is_not_swept_after_a_restart() {
+    let _guard = env_guard();
+    let dir = temp_state("edgepersist");
+    let script = stub_notifier(&dir, 0);
+    std::env::set_var("CHATBOT_NOTIFY_CMD", &script);
+    let state = dir.display().to_string();
+
+    ops::alert_transition_to(&state, "run_failed:sig-1", true, "could not deliver");
+    let _ = wait_calls(&dir, 1);
+    settle();
+    std::fs::write(
+        dir.join("notify-state.json"),
+        format!(
+            "{{\"seen\":{{\"{}|could not deliver\":{}}},\"pending\":{{}},\"close\":{{\"run_failed:sig-1\":{}}},\"arms\":{{\"run_failed:sig-1\":true}}}}",
+            "db_failure",
+            chat_bot::ops::now_secs() - 10_000,
+            1
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("notify-state.json"),
+        format!(
+            "{{\"seen\":{{\"run_failed:sig-1|could not deliver\":{}}},\"pending\":{{}},\"close\":{{\"run_failed:sig-1\":{}}},\"arms\":{{\"run_failed:sig-1\":true}}}}",
+            chat_bot::ops::now_secs() - 10_000,
+            1
+        ),
+    )
+    .unwrap();
+    ops::sweep_alerts(&state);
+    settle();
+    std::env::remove_var("CHATBOT_NOTIFY_CMD");
+
+    let calls = calls(&dir);
+    assert!(
+        !calls.iter().any(|l| l.contains("recovered")),
+        "an armed edge cause is not closed by time: {calls:?}"
     );
 }
