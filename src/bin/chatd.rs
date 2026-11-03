@@ -531,7 +531,7 @@ async fn deliver_sig(
         let budget = if cycle == 0 { first } else { rest };
         if out_tx
             .send(Out::Push {
-                delivery_id: sig.to_string(),
+                delivery_id: frame_id(sig),
                 text: text.to_string(),
                 owner_msgs: owners.to_vec(),
                 batch_ids: ids.to_vec(),
@@ -549,7 +549,7 @@ async fn deliver_sig(
             }
             match tokio::time::timeout(remaining, inbound_rx.recv()).await {
                 Ok(Some(Inbound::Result { delivery_id, kind })) => {
-                    if delivery_id != sig {
+                    if !frame_for(&delivery_id, sig) {
                         continue;
                     }
                     if accepted_kind(&kind) {
@@ -870,8 +870,10 @@ async fn track_loop(
                             match st.as_str() {
                                 "emitted" => {
                                     // The context entry exists: the agent has
-                                    // the batch. Not a close, just progress.
-                                    let id_db = id.clone();
+                                    // the batch. Not a close, just progress. The
+                                    // event carries the frame id (`sig#n`), the
+                                    // ledger is keyed by the batch sig.
+                                    let id_db = sig_of_frame(&id).to_string();
                                     let _ = db
                                         .call(move |con| {
                                             pending_mark_set(con, &id_db, "emitted_at", at)?;

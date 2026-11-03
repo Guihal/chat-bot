@@ -1638,6 +1638,35 @@ pub fn mark_done(con: &Connection, _state: &str, sig: &str) -> Result<()> {
     Ok(())
 }
 
+/// Delivery frames are `sig#n`. `admitExternalMessage` is idempotent per
+/// delivery_id, so a re-delivery MUST carry a fresh id: reusing the batch sig
+/// made a batch that stalled once come back as `already_admitted`, which
+/// enqueues nothing — the text never entered the context again and the bot went
+/// silent while the daemon re-delivered forever (observed live 2026-11-03: 24
+/// admissions, zero emissions, a session recreated every ~15 s). The ledger
+/// keeps the batch sig; only the frame id differs.
+static DELIVERY_FRAME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn frame_id(sig: &str) -> String {
+    format!(
+        "{sig}#{}",
+        DELIVERY_FRAME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// Batch sig behind a frame id: `sig`, or `sig#n` from a later attempt.
+pub fn sig_of_frame(frame: &str) -> &str {
+    match frame.rfind('#') {
+        Some(i) if i + 1 < frame.len() && frame[i + 1..].bytes().all(|b| b.is_ascii_digit()) => &frame[..i],
+        _ => frame,
+    }
+}
+
+/// True when `frame` belongs to the batch `sig` (first or any re-delivery).
+pub fn frame_for(frame: &str, sig: &str) -> bool {
+    sig_of_frame(frame) == sig
+}
+
 pub async fn wait_for(state: &str, mut offset: u64, want: &str, sig: &str, budget: Duration) -> Result<(Option<Value>, Vec<Value>, u64)> {
     let deadline = Instant::now() + budget;
     let mut receipts = vec![];
@@ -1649,7 +1678,7 @@ pub async fn wait_for(state: &str, mut offset: u64, want: &str, sig: &str, budge
             if (kind == "chat_send_result" || kind == "chat_send_replay") && ev.get("receipt").map(|r| r.is_object()).unwrap_or(false) {
                 receipts.push(ev.get("receipt").unwrap().clone());
             }
-            if kind == want && (want != "admitted" || ev.get("delivery_id").and_then(|v| v.as_str()).unwrap_or("") == sig) {
+            if kind == want && (want != "admitted" || frame_for(ev.get("delivery_id").and_then(|v| v.as_str()).unwrap_or(""), sig)) {
                 return Ok((Some(ev), receipts, offset));
             }
         }
@@ -2506,5 +2535,20 @@ mod tests {
         assert_eq!(activity_phase(&t), None);
         let m = json!({"kind": "agent_activity"});
         assert_eq!(activity_phase(&m), None);
+    }
+
+    #[test]
+    fn delivery_frames_are_unique_and_map_back_to_the_batch() {
+        let a = frame_id("abc123");
+        let b = frame_id("abc123");
+        assert_ne!(a, b, "a re-delivery must carry a fresh frame id");
+        assert!(frame_for(&a, "abc123"));
+        assert!(frame_for(&b, "abc123"));
+        assert!(frame_for("abc123", "abc123"), "a plain sig still matches");
+        assert!(!frame_for(&a, "abc12"), "a prefix of the sig is not the batch");
+        assert!(!frame_for("abc123#x", "abc123"), "a non-numeric suffix is no frame");
+        assert_eq!(sig_of_frame(&a), "abc123");
+        assert_eq!(sig_of_frame("abc123"), "abc123");
+        assert_eq!(sig_of_frame("abc#7#2"), "abc#7");
     }
 }
