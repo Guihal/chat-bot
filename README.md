@@ -117,6 +117,9 @@
 | `CHATBOT_RETRY_SEC` | `60` | пауза перед повтором неудавшейся доставки |
 | `CHATBOT_EMIT_SEC` | `60` | ожидание следа доставки в транскрипте |
 | `CHATBOT_SUMMARY_SESSION` | `chat-summary` | имя сессии для `chatd summarize` |
+| `CHATBOT_STALE_SEC` | `90` | порог свежести `poll_ok_at`; период наблюдателя и записи `health.json` = `stale/2` (одно значение, не два) |
+| `CHATBOT_SYSTEMD_UNIT` | `chat-bot.service` | юнит, чьё состояние решает вердикт `down` |
+| `CHATBOT_NOTIFY_CMD` | пусто | внешний notifier (например, `tg-notify`): получает строку `ALERT ...` одним аргументом; пусто = только `chatd.log` |
 
 ## Запуск как сервис (systemd)
 
@@ -215,6 +218,37 @@ Telegram и пишет кадры в сокет. Многошаговые опе
 `src/bin/dbbench.rs` — воспроизводимый замер старых и новых запросов на одном файле в одном
 прогоне (фаза «до» — старый SQL без новых индексов, «после» — новый вызов с индексами,
 затем сравнение результатов: расхождение = баг, а не ускорение).
+
+### Наблюдаемость и откат
+
+Демон пишет `<state>/health.json` — только факты: `poll_ok_at` (время последнего успешного
+`getUpdates`), глубину очереди медиа, состояние host-сокета, число сессий с настроенным
+именем, размеры `media/`, базы и логов, счётчики приёма. Вердикта в файле нет.
+
+```bash
+chatd config --effective     # что реально в силе в этом процессе
+chatd watchdog               # VERDICT up|degraded|stale|down + причины, код 0/1/2/3
+chatd watchdog --loop        # то же с периодом stale/2 (в одном процессе)
+```
+
+`stale` — живой процесс, у которого `poll_ok_at` старше `CHATBOT_STALE_SEC`; `down` — юнит
+не активен. Возраст самого `health.json` на вердикт не влияет. Алерты пишутся строкой
+`ALERT <kind>: <detail>` в `chatd.log` (и в `CHATBOT_NOTIFY_CMD`, если задан):
+`host_socket_gone`, `send_unknown`, `db_failure`, `free_below_reserve`, `session_mismatch`.
+
+Релиз и откат — набором, а не отдельным расширением:
+
+```bash
+deploy/release.sh manifest --root . --env-file /etc/chat-bot/chat-bot.env --manifest /var/lib/chat-bot/release.manifest
+deploy/release.sh backup --root . --env-file /etc/chat-bot/chat-bot.env --dest /var/lib/chat-bot/release-backup --agent-dir /var/lib/chat-bot/agent
+deploy/release.sh verify --root . --env-file /etc/chat-bot/chat-bot.env --manifest /var/lib/chat-bot/release.manifest
+deploy/release.sh rollback --root . --backup /var/lib/chat-bot/release-backup --agent-dir /var/lib/chat-bot/agent
+```
+
+Манифест содержит один `set_hash` по бинарю, `chat-ext.mjs`, фазовому стрипу, промпту,
+персоне и agent-профилю, `provision-agent.sh`, env-файлу и systemd-юниту. `rollback`
+возвращает все файлы побайтово, перепровижинит agent dir из восстановленной персоны и
+сверяет именно `set_hash` манифеста.
 
 ## Чего здесь нет и как это получить
 

@@ -1,9 +1,48 @@
 use anyhow::{anyhow, Result};
 use chat_bot::db::Db;
+use chat_bot::ledger;
+use chat_bot::ops;
 use chat_bot::*;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// When an instance last proved it cannot serve again (`StaleExtensionContextError`).
+/// This, not bare absence, is the only evidence that lets the host generation be
+/// restarted: the extension reconnects by itself and a running turn must never
+/// be thrown away.
+static DEAD_GATE_MS: AtomicU64 = AtomicU64::new(0);
+/// When a turn was last seen running (turn start or agent working).
+static TURN_OPEN_MS: AtomicU64 = AtomicU64::new(0);
+
+fn mark_dead_gate() {
+    DEAD_GATE_MS.store(now_ms().max(0) as u64, Ordering::Relaxed);
+}
+
+fn mark_turn_open() {
+    TURN_OPEN_MS.store(now_ms().max(0) as u64, Ordering::Relaxed);
+}
+
+fn dead_gate_recent() -> bool {
+    let t = DEAD_GATE_MS.load(Ordering::Relaxed) as i64;
+    t > 0 && now_ms().saturating_sub(t) < 600_000
+}
+
+fn dead_gate_age_secs() -> u64 {
+    let t = DEAD_GATE_MS.load(Ordering::Relaxed) as i64;
+    if t <= 0 {
+        0
+    } else {
+        (now_ms().saturating_sub(t) / 1000).max(0) as u64
+    }
+}
+
+fn turn_recently_open() -> bool {
+    let t = TURN_OPEN_MS.load(Ordering::Relaxed) as i64;
+    t > 0 && now_ms().saturating_sub(t) < 30_000
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -19,8 +58,15 @@ async fn main() -> Result<()> {
                 "run" => cmd_run().await,
                 "sync" => cmd_sync().await,
                 "summarize" => cmd_summarize().await,
+                "config" => cmd_config(),
+                "watchdog" => {
+                    let loop_mode = std::env::args().nth(2).as_deref() == Some("--loop");
+                    cmd_watchdog(loop_mode).await
+                }
                 _ => {
-                    eprintln!("usage: chatd run|sync|summarize");
+                    eprintln!(
+                        "usage: chatd run|sync|summarize|config --effective|watchdog [--loop]"
+                    );
                     std::process::exit(2);
                 }
             }
@@ -28,43 +74,143 @@ async fn main() -> Result<()> {
         .await
 }
 
+fn cmd_config() -> Result<()> {
+    if std::env::args().nth(2).as_deref() != Some("--effective") {
+        eprintln!("usage: chatd config --effective");
+        std::process::exit(2);
+    }
+    let token_file = cfg("CHATBOT_TOKEN_FILE", "");
+    let present = !token_file.is_empty() && std::fs::metadata(&token_file).is_ok();
+    let mode = std::fs::metadata(&token_file)
+        .ok()
+        .map(|m| format!("{:o}", m.permissions().mode() & 0o777))
+        .unwrap_or_else(|| "-".to_string());
+    let retention_days: i64 = cfg(
+        "CHATBOT_ROW_RETENTION_DAYS",
+        &chat_bot::media::ROW_RETENTION_DAYS.to_string(),
+    )
+    .parse()
+    .unwrap_or(chat_bot::media::ROW_RETENTION_DAYS);
+    println!("state_dir={}", state_dir());
+    println!("host_socket={}", host_socket());
+    println!("session={}", cfg("CHATBOT_SESSION", "chat-participant"));
+    println!("systemd_unit={}", ops::systemd_unit());
+    println!("token_file={token_file}");
+    println!("token_file_present={}", if present { "yes" } else { "no" });
+    println!("token_file_mode={mode}");
+    println!("chat_id={}", cfg("CHATBOT_CHAT_ID", ""));
+    println!("retention_days={retention_days}");
+    println!("media_cap_bytes={}", chat_bot::media::MEDIA_CAP_BYTES);
+    println!("free_reserve_bytes={}", chat_bot::media::FREE_RESERVE_BYTES);
+    println!("refuse_free_bytes={}", chat_bot::media::REFUSE_FREE_BYTES);
+    println!("stale_threshold_sec={}", ops::stale_threshold_secs());
+    println!("watchdog_period_sec={}", ops::watchdog_period_secs());
+    println!("notify_cmd={}", cfg("CHATBOT_NOTIFY_CMD", ""));
+    println!("agent_dir={}", cfg("CHATBOT_AGENT_DIR", ""));
+    Ok(())
+}
+
+async fn cmd_watchdog(loop_mode: bool) -> Result<()> {
+    let state = state_dir();
+    let path = ops::health_path(&state);
+    loop {
+        let health = ops::read_health(&path).ok();
+        let verdict = ops::verdict_for(
+            health.as_ref(),
+            &ops::unit_state(&ops::systemd_unit()),
+            ops::now_secs(),
+            ops::stale_threshold_secs(),
+            chat_bot::media::FREE_RESERVE_BYTES,
+        );
+        println!("VERDICT {}", verdict.level);
+        for reason in &verdict.reasons {
+            println!("reason={reason}");
+        }
+        if !loop_mode {
+            std::process::exit(verdict.exit_code());
+        }
+        tokio::time::sleep(Duration::from_secs(ops::watchdog_period_secs())).await;
+    }
+}
+
 async fn cmd_sync() -> Result<()> {
     let state = state_dir();
-    let con = db(&state)?;
-    let mut offset: i64 = kv_get(&con, "offset", "0").parse().unwrap_or(0);
+    let chat_raw = required_cfg("CHATBOT_CHAT_ID")?;
+    if chat_bot::parse_chat_id(&chat_raw).is_none() {
+        return Err(anyhow!(
+            "CHATBOT_CHAT_ID={chat_raw:?} is not a valid numeric Telegram chat id; \
+             refusing to open/migrate the database"
+        ));
+    }
+    let _lock = acquire_state_lock(&state)?;
+    let db = Db::open(&state)?;
+    let mut offset: i64 = db
+        .call(|con| Ok(kv_get(con, "offset", "0").parse().unwrap_or(0)))
+        .await?;
+    let chat: i64 = db
+        .call(|con| Ok(kv_get(con, "chat_id", "0").parse().unwrap_or(0)))
+        .await?;
     loop {
-        let updates = api("getUpdates", &json!({"offset": offset, "timeout": 3, "limit": 100})).await?;
+        let updates = api(
+            "getUpdates",
+            &json!({"offset": offset, "timeout": 3, "limit": 100}),
+        )
+        .await?;
         let arr = updates.as_array().cloned().unwrap_or_default();
         let n = arr.len();
         if n == 0 {
             break;
         }
+        let mut envelopes = vec![];
+        let mut through = offset;
         for u in arr {
             let uid = u.get("update_id").and_then(|v| v.as_i64()).unwrap_or(0);
-            offset = offset.max(uid + 1);
-            if let Some(msg) = u.get("message").cloned() {
-                let mut msg = msg;
+            through = through.max(uid + 1);
+            if let Some(mut msg) = u.get("message").cloned() {
                 msg["_update_id"] = json!(uid);
-                if let Some(prep) = prepare_message(&msg, &state, true).await? {
-                    let _ = store_prepared(&con, &prep, &state)?;
+                if let Some(env) = envelope_from_message(&msg, uid, true, chat)? {
+                    envelopes.push(env);
                 }
             }
         }
-        kv_set(&con, "offset", &offset.to_string())?;
+        if through > offset {
+            db.write(move |tx| tx.commit_page(envelopes, through))
+                .await?;
+            offset = through;
+        }
         if n < 100 {
             break;
         }
     }
-    println!("synced, offset {}", kv_get(&con, "offset", "0"));
+    // Rows are already durable and pending; this pass downloads them under
+    // the same budget as the daemon.
+    let jobs = db
+        .call(|con| chat_bot::media::resume_pending(con, chat_bot::media::MEDIA_QUEUE_CAP))
+        .await?;
+    let source = chat_bot::media::TelegramSource;
+    for job in jobs {
+        let budget = chat_bot::media::MediaBudget::from_disk(&state);
+        if let Err(e) = chat_bot::media::fetch_job(&db, &state, &job, &budget, &source).await {
+            dlog(&format!(
+                "sync media fetch failed for {}: {e:#}",
+                job.row_id
+            ));
+        }
+    }
+    println!("synced, offset {}", offset);
     Ok(())
 }
 
 async fn cmd_summarize() -> Result<()> {
     let state = state_dir();
     let con = db(&state)?;
-    let mut stmt = con.prepare("SELECT username, first_name, text FROM messages ORDER BY update_id DESC LIMIT 500")?;
-    let rows: Vec<(Option<String>, Option<String>, Option<String>)> =
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.flatten().collect();
+    let mut stmt = con.prepare(
+        "SELECT username, first_name, text FROM messages ORDER BY update_id DESC LIMIT 500",
+    )?;
+    let rows: Vec<(Option<String>, Option<String>, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .flatten()
+        .collect();
     let mut lines = vec![];
     for (u, n, t) in rows.iter().rev() {
         if let Some(t) = t {
@@ -72,7 +218,11 @@ async fn cmd_summarize() -> Result<()> {
                 continue;
             }
             let who = u.clone().unwrap_or_default();
-            let who = if who.is_empty() { n.clone().unwrap_or_default() } else { who };
+            let who = if who.is_empty() {
+                n.clone().unwrap_or_default()
+            } else {
+                who
+            };
             let short: String = t.chars().take(300).collect();
             lines.push(format!("{who}: {short}"));
         }
@@ -88,14 +238,29 @@ async fn cmd_summarize() -> Result<()> {
 async fn summarize_prompt(sid: &str, sock: &str, digest: &str) -> Result<()> {
     // Every call below must go through the scratch summary socket: the sid
     // exists only there, never on the chat host (isolation requirement).
-    omo_on(&["wait", sid, "--until", "idle", "--timeout", "600000"], Duration::from_secs(620), sock).await?;
+    omo_on(
+        &["wait", sid, "--until", "idle", "--timeout", "600000"],
+        Duration::from_secs(620),
+        sock,
+    )
+    .await?;
     let prompt = format!(
         "Ниже история чата (свежие внизу). Собери chat-summary.md: смысловые темы, кто есть кто, тон и стиль, табу, где боту уместно влезать. Отвечай только текстом файла.\n\n{}",
         digest.chars().take(60000).collect::<String>()
     );
     omo_on(&["prompt", sid, &prompt], Duration::from_secs(120), sock).await?;
-    omo_on(&["wait", sid, "--until", "idle", "--timeout", "600000"], Duration::from_secs(620), sock).await?;
-    let data = omo_on(&["read", sid, "--tail", "3", "--messages"], Duration::from_secs(60), sock).await?;
+    omo_on(
+        &["wait", sid, "--until", "idle", "--timeout", "600000"],
+        Duration::from_secs(620),
+        sock,
+    )
+    .await?;
+    let data = omo_on(
+        &["read", sid, "--tail", "3", "--messages"],
+        Duration::from_secs(60),
+        sock,
+    )
+    .await?;
     if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
         for m in msgs.iter().rev() {
             if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
@@ -147,10 +312,7 @@ fn now_ms() -> i64 {
 }
 
 fn accepted_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "started" | "steered" | "queued" | "already_admitted"
-    )
+    matches!(kind, "started" | "steered" | "queued" | "already_admitted")
 }
 
 /// Frames written to the extension over the control socket.
@@ -158,26 +320,38 @@ enum Out {
     Push {
         delivery_id: String,
         text: String,
-        /// message_ids authored by the owner in this batch; the extension keeps
-        /// them for the turn and the `subagent` tool demands one as proof that
-        /// the request really came from the owner.
-        owner_msgs: Vec<i64>,
         /// Incoming message_ids of this batch; `chat_send` refuses a `reply_to`
         /// outside them (history, GIF catalog, another turn). Empty on an old
         /// ledger entry — the extension then disables the check.
         batch_ids: Vec<i64>,
+        /// Forum topic the batch arrived in. The extension forwards it to
+        /// `typing`; sends also carry it, and the daemon is the owner of the
+        /// `message_thread_id` helper.
+        thread_id: Option<i64>,
     },
+    /// Authoritative durable identity of the live session. The extension puts
+    /// it into `hello`, so the handshake carries the durable id and generation
+    /// instead of the configured name.
+    Session { uid: String, generation: i64 },
 }
 
 /// Frames the extension writes back.
 enum Inbound {
-    Hello { session: String, pid: i64 },
-    Result { delivery_id: String, kind: String },
+    Hello {
+        session: String,
+        generation: i64,
+        pid: i64,
+    },
+    Result {
+        delivery_id: String,
+        kind: String,
+    },
 }
 
 /// The admit unit is the sole owner of session lifecycle: `ensure_session`
-/// closes every session carrying CHATBOT_SESSION, so two owners would recreate
-/// storm and kill working turns. Everyone else asks through `recover_tx`.
+/// repairs the one-session invariant and closes older duplicates by durable
+/// id, so two owners would race the repair and kill working turns. Everyone
+/// else asks through `recover_tx`.
 #[allow(clippy::too_many_arguments)]
 async fn admit_loop(
     db: Db,
@@ -193,12 +367,13 @@ async fn admit_loop(
     let state = state_dir();
     let ref_ = cfg("CHATBOT_SESSION", "chat-participant");
     let mut sid: Option<String> = None;
-    match ensure_session(&system_path, Some(&ref_)).await {
+    match ensure_session(&db, &system_path, Some(&ref_)).await {
         Ok(s) => {
             let offset = read_events(&state, 0).map(|(_, o)| o).unwrap_or(0);
             let _ = settle_session(&state, &db, offset, Duration::from_secs(180)).await;
             dlog(&format!("admit unit ready, session {s}"));
             sid = Some(s);
+            announce_session(&db, &out_tx).await;
         }
         Err(e) => dlog(&format!("initial session ensure failed: {e:#}")),
     }
@@ -222,15 +397,106 @@ async fn admit_loop(
     let watch_secs: u64 = cfg("CHATBOT_HOST_WATCH_SEC", "15").parse().unwrap_or(15);
     let mut host_tick = tokio::time::interval(Duration::from_secs(watch_secs.max(5)));
     host_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Healing a held session restarts the host generation, so it must be rare and
+    // confirmed twice: an isolated reading of a hold is not enough to kill a host
+    // that may be finishing a turn.
+    const HELD_STRIKES: u32 = 2;
+    const HELD_COOLDOWN_TICKS: u32 = 5;
+    let mut held_strikes: u32 = 0;
+    // Starts at the cooldown value: the cooldown spaces out REPEATED heals, it
+    // must not delay the first one past the two-tick confirmation.
+    let mut ticks_since_heal: u32 = HELD_COOLDOWN_TICKS;
     loop {
         tokio::select! {
             _ = host_tick.tick() => {
+                // A session parked by the host on an interrupted delivery accepts
+                // every push and executes nothing (typing runs, no turn_start).
+                // Only THAT hold is treated as a fault: `unattended` is normal for
+                // a client-less bot session and an external delivery still runs
+                // under it, so healing on it would restart healthy sessions.
+                if host_alive() {
+                    if let Some(uid) = sid.clone() {
+                        if let Some(h) = chat_bot::session::health_on(&uid, &host_socket()).await {
+                            if chat_bot::session::is_mute(&h) {
+                                held_strikes = held_strikes.saturating_add(1);
+                                dlog(&format!(
+                                    "session {uid} is held {:?} (strike {held_strikes}/{HELD_STRIKES})",
+                                    h.holds
+                                ));
+                                if chat_bot::session::should_heal(
+                                    held_strikes,
+                                    turn_recently_open(),
+                                    ticks_since_heal,
+                                ) {
+                                    dlog(&format!(
+                                        "session {uid} is mute on interrupted-run; restarting the host generation"
+                                    ));
+                                    let _ = chat_bot::stop_host_on(&host_socket()).await;
+                                    match ensure_session(&db, &system_path, Some(&ref_)).await {
+                                        Ok(s) => {
+                                            dlog(&format!("heal: fresh session {s}"));
+                                            sid = Some(s);
+                                            announce_session(&db, &out_tx).await;
+                                        }
+                                        Err(e) => dlog(&format!("heal: ensure failed: {e:#}")),
+                                    }
+                                    // The held session ate every push; re-drive the
+                                    // open batches now instead of waiting for the
+                                    // seven-minute stall budget.
+                                    let pend = db
+                                        .call(|con| Ok(ledger::open_batches(con)?))
+                                        .await
+                                        .unwrap_or_default();
+                                    for open_sig in pend {
+                                        let st = state.clone();
+                                        let sg = open_sig.clone();
+                                        let text = db
+                                            .call(move |con| {
+                                                Ok(regen_text(&st, con, &sg).ok().flatten())
+                                            })
+                                            .await
+                                            .unwrap_or(None);
+                                        let Some(text) = text else { continue };
+                                        let sg2 = open_sig.clone();
+                                        let ids = db
+                                            .call(move |con| Ok(ledger::message_ids(con, &sg2)?))
+                                            .await
+                                            .unwrap_or_default();
+                                        let sg3 = open_sig.clone();
+                                        let tid = db
+                                            .call(move |con| Ok(ledger::thread_id(con, &sg3)))
+                                            .await
+                                            .unwrap_or(None);
+                                        if out_tx
+                                            .send(Out::Push {
+                                                delivery_id: frame_id(&open_sig),
+                                                text,
+                                                batch_ids: ids,
+                                                thread_id: tid,
+                                            })
+                                            .is_ok()
+                                        {
+                                            dlog(&format!(
+                                                "heal: re-pushed {open_sig} into the fresh session"
+                                            ));
+                                        }
+                                    }
+                                    held_strikes = 0;
+                                    ticks_since_heal = 0;
+                                }
+                            } else {
+                                held_strikes = 0;
+                            }
+                        }
+                    }
+                }
+                ticks_since_heal = ticks_since_heal.saturating_add(1);
                 if !host_alive() {
                     dlog(&format!(
                         "host watchdog: socket missing ({}), re-ensuring host",
                         host_socket()
                     ));
-                    match ensure_session(&system_path, Some(&ref_)).await {
+                    match ensure_session(&db, &system_path, Some(&ref_)).await {
                         Ok(s) => {
                             // No settle here: a freshly ensured idle session never
                             // emits turn_end, so waiting for one would hold the
@@ -239,11 +505,32 @@ async fn admit_loop(
                             // actually opened a turn.
                             dlog(&format!("host watchdog: host re-ensured, session {s}"));
                             sid = Some(s);
+                            announce_session(&db, &out_tx).await;
                         }
                         Err(e) => dlog(&format!("host watchdog: re-ensure failed: {e:#}")),
                     }
                 }
             }
+            frame = inbound_rx.recv() => match frame {
+                Some(Inbound::Hello { session, generation, pid }) => {
+                    dlog(&format!(
+                        "extension hello while idle (session={session}, generation={generation}, pid={pid})"
+                    ));
+                    if let Some(live) = sid.as_deref() {
+                        if let Err(e) = chat_bot::session::stale_hello(&session, live) {
+                            mark_dead_gate();
+                            dlog(&format!(
+                                "{e:#}; refusing the hello of a stale instance and sending the live identity"
+                            ));
+                        }
+                    }
+                    announce_session(&db, &out_tx).await;
+                }
+                Some(Inbound::Result { delivery_id, kind }) => {
+                    dlog(&format!("stray delivery result {delivery_id} ({kind})"));
+                }
+                None => break,
+            },
             job = jobs.recv() => match job {
                 Some(job) => {
                     let res = admit_job(&db, &state, &mut sid, &system_path, &ref_, &admitted_tx, &inboxed_tx, &out_tx, &mut inbound_rx, job).await;
@@ -272,16 +559,76 @@ async fn admit_loop(
 /// database is answered promptly instead of freezing the caller.
 async fn handle_control_call(db: &Db, op: &str, args: &Value) -> Result<String> {
     match op {
+        "chat_send" => chat_bot::send::chat_send(db, args).await,
+        "typing" => chat_bot::send::typing(db, args).await,
         "gif_list" => {
-            let offset = args.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
-            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(200);
-            db.call(move |con| {
-                let (entries, total) = gif_page(con, offset, limit)?;
-                Ok(gif_list_text(&entries, total))
-            })
-            .await
+            let (offset, limit) = chat_bot::catalog::parse_page_args(args)?;
+            db.call(move |con| chat_bot::catalog::list_view(con, offset, limit))
+                .await
         }
         other => Err(anyhow!("unknown control op: {other}")),
+    }
+}
+
+/// Read-only MCP tool socket. Separate from the control socket so a tool call
+/// never evicts the extension; every Bot API/media operation runs here, in the
+/// daemon process that owns the token.
+async fn tool_loop(state: String, sock: std::path::PathBuf) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    unlink_stale_socket(&sock);
+    let listener = loop {
+        match tokio::net::UnixListener::bind(&sock) {
+            Ok(l) => break l,
+            Err(e) => {
+                dlog(&format!(
+                    "tool socket bind failed ({}): {e:#}",
+                    sock.display()
+                ));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    };
+    loop {
+        let stream = match listener.accept().await {
+            Ok((s, _)) => s,
+            Err(e) => {
+                dlog(&format!("tool socket accept failed: {e:#}"));
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        let state = state.clone();
+        tokio::task::spawn_local(async move {
+            let (rd, mut wr) = stream.into_split();
+            let mut rd = tokio::io::BufReader::new(rd);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match rd.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let raw = line.trim();
+                        if raw.is_empty() {
+                            continue;
+                        }
+                        let Ok(v) = serde_json::from_str::<Value>(raw) else {
+                            continue;
+                        };
+                        let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("");
+                        let args = v.get("args").cloned().unwrap_or(json!({}));
+                        let frame = match chat_bot::tool_call(&state, op, &args).await {
+                            Ok(text) => json!({"ok": true, "text": text}),
+                            Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+                        };
+                        if wr.write_all(format!("{frame}\n").as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = wr.flush().await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
     }
 }
 
@@ -331,8 +678,18 @@ async fn control_loop(
         loop {
             tokio::select! {
                 msg = out_rx.recv() => match msg {
-                    Some(Out::Push { delivery_id, text, owner_msgs, batch_ids }) => {
-                        let frame = json!({"push": {"delivery_id": delivery_id, "text": text, "deliverAs": "steer", "owner_msgs": owner_msgs, "batch_ids": batch_ids}});
+                    Some(Out::Push { delivery_id, text, batch_ids, thread_id }) => {
+                        let frame = json!({"push": {"delivery_id": delivery_id, "text": text, "deliverAs": "steer", "batch_ids": batch_ids, "thread_id": thread_id}});
+                        let ok = match serde_json::to_string(&frame) {
+                            Ok(s) => wr.write_all(format!("{s}\n").as_bytes()).await.is_ok() && wr.flush().await.is_ok(),
+                            Err(_) => false,
+                        };
+                        if !ok {
+                            break;
+                        }
+                    }
+                    Some(Out::Session { uid, generation }) => {
+                        let frame = json!({"session": {"uid": uid, "generation": generation}});
                         let ok = match serde_json::to_string(&frame) {
                             Ok(s) => wr.write_all(format!("{s}\n").as_bytes()).await.is_ok() && wr.flush().await.is_ok(),
                             Err(_) => false,
@@ -372,6 +729,7 @@ async fn control_loop(
                             } else if let Some(h) = v.get("hello") {
                                 let _ = inbound_tx.send(Inbound::Hello {
                                     session: h.get("session").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                                    generation: h.get("generation").and_then(|x| x.as_i64()).unwrap_or(0),
                                     pid: h.get("pid").and_then(|x| x.as_i64()).unwrap_or(0),
                                 });
                             } else if let Some(c) = v.get("call") {
@@ -418,15 +776,32 @@ async fn control_loop(
     }
 }
 
-async fn ensure_sid(sid: &mut Option<String>, system_path: &str, ref_: &str) -> Result<String> {
+async fn announce_session(db: &Db, out_tx: &tokio::sync::mpsc::UnboundedSender<Out>) {
+    if let Ok(Some((uid, generation))) = db.call(|con| chat_bot::session::live_identity(con)).await
+    {
+        let _ = out_tx.send(Out::Session { uid, generation });
+    }
+}
+
+async fn ensure_sid(
+    db: &Db,
+    sid: &mut Option<String>,
+    system_path: &str,
+    ref_: &str,
+    out_tx: &tokio::sync::mpsc::UnboundedSender<Out>,
+) -> Result<String> {
     if let Some(s) = sid.clone() {
         if host_alive() {
             return Ok(s);
         }
-        dlog(&format!("host socket missing ({}), re-ensuring host", host_socket()));
+        dlog(&format!(
+            "host socket missing ({}), re-ensuring host",
+            host_socket()
+        ));
     }
-    let s = ensure_session(system_path, Some(ref_)).await?;
+    let s = ensure_session(db, system_path, Some(ref_)).await?;
     *sid = Some(s.clone());
+    announce_session(db, out_tx).await;
     Ok(s)
 }
 
@@ -447,36 +822,41 @@ async fn admit_job(
     // One closure: building the text and writing its pending ledger entry must
     // not be separated by another unit's write.
     let state_for_db = state.to_string();
-    let (text, sig, ids, tome, owners, anchor) = {
-        db.call(move |con| build_batch_text(&state_for_db, con, &batch)).await?
+    let (text, sig, ids, tome, _anchor) = {
+        db.call(move |con| build_batch_text(&state_for_db, con, &batch))
+            .await?
     };
     if ids.is_empty() {
         dlog("flush skipped: every batch row already answered");
         return Ok(());
     }
-    {
-        let (sig_c, text_c, ids_c, tome_c, owners_c, anchor_c) = (
-            sig.clone(),
-            text.clone(),
-            ids.clone(),
-            tome.clone(),
-            owners.clone(),
-            anchor.clone(),
-        );
-        db.call(move |con| {
-            kv_set(con, &format!("pending_batch_ids:{sig_c}"), &serde_json::to_string(&ids_c)?)?;
-            kv_set(con, &format!("pending_window:{sig_c}"), &anchor_c)?;
-            kv_set(con, &format!("pending_tome:{sig_c}"), &serde_json::to_string(&tome_c)?)?;
-            kv_set(con, &format!("pending_owner:{sig_c}"), &serde_json::to_string(&owners_c)?)?;
-            kv_set(con, &format!("pending_text:{sig_c}"), &text_c)?;
-            kv_set(con, &format!("pending_deliverAs:{sig_c}"), "steer")?;
-            pending_marks_clear(con, &sig_c)?;
-            let mut pending = pending_ids(con);
-            if !pending.contains(&sig_c) {
-                pending.push(sig_c.clone());
-                save_pending(con, &pending)?;
+    let state_db = state.to_string();
+    let ids_db = ids.clone();
+    let (chat, thread) = db
+        .call(move |con| {
+            let _ = state_db;
+            let chat: i64 = kv_get(con, "chat_id", "0").parse().unwrap_or(0);
+            let mut thread = None;
+            for id in &ids_db {
+                if let Ok(t) = con.query_row(
+                    "SELECT thread_id FROM messages WHERE message_id=? LIMIT 1",
+                    [id],
+                    |r| r.get::<_, Option<i64>>(0),
+                ) {
+                    if t.is_some() {
+                        thread = t;
+                        break;
+                    }
+                }
             }
-            Ok(())
+            Ok((chat, thread))
+        })
+        .await?;
+    {
+        let (sig_c, ids_c, tome_c) = (sig.clone(), ids.clone(), tome.clone());
+        db.write(move |tx| {
+            tx.seal_batch(&sig_c, chat, thread, &ids_c, &tome_c)?;
+            tx.mark_pushed(&sig_c)
         })
         .await?;
     }
@@ -493,7 +873,6 @@ async fn admit_job(
         inbound_rx,
         &sig,
         &text,
-        &owners,
         &ids,
     )
     .await
@@ -513,7 +892,6 @@ async fn deliver_sig(
     inbound_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Inbound>,
     sig: &str,
     text: &str,
-    owners: &[i64],
     ids: &[i64],
 ) -> Result<()> {
     let first = Duration::from_secs_f64(cfg("CHATBOT_ADMIT_FIRST_SEC", "8").parse().unwrap_or(8.0));
@@ -525,7 +903,44 @@ async fn deliver_sig(
             "host socket missing ({}), re-ensuring before delivery of {sig}",
             host_socket()
         ));
-        let _ = ensure_sid(sid_slot, system_path, ref_).await;
+        let _ = ensure_sid(db, sid_slot, system_path, ref_, out_tx).await;
+    }
+    let sig_thread = sig.to_string();
+    let thread = db
+        .call(move |con| Ok(ledger::thread_id(con, &sig_thread)))
+        .await
+        .unwrap_or(None);
+    // Addressability before the first frame. The daemon's own `sessions.state`
+    // is a belief that survives host restarts, so it is never the argument here:
+    // the host is asked for the durable id and for an occupied attachment slot.
+    // Pushing anyway is exactly the 10:43-12:05 mute window - batches stalled in
+    // `inboxed` while no instance was attached to the control socket.
+    let live_uid = db
+        .call(|con| Ok(chat_bot::session::live_identity(con)?))
+        .await
+        .unwrap_or(None);
+    if let Some((uid, _gen)) = live_uid {
+        let address = chat_bot::session::address_on(ref_, &host_socket(), &uid).await;
+        match chat_bot::session::next_target(&address) {
+            chat_bot::session::Target::Push => {}
+            chat_bot::session::Target::EnsureSession => {
+                dlog(&format!(
+                    "{sig}: host does not list session {uid}; ensuring it before the push"
+                ));
+                let _ = ensure_sid(db, sid_slot, system_path, ref_, out_tx).await;
+                return Ok(());
+            }
+            chat_bot::session::Target::Wait => {
+                let why = match &address.addressee {
+                    chat_bot::session::Addressee::Unknown(r) => {
+                        format!("the host could not be asked: {r}")
+                    }
+                    _ => "session missing".to_string(),
+                };
+                dlog(&format!("{sig}: not pushing yet, {why}"));
+                return Ok(());
+            }
+        }
     }
     for cycle in 0..3 {
         let budget = if cycle == 0 { first } else { rest };
@@ -533,8 +948,8 @@ async fn deliver_sig(
             .send(Out::Push {
                 delivery_id: frame_id(sig),
                 text: text.to_string(),
-                owner_msgs: owners.to_vec(),
                 batch_ids: ids.to_vec(),
+                thread_id: thread,
             })
             .is_err()
         {
@@ -553,20 +968,37 @@ async fn deliver_sig(
                         continue;
                     }
                     if accepted_kind(&kind) {
-                        let at = now_ms();
                         let sig_db = sig.to_string();
-                        db.call(move |con| pending_mark_set(con, &sig_db, "admitted_at", at))
+                        let kind_db = kind.clone();
+                        db.write(move |tx| tx.admit_batch(&sig_db, &kind_db))
                             .await?;
                         let _ = admitted_tx.send(sig.to_string());
                         dlog(&format!("admitted {sig} ({kind})"));
-                        let _ = ensure_sid(sid_slot, system_path, ref_).await;
+                        let _ = ensure_sid(db, sid_slot, system_path, ref_, out_tx).await;
                         return Ok(());
                     }
-                    dlog(&format!("deferred {sig} ({kind}): the runtime took nothing, retrying"));
+                    dlog(&format!(
+                        "deferred {sig} ({kind}): the runtime took nothing, retrying"
+                    ));
                     break;
                 }
-                Ok(Some(Inbound::Hello { session, pid })) => {
-                    dlog(&format!("extension hello (session={session}, pid={pid})"));
+                Ok(Some(Inbound::Hello {
+                    session,
+                    generation,
+                    pid,
+                })) => {
+                    dlog(&format!(
+                        "extension hello (session={session}, generation={generation}, pid={pid})"
+                    ));
+                    if let Some(live) = sid_slot.as_deref() {
+                        if let Err(e) = chat_bot::session::stale_hello(&session, live) {
+                            mark_dead_gate();
+                            dlog(&format!(
+                                "{e:#}; refusing the hello of a stale instance and sending the live identity"
+                            ));
+                        }
+                    }
+                    announce_session(db, out_tx).await;
                     continue;
                 }
                 Ok(None) => return Ok(()),
@@ -574,7 +1006,22 @@ async fn deliver_sig(
             }
         }
     }
-    dlog(&format!("no admission for {sig} after 3 cycles; track will retry on its delivery clock"));
+    // Nobody consumed the frame. Without a dead-gate this is the extension
+    // reconnecting on its own (or a busy runtime) and retrying is right; with a
+    // proven stale instance waiting forever is the mute window, so the
+    // generation is restarted - once, bounded, never over a running turn.
+    let absent = dead_gate_age_secs();
+    if chat_bot::session::rearm_allowed(dead_gate_recent(), absent, turn_recently_open()) {
+        dlog(&format!(
+            "{sig}: no admission and the instance is dead-gated ({absent}s); rearming the host generation"
+        ));
+        let _ = chat_bot::stop_host_on(&host_socket()).await;
+        let _ = ensure_sid(db, sid_slot, system_path, ref_, out_tx).await;
+        return Ok(());
+    }
+    dlog(&format!(
+        "no admission for {sig} after 3 cycles; track will retry on its delivery clock"
+    ));
     Ok(())
 }
 
@@ -596,12 +1043,11 @@ async fn recover_batch(
     // the same batch: one closure for both.
     let state_for_db = state.to_string();
     let sig_for_db = sig.to_string();
-    let (text, owners, ids) = db
+    let (text, ids) = db
         .call(move |con| {
             let text = push_pending(&state_for_db, con, &sig_for_db)?;
-            let owners = pending_owner_ids(con, &sig_for_db);
-            let ids = pending_batch_ids(con, &sig_for_db);
-            Ok((text, owners, ids))
+            let ids = ledger::message_ids(con, &sig_for_db)?;
+            Ok((text, ids))
         })
         .await?;
     let text = match text {
@@ -612,9 +1058,19 @@ async fn recover_batch(
         }
     };
     if req.recreate {
-        dlog(&format!("recover {sig}: recreating session and re-delivering"));
+        dlog(&format!(
+            "recover {sig}: recreating session and re-delivering"
+        ));
         if let Some(sid) = sid_slot.clone() {
-            match recreate_session(&sid, system_path, Some(ref_), &format!("stalled delivery {sig}")).await {
+            match recreate_session(
+                db,
+                &sid,
+                system_path,
+                Some(ref_),
+                &format!("stalled delivery {sig}"),
+            )
+            .await
+            {
                 Ok(new_sid) => {
                     let offset = read_events(state, 0).map(|(_, o)| o).unwrap_or(0);
                     let _ = settle_session(state, db, offset, Duration::from_secs(120)).await;
@@ -622,8 +1078,9 @@ async fn recover_batch(
                 }
                 Err(e) => dlog(&format!("recreate for {sig} failed: {e:#}")),
             }
-        } else if let Ok(s) = ensure_session(system_path, Some(ref_)).await {
+        } else if let Ok(s) = ensure_session(db, system_path, Some(ref_)).await {
             *sid_slot = Some(s);
+            announce_session(db, out_tx).await;
         }
         // Delivery evidence is never wiped here: an admitted/emitted/settled
         // mark is the only thing that stops a restart from re-asking a message
@@ -634,14 +1091,26 @@ async fn recover_batch(
         // Never-accepted batch on a dead host: the socket, not the session, is
         // what is missing, so re-ensure host+session and then re-deliver.
         dlog(&format!("recover {sig}: host socket missing, re-ensuring"));
-        let _ = ensure_sid(sid_slot, system_path, ref_).await;
+        let _ = ensure_sid(db, sid_slot, system_path, ref_, out_tx).await;
     } else {
         // Never-accepted batch, live host: re-push only. A live session is not
         // touched at all.
         dlog(&format!("recover {sig}: re-pushing (no session change)"));
     }
     let _ = inboxed_tx.send(sig.to_string());
-    deliver_sig(db, sid_slot, system_path, ref_, admitted_tx, out_tx, inbound_rx, sig, &text, &owners, &ids).await
+    deliver_sig(
+        db,
+        sid_slot,
+        system_path,
+        ref_,
+        admitted_tx,
+        out_tx,
+        inbound_rx,
+        sig,
+        &text,
+        &ids,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -656,73 +1125,54 @@ async fn recover_pending(
     out_tx: &tokio::sync::mpsc::UnboundedSender<Out>,
     inbound_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Inbound>,
 ) {
-    // One pass: the pending list and the answered set (which reads the events
-    // journal) are taken once, then reused for every pending sig.
-    let state_for_db = state.to_string();
-    let (pending, answered) = match db
-        .call(move |con| {
-            let done = done_ids(con);
-            let pending: Vec<String> = pending_ids(con)
-                .into_iter()
-                .filter(|s| !done.contains(s))
-                .collect();
-            Ok((pending, answered_ids(&state_for_db, con)))
-        })
+    // Open batches come from the journal, not from `pending:*` kv marks.
+    let pending = db
+        .call(|con| ledger::open_batches(con))
         .await
-    {
-        Ok(v) => v,
-        Err(_) => return,
-    };
+        .unwrap_or_default();
     for sig in pending {
         let state_for_db = state.to_string();
         let sig_db = sig.clone();
-        let answered_db = answered.clone();
-        // One closure per sig: retirement decision and marks come from the same
-        // database snapshot.
-        let (all_answered, marks, text) = match db
+        let (view, text) = match db
             .call(move |con| {
-                let raw = kv_get(con, &format!("pending_batch_ids:{sig_db}"), "");
-                let ids: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap_or_default();
-                let ids: Vec<i64> = ids.iter().filter_map(|v| v.as_i64()).collect();
-                let all = !ids.is_empty() && ids.iter().all(|i| answered_db.contains(i));
+                let view = ledger::view(con, &sig_db)?;
                 let text = match regen_text(&state_for_db, con, &sig_db) {
                     Ok(Some(t)) => t,
-                    Ok(None) => kv_get(con, &format!("pending_text:{sig_db}"), ""),
+                    Ok(None) => String::new(),
                     Err(_) => String::new(),
                 };
-                let marks = (
-                    pending_mark_get(con, &sig_db, "admitted_at"),
-                    pending_mark_get(con, &sig_db, "emitted_at"),
-                    pending_mark_get(con, &sig_db, "settled_at"),
-                );
-                Ok((all, marks, text))
+                Ok((view, text))
             })
             .await
         {
             Ok(v) => v,
             Err(_) => return,
         };
-        // A run may settle before the runtime reports the delivery proof, so a
-        // batch can sit with `emitted` and no `settled`. Repair it from the
-        // journal at boot instead of re-asking a message the agent already saw.
-        let mut marks = marks;
-        if marks.1.is_some() && marks.2.is_none() {
+        let Some(mut view) = view else { continue };
+        if view.state == "closed" {
+            continue;
+        }
+        if view.emitted_at.is_some() && view.settled_at.is_none() {
             if let Some(settled) = last_event_ts(state, "agent_settled") {
-                if marks.0.map(|a| settled >= a).unwrap_or(false) {
+                if view.admitted_at.map(|a| settled >= a).unwrap_or(false) {
                     let sig_db = sig.clone();
-                    let _ = db
-                        .call(move |con| pending_mark_set(con, &sig_db, "settled_at", settled))
-                        .await;
-                    marks.2 = Some(settled);
-                    dlog(&format!("bootstrap: {sig} settled late, recorded {settled}"));
+                    let _ = db.write(move |tx| tx.mark_settled(&sig_db, settled)).await;
+                    view.settled_at = Some(settled);
+                    dlog(&format!(
+                        "bootstrap: {sig} settled late, recorded {settled}"
+                    ));
                 }
             }
         }
-        if let Some(reason) = should_retire(all_answered, marks.1, marks.2) {
-            let state_for_db = state.to_string();
+        if let Some(reason) = view.close_reason() {
             let sig_db = sig.clone();
+            let outcome = if reason == "settled" {
+                "skipped"
+            } else {
+                "delivered"
+            };
             let _ = db
-                .call(move |con| mark_done(con, &state_for_db, &sig_db))
+                .write(move |tx| ledger::close_batch(tx.handle(), &sig_db, outcome))
                 .await;
             dlog(&format!("bootstrap: {sig} retired ({reason})"));
             continue;
@@ -732,17 +1182,12 @@ async fn recover_pending(
         }
         dlog(&format!(
             "bootstrap: re-delivering pending {sig} ({})",
-            delivery_phase(marks.0, marks.1, marks.2)
+            view.phase()
         ));
         let _ = inboxed_tx.send(sig.clone());
         let sig_db = sig.clone();
-        let (owners, ids) = db
-            .call(move |con| {
-                Ok((
-                    pending_owner_ids(con, &sig_db),
-                    pending_batch_ids(con, &sig_db),
-                ))
-            })
+        let ids = db
+            .call(move |con| ledger::message_ids(con, &sig_db))
             .await
             .unwrap_or_default();
         if deliver_sig(
@@ -755,7 +1200,6 @@ async fn recover_pending(
             inbound_rx,
             &sig,
             &text,
-            &owners,
             &ids,
         )
         .await
@@ -784,7 +1228,8 @@ async fn track_loop(
         Err(_) => 0,
     };
     let mut inflight: HashSet<String> = HashSet::new();
-    let mut last_progress: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut last_progress: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
     let mut emit_warned: HashSet<String> = HashSet::new();
     let mut last_working_at: i64 = 0;
     // Timestamp of the last fully settled run. The runtime may report the
@@ -813,23 +1258,26 @@ async fn track_loop(
                 if !events.is_empty() {
                     last_event_at = now_ms();
                 }
-                // Receipts of the whole cycle are mirrored in ONE closure: the
-                // event loop used to open a connection per receipt.
-                let mut receipts: Vec<Value> = vec![];
+                // Receipts are already mirrored inside the send transaction;
+                // the event stream is liveness only. Nothing here re-writes a
+                // receipt, so the mirror keeps one authority (I4).
+                let mut _receipts = 0usize;
                 for ev in &events {
                     let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                     match kind {
                         "chat_send_result" | "chat_send_replay" => {
-                            if let Some(r) = ev.get("receipt") {
-                                receipts.push(r.clone());
-                            }
+                            _receipts += 1;
                         }
                         "agent_activity" => {
                             if activity_phase(ev) == Some(true) {
+                                mark_turn_open();
                                 last_working_at = now_ms();
                             }
                         }
-                        "turn_start" => turn_in_flight = true,
+                        "turn_start" => {
+                            mark_turn_open();
+                            turn_in_flight = true;
+                        }
                         "turn_end" => {
                             // A turn boundary is liveness only: the run may
                             // continue with another turn, so it never proves
@@ -848,11 +1296,9 @@ async fn track_loop(
                             let sigs: Vec<String> = inflight.iter().cloned().collect();
                             if !sigs.is_empty() {
                                 let _ = db
-                                    .call(move |con| {
+                                    .write(move |tx| {
                                         for sig in &sigs {
-                                            if pending_mark_get(con, sig, "emitted_at").is_some() {
-                                                let _ = pending_mark_set(con, sig, "settled_at", at);
-                                            }
+                                            tx.mark_settled(sig, at)?;
                                         }
                                         Ok(())
                                     })
@@ -865,7 +1311,11 @@ async fn track_loop(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            let st = ev.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let st = ev
+                                .get("state")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             let at = ev.get("t").and_then(|v| v.as_i64()).unwrap_or_else(now_ms);
                             match st.as_str() {
                                 "emitted" => {
@@ -874,13 +1324,12 @@ async fn track_loop(
                                     // event carries the frame id (`sig#n`), the
                                     // ledger is keyed by the batch sig.
                                     let id_db = sig_of_frame(&id).to_string();
+                                    let settled_seen = last_settled_at;
                                     let _ = db
-                                        .call(move |con| {
-                                            pending_mark_set(con, &id_db, "emitted_at", at)?;
-                                            let admitted =
-                                                pending_mark_get(con, &id_db, "admitted_at").unwrap_or(0);
-                                            if last_settled_at > 0 && last_settled_at >= admitted {
-                                                pending_mark_set(con, &id_db, "settled_at", last_settled_at)?;
+                                        .write(move |tx| {
+                                            tx.mark_emitted(&id_db, at)?;
+                                            if settled_seen > 0 {
+                                                tx.mark_settled(&id_db, settled_seen)?;
                                             }
                                             Ok(())
                                         })
@@ -890,8 +1339,13 @@ async fn track_loop(
                                 "failed" => {
                                     // Refused by the session file: admissible
                                     // again, so the admit unit re-pushes it.
-                                    let err = ev.get("error").and_then(|v| v.as_str()).unwrap_or("");
-                                    dlog(&format!("delivery {id} failed ({err}); asking admit to re-push"));
+                                    let err =
+                                        ev.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                                    dlog(&format!(
+                                        "delivery {id} failed ({err}); asking admit to re-push"
+                                    ));
+                                    let sig_db = sig_of_frame(&id).to_string();
+                                    let _ = db.write(move |tx| tx.fail_attempt(&sig_db)).await;
                                     let _ = recover_tx.send(Recover {
                                         sig: id.clone(),
                                         recreate: false,
@@ -923,10 +1377,10 @@ async fn track_loop(
                         _ => {}
                     }
                 }
-                if !receipts.is_empty() {
-                    let _ = db
-                        .call(move |con| mirror_receipts(con, &receipts))
-                        .await;
+                if _receipts > 0 {
+                    dlog(&format!(
+                        "track: {_receipts} send event(s); receipts already mirrored"
+                    ));
                 }
             }
             Err(e) => dlog(&format!("track read_events failed: {e:#}")),
@@ -934,50 +1388,49 @@ async fn track_loop(
         let now = now_ms();
         // A run whose end event never arrived must not block recovery forever:
         // silence past the hard cap means "no longer in flight".
-        if turn_in_flight && now.saturating_sub(last_event_at) > ((turn_budget + extra) as i64) * 1000 {
+        if turn_in_flight
+            && now.saturating_sub(last_event_at) > ((turn_budget + extra) as i64) * 1000
+        {
             dlog("run liveness went quiet past the hard cap; treating it as no longer in flight");
             turn_in_flight = false;
         }
         let working = turn_in_flight || now.saturating_sub(last_working_at) < 30_000;
-        // ONE database snapshot per cycle for every in-flight batch: the answered
-        // set (which reads the events journal) is computed once instead of once
-        // per sig package.
         let sigs: Vec<String> = inflight.iter().cloned().collect();
         if !sigs.is_empty() {
-            let state_for_db = state.clone();
             let snap = db
                 .call(move |con| {
-                    let answered = answered_ids(&state_for_db, con);
                     let mut out = vec![];
                     for sig in &sigs {
-                        let raw = kv_get(con, &format!("pending_batch_ids:{sig}"), "");
-                        let ids: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap_or_default();
-                        let ids: Vec<i64> = ids.iter().filter_map(|v| v.as_i64()).collect();
-                        let all = !ids.is_empty() && ids.iter().all(|i| answered.contains(i));
-                        out.push((
-                            sig.clone(),
-                            all,
-                            pending_mark_get(con, sig, "admitted_at"),
-                            pending_mark_get(con, sig, "emitted_at"),
-                            pending_mark_get(con, sig, "settled_at"),
-                        ));
+                        if let Some(view) = ledger::view(con, sig)? {
+                            out.push(view);
+                        }
                     }
                     Ok(out)
                 })
                 .await;
             if let Ok(snap) = snap {
-                let mut retired: Vec<(String, &'static str)> = vec![];
-                for (sig, all_answered, admitted_at, emitted_at, settled_at) in snap {
-                    if let Some(reason) = should_retire(all_answered, emitted_at, settled_at) {
-                        retired.push((sig, reason));
+                let mut retired: Vec<(String, String)> = vec![];
+                for view in snap {
+                    if let Some(reason) = view.close_reason() {
+                        let outcome = if reason == "settled" {
+                            "skipped"
+                        } else {
+                            "delivered"
+                        };
+                        retired.push((view.batch_key.clone(), outcome.to_string()));
                         continue;
                     }
+                    let sig = view.batch_key.clone();
                     let last = *last_progress.get(&sig).unwrap_or(&now);
-                    let phase = delivery_phase(admitted_at, emitted_at, settled_at);
+                    let phase = view.phase();
                     // Waiting for the proof is bounded by a full model step: the
                     // extension emits nothing while the model thinks, so a short
                     // emit deadline would fire into a healthy turn.
-                    let budget = if phase == "inboxed" { retry_budget } else { turn_budget };
+                    let budget = if phase == "inboxed" {
+                        retry_budget
+                    } else {
+                        turn_budget
+                    };
                     if phase != "inboxed"
                         && !emit_warned.contains(&sig)
                         && now.saturating_sub(last) >= (emit_warn as i64) * 1000
@@ -1002,18 +1455,17 @@ async fn track_loop(
                     }
                 }
                 if !retired.is_empty() {
-                    let state_for_db = state.clone();
-                    let sigs_db: Vec<String> = retired.iter().map(|(s, _)| s.clone()).collect();
+                    let retired_db = retired.clone();
                     let _ = db
-                        .call(move |con| {
-                            for sig in &sigs_db {
-                                let _ = mark_done(con, &state_for_db, sig);
+                        .write(move |tx| {
+                            for (sig, outcome) in &retired_db {
+                                ledger::close_batch(tx.handle(), sig, outcome)?;
                             }
                             Ok(())
                         })
                         .await;
-                    for (sig, reason) in retired {
-                        dlog(&format!("batch {sig} retired ({reason})"));
+                    for (sig, outcome) in retired {
+                        dlog(&format!("batch {sig} retired ({outcome})"));
                         inflight.remove(&sig);
                         last_progress.remove(&sig);
                     }
@@ -1030,8 +1482,14 @@ async fn cmd_run() -> Result<()> {
     // message — the "looks healthy but deaf" failure this extraction exists to
     // avoid. required_cfg names the variable in the error.
     required_cfg("CHATBOT_TOKEN_FILE")?;
-    required_cfg("CHATBOT_CHAT_ID")?;
+    let chat_raw = required_cfg("CHATBOT_CHAT_ID")?;
+    if chat_bot::parse_chat_id(&chat_raw).is_none() {
+        return Err(anyhow!(
+            "CHATBOT_CHAT_ID={chat_raw:?} is not a valid numeric Telegram chat id; refusing to start"
+        ));
+    }
     let state = state_dir();
+    let _lock = acquire_state_lock(&state)?;
     // A live host keeps the extension it was spawned with, and the 15-minute
     // idle exit that used to reload it implicitly is gone (the host is now
     // persistent). So restart the generation whenever the staged extension
@@ -1051,7 +1509,32 @@ async fn cmd_run() -> Result<()> {
     }
     // The database thread starts before any unit needs it; a broken database
     // fails here, visibly, instead of inside the worker.
-    let db = Db::open(&state)?;
+    let db = match Db::open(&state) {
+        Ok(db) => db,
+        Err(e) => {
+            ops::db_failure("open", &e);
+            return Err(e);
+        }
+    };
+    // Crash window repair: a process that died between Intent -> Sending and
+    // the Telegram reply leaves Sending behind. It becomes Unknown here, with
+    // ONE incident and no HTTP call, so a restart cannot post a second message.
+    match chat_bot::send::repair_sending(&db).await {
+        Ok(n) if n > 0 => {
+            dlog(&format!(
+                "startup: {n} send(s) stuck in Sending -> Unknown (one alert, no resend)"
+            ));
+            ops::alert(
+                "send_unknown",
+                &format!("{n} send(s) left Sending at startup; not resent"),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            dlog(&format!("startup: repair Sending failed: {e:#}"));
+            ops::db_failure("repair_sending", &e);
+        }
+    }
     let me = api("getMe", &json!({})).await?;
     let bot_id: i64 = me
         .get("id")
@@ -1059,8 +1542,16 @@ async fn cmd_run() -> Result<()> {
         .ok_or_else(|| anyhow!("getMe: no id"))?;
     let username = cfg("CHATBOT_USERNAME", "").to_lowercase();
     {
-        let self_username = me.get("username").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let self_first = me.get("first_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let self_username = me
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let self_first = me
+            .get("first_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         db.call(move |con| {
             kv_set(con, "self_id", &bot_id.to_string())?;
             kv_set(con, "self_username", &self_username)?;
@@ -1080,6 +1571,20 @@ async fn cmd_run() -> Result<()> {
     let (recover_tx, recover_rx) = tokio::sync::mpsc::unbounded_channel::<Recover>();
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<Out>();
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<Inbound>();
+    let (media_tx, media_rx) =
+        tokio::sync::mpsc::channel::<chat_bot::media::MediaJob>(chat_bot::media::MEDIA_QUEUE_CAP);
+    let health_session = cfg("CHATBOT_SESSION", "chat-participant");
+    tokio::task::spawn_local(ops::health_loop(
+        state.clone(),
+        media_tx.clone(),
+        health_session,
+    ));
+    let retention_days: i64 = cfg(
+        "CHATBOT_ROW_RETENTION_DAYS",
+        &chat_bot::media::ROW_RETENTION_DAYS.to_string(),
+    )
+    .parse()
+    .unwrap_or(chat_bot::media::ROW_RETENTION_DAYS);
     tokio::task::spawn_local(control_loop(
         db.clone(),
         control_sock_path(&state),
@@ -1087,6 +1592,7 @@ async fn cmd_run() -> Result<()> {
         out_rx,
         inbound_tx,
     ));
+    tokio::task::spawn_local(tool_loop(state.clone(), chat_bot::tool_socket_path(&state)));
     tokio::task::spawn_local(admit_loop(
         db.clone(),
         job_rx,
@@ -1099,55 +1605,116 @@ async fn cmd_run() -> Result<()> {
         system_path,
     ));
     tokio::task::spawn_local(track_loop(db.clone(), admitted_rx, inboxed_rx, recover_tx));
+
+    // One cleanup pass at startup, then resume every unfinished download.
+    // Both run before polling so a pending row from the previous process is
+    // picked up without waiting for the maintenance timer.
+    {
+        let budget = chat_bot::media::MediaBudget::from_disk(&state);
+        let st = state.clone();
+        if let Err(e) = db
+            .call(move |con| {
+                chat_bot::media::cleanup_media(
+                    con,
+                    &st,
+                    &budget,
+                    std::time::SystemTime::now(),
+                    chat_bot::media::ORPHAN_GRACE,
+                    retention_days,
+                )
+            })
+            .await
+        {
+            dlog(&format!("startup media cleanup failed: {e:#}"));
+            ops::db_failure("startup_media_cleanup", &e);
+        }
+        match db
+            .call(|con| chat_bot::media::resume_pending(con, chat_bot::media::MEDIA_QUEUE_CAP))
+            .await
+        {
+            Ok(jobs) => {
+                for job in jobs {
+                    if media_tx.try_send(job).is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                dlog(&format!("startup media resume failed: {e:#}"));
+                ops::db_failure("startup_media_resume", &e);
+            }
+        }
+    }
+    tokio::task::spawn_local(media_loop(db.clone(), state.clone(), media_rx));
+    tokio::task::spawn_local(media_maintenance_loop(
+        db.clone(),
+        state.clone(),
+        media_tx.clone(),
+        retention_days,
+    ));
     dlog(&format!(
-        "chatd running, independent units (ingest/admit/track), database on its own thread, control socket {} (host socket {})",
+        "chatd running, independent units (ingest/media/admit/track), database on its own thread, control socket {} (host socket {})",
         control_sock_path(&state).display(),
         host_socket()
     ));
-    ingest_loop(db, state, bot_id, username, offset, job_tx, ack_rx).await
+    ingest_loop(
+        db, state, bot_id, username, offset, job_tx, media_tx, ack_rx,
+    )
+    .await
 }
 
-/// Ingest unit: polls Telegram continuously. Parsing a message and downloading
-/// its media runs in its own `spawn_local` task, so a slow download never delays
-/// the next `getUpdates`; the database write itself goes to the `chatdb` thread
-/// as ONE closure (dedup check + insert + prune) and never blocks this loop.
+/// Ingest unit: polls Telegram continuously. Parsing is pure; one page of
+/// envelopes is committed together with `kv("offset")` in a single
+/// `commit_page` transaction, and media downloads are only enqueued (the row
+/// is already durable in `pending`). A commit failure leaves the cursor where
+/// it was and the next poll re-fetches the same page.
 async fn ingest_loop(
     db: Db,
-    state: String,
+    _state: String,
     bot_id: i64,
     username: String,
     mut offset: i64,
     job_tx: tokio::sync::mpsc::UnboundedSender<Job>,
+    media_tx: tokio::sync::mpsc::Sender<chat_bot::media::MediaJob>,
     mut ack_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
     let window: f64 = cfg("CHATBOT_BATCH_SEC", "10").parse().unwrap_or(10.0);
     let mut batch: Vec<BatchMsg> = vec![];
     let mut poll_failures = 0u32;
     let mut last_flush = std::time::Instant::now();
-    let mut committed: i64 = db
-        .call(|con| Ok(kv_get(con, "offset", "0").parse().unwrap_or(0)))
+    let chat: i64 = db
+        .call(|con| Ok(kv_get(con, "chat_id", "0").parse().unwrap_or(0)))
         .await?;
     let mut inflight = 0usize;
-    let mut pending_stores = 0usize;
-    let (row_tx, mut row_rx) = tokio::sync::mpsc::unbounded_channel::<Option<BatchMsg>>();
     loop {
-        let updates: Value = match api("getUpdates", &json!({"offset": offset, "timeout": 3, "limit": 100})).await {
+        let updates: Value = match api(
+            "getUpdates",
+            &json!({"offset": offset, "timeout": 3, "limit": 100}),
+        )
+        .await
+        {
             Ok(u) => {
                 poll_failures = 0;
+                ops::mark_poll_ok();
                 u
             }
             Err(e) => {
                 poll_failures += 1;
+                ops::ingest_failure();
                 let exp = poll_failures.saturating_sub(1).min(4);
                 let backoff = (5u64 * (1u64 << exp)).min(60);
-                dlog(&format!("poll failed ({poll_failures}x), retry in {backoff}s: {e}"));
+                dlog(&format!(
+                    "poll failed ({poll_failures}x), retry in {backoff}s: {e}"
+                ));
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 continue;
             }
         };
+        let mut envelopes = vec![];
+        let mut through = offset;
         for u in updates.as_array().cloned().unwrap_or_default() {
             let uid = u.get("update_id").and_then(|v| v.as_i64()).unwrap_or(0);
-            offset = offset.max(uid + 1);
+            through = through.max(uid + 1);
             let raw_msg = u.get("message").cloned();
             let chan_post = u.get("channel_post").cloned();
             let msg = raw_msg.clone().or(chan_post.clone());
@@ -1155,65 +1722,71 @@ async fn ingest_loop(
                 Some(m) => m,
                 None => continue,
             };
+            if let Some(id) = msg.get("message_id").and_then(|v| v.as_i64()) {
+                ops::record_message_id(id);
+            }
             msg["_update_id"] = json!(uid);
             if chan_post.is_some() && raw_msg.is_none() {
                 msg["_cross_chat"] = json!(true);
             }
             let strict = raw_msg.is_some();
-            let st = state.clone();
-            let tx = row_tx.clone();
-            let db_task = db.clone();
-            pending_stores += 1;
-            tokio::task::spawn_local(async move {
-                // Contract: every await (media download, ffmpeg preview) happens
-                // BEFORE the database closure; the closure receives a finished
-                // packet and does dedup+insert+prune atomically.
-                let prep = match prepare_message(&msg, &st, strict).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // Never swallow this: a config/IO failure here means the
-                        // message is lost, and silence would hide it.
-                        dlog(&format!("prepare message failed: {e:#}"));
-                        None
-                    }
-                };
-                let out = match prep {
-                    Some(prep) => {
-                        let st2 = st.clone();
-                        db_task
-                            .call(move |con| store_prepared(con, &prep, &st2))
-                            .await
-                            .ok()
-                            .flatten()
-                    }
-                    None => None,
-                };
-                let _ = tx.send(out);
-            });
-        }
-        // Rows finished by the store tasks since the last cycle.
-        while let Ok(row) = row_rx.try_recv() {
-            pending_stores = pending_stores.saturating_sub(1);
-            let mut row = match row {
-                Some(r) => r,
-                None => continue,
-            };
-            if row.user_id == Some(bot_id) {
-                continue;
+            match envelope_from_message(&msg, uid, strict, chat) {
+                Ok(Some(env)) => envelopes.push(env),
+                Ok(None) => {}
+                Err(e) => dlog(&format!("prepare message failed: {e:#}")),
             }
-            let urgent = row.to_me
-                || (!username.is_empty() && row.text.to_lowercase().contains(&format!("@{username}")));
-            if urgent {
-                row.to_me = true;
-                let mut combo = std::mem::take(&mut batch);
-                combo.push(row);
-                inflight += 1;
-                if job_tx.send(Job { batch: combo }).is_err() {
-                    dlog("admit unit gone; dropping urgent batch");
+        }
+        if through > offset {
+            let mut by_key: std::collections::HashMap<MessageKey, Envelope> =
+                envelopes.iter().cloned().map(|e| (e.key, e)).collect();
+            let page = match db.write(move |tx| tx.commit_page(envelopes, through)).await {
+                Ok(p) => p,
+                Err(e) => {
+                    // The cursor was not advanced: the same page is fetched
+                    // again instead of losing these updates.
+                    dlog(&format!("page commit failed, offset stays {offset}: {e:#}"));
+                    ops::ingest_failure();
+                    ops::db_failure("commit_page", &e);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
                 }
-                last_flush = std::time::Instant::now();
-            } else {
-                batch.push(row);
+            };
+            offset = through;
+            ops::record_duplicates(page.applied.duplicate as u64);
+            for ins in page.inserted {
+                let Some(env) = by_key.remove(&ins.key) else {
+                    continue;
+                };
+                if env.media_state == chat_bot::media::MediaState::Pending {
+                    let job = chat_bot::media::MediaJob {
+                        row_id: ins.row_id,
+                        file_id: env.file_id.clone(),
+                        kind: env.media_kind.clone(),
+                        expected_size: env.media_size.unwrap_or(0),
+                    };
+                    if media_tx.try_send(job).is_err() {
+                        dlog("media queue full; pending row will be resumed by maintenance");
+                    }
+                }
+                if env.user_id == Some(bot_id) {
+                    continue;
+                }
+                let mut row = env.to_batch_msg();
+                let urgent = row.to_me
+                    || (!username.is_empty()
+                        && row.text.to_lowercase().contains(&format!("@{username}")));
+                if urgent {
+                    row.to_me = true;
+                    let mut combo = std::mem::take(&mut batch);
+                    combo.push(row);
+                    inflight += 1;
+                    if job_tx.send(Job { batch: combo }).is_err() {
+                        dlog("admit unit gone; dropping urgent batch");
+                    }
+                    last_flush = std::time::Instant::now();
+                } else {
+                    batch.push(row);
+                }
             }
         }
         if !batch.is_empty() && last_flush.elapsed().as_secs_f64() >= window {
@@ -1224,16 +1797,84 @@ async fn ingest_loop(
             }
             last_flush = std::time::Instant::now();
         }
-        // Durable-first offset: commit only once every queued batch has its
-        // pending ledger entry and no store task is still running, so a crash
-        // re-fetches instead of losing (mirror dedups by message_id).
         while ack_rx.try_recv().is_ok() {
             inflight = inflight.saturating_sub(1);
         }
-        if batch.is_empty() && inflight == 0 && pending_stores == 0 && offset != committed {
-            let target = offset;
-            db.call(move |con| kv_set(con, "offset", &target.to_string())).await?;
-            committed = offset;
+    }
+}
+
+/// Media fetcher: one job at a time, each bounded by FETCH_DEADLINE. A budget
+/// refusal is not an error: the row stays `pending` and maintenance resumes it.
+async fn media_loop(
+    db: Db,
+    state: String,
+    mut rx: tokio::sync::mpsc::Receiver<chat_bot::media::MediaJob>,
+) {
+    let source = chat_bot::media::TelegramSource;
+    while let Some(job) = rx.recv().await {
+        let budget = chat_bot::media::MediaBudget::from_disk(&state);
+        match chat_bot::media::fetch_job(&db, &state, &job, &budget, &source).await {
+            Ok(chat_bot::media::FetchOutcome::Deferred) => {
+                dlog(&format!("media budget deferred row {}", job.row_id));
+            }
+            Ok(chat_bot::media::FetchOutcome::Skipped) => {
+                dlog(&format!(
+                    "media row {} vanished before finalize",
+                    job.row_id
+                ));
+            }
+            Ok(chat_bot::media::FetchOutcome::Finalized { size, .. }) => {
+                dlog(&format!("media row {} ready ({size} bytes)", job.row_id));
+            }
+            Err(e) => dlog(&format!("media fetch failed for {}: {e:#}", job.row_id)),
+        }
+    }
+}
+
+/// Startup cleanup plus a five-minute pass: one cleanup pass, then resume
+/// pending downloads. The victim order inside cleanup is fixed in
+/// `media::cleanup_media`.
+async fn media_maintenance_loop(
+    db: Db,
+    state: String,
+    tx: tokio::sync::mpsc::Sender<chat_bot::media::MediaJob>,
+    retention_days: i64,
+) {
+    loop {
+        tokio::time::sleep(chat_bot::media::MAINTENANCE_INTERVAL).await;
+        let budget = chat_bot::media::MediaBudget::from_disk(&state);
+        let st = state.clone();
+        if let Err(e) = db
+            .call(move |con| {
+                chat_bot::media::cleanup_media(
+                    con,
+                    &st,
+                    &budget,
+                    std::time::SystemTime::now(),
+                    chat_bot::media::ORPHAN_GRACE,
+                    retention_days,
+                )
+            })
+            .await
+        {
+            dlog(&format!("media cleanup failed: {e:#}"));
+            ops::db_failure("media_cleanup", &e);
+        }
+        match db
+            .call(|con| chat_bot::media::resume_pending(con, chat_bot::media::MEDIA_QUEUE_CAP))
+            .await
+        {
+            Ok(jobs) => {
+                for job in jobs {
+                    if tx.try_send(job).is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                dlog(&format!("media resume failed: {e:#}"));
+                ops::db_failure("media_resume", &e);
+            }
         }
     }
 }

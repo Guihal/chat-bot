@@ -72,11 +72,17 @@ fn main() -> Result<()> {
                 i += 2;
             }
             "--repeat" => {
-                repeat = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(repeat);
+                repeat = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(repeat);
                 i += 2;
             }
             "--media-files" => {
-                media_files = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(media_files);
+                media_files = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(media_files);
                 i += 2;
             }
             other => {
@@ -87,7 +93,9 @@ fn main() -> Result<()> {
     }
     println!(
         "dbbench: rows={rows_wanted:?} repeat={repeat} media_files={media_files} cpus={}",
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0)
     );
     for rows in rows_wanted {
         run_for(rows, repeat)?;
@@ -129,7 +137,11 @@ fn seed(con: &Connection, rows: i64) -> Result<()> {
             } else {
                 (String::new(), String::new(), None)
             };
-            let reply_to: Option<i64> = if i % 31 == 0 && i > 7 { Some(1000 + i - 7) } else { None };
+            let reply_to: Option<i64> = if i % 31 == 0 && i > 7 {
+                Some(1000 + i - 7)
+            } else {
+                None
+            };
             ins.execute(params![
                 i + 1,
                 1000 + i,
@@ -282,10 +294,9 @@ fn legacy_p4(con: &Connection) -> Result<String> {
 fn legacy_p5(con: &Connection) -> Result<String> {
     let mut stmt = con.prepare(DEDUP_LEGACY)?;
     let id: Option<i64> = stmt
-        .query_row(
-            params![DEDUP_TEXT, DEDUP_USER, DEDUP_FROM, DEDUP_TO],
-            |r| r.get(0),
-        )
+        .query_row(params![DEDUP_TEXT, DEDUP_USER, DEDUP_FROM, DEDUP_TO], |r| {
+            r.get(0)
+        })
         .ok();
     Ok(format!("{id:?}"))
 }
@@ -296,12 +307,19 @@ fn legacy_p6(con: &Connection) -> Result<String> {
 }
 
 fn new_p1(con: &Connection) -> Result<String> {
-    let (entries, total) = gif_page(con, 0, 200)?;
-    let page: Vec<String> = entries
+    let page = chat_bot::catalog::page(con, 0, 200)?;
+    let rows: Vec<String> = page
+        .records
         .iter()
-        .map(|e| format!("{}|{}", e.file_id, e.text))
+        .map(|r| {
+            let caption = match r.caption() {
+                chat_bot::catalog::Caption::Absent => "",
+                chat_bot::catalog::Caption::Text(t) => t.as_str(),
+            };
+            format!("{}|{}", r.file_id(), caption)
+        })
         .collect();
-    Ok(format!("total={total};{}", page.join(",")))
+    Ok(format!("total={};{}", page.total, rows.join(",")))
 }
 
 fn new_p2(con: &Connection) -> Result<String> {
@@ -309,7 +327,14 @@ fn new_p2(con: &Connection) -> Result<String> {
     let rows = batch_rows_by_ids(con, &ids)?;
     Ok(rows
         .iter()
-        .map(|r| format!("{}|{}|{}", r.message_id, r.user_id.unwrap_or_default(), r.username))
+        .map(|r| {
+            format!(
+                "{}|{}|{}",
+                r.message_id,
+                r.user_id.unwrap_or_default(),
+                r.username
+            )
+        })
         .collect::<Vec<_>>()
         .join(","))
 }
@@ -346,10 +371,9 @@ fn new_p4(con: &Connection) -> Result<String> {
 fn new_p5(con: &Connection) -> Result<String> {
     let mut stmt = con.prepare_cached(DEDUP_LEGACY)?;
     let id: Option<i64> = stmt
-        .query_row(
-            params![DEDUP_TEXT, DEDUP_USER, DEDUP_FROM, DEDUP_TO],
-            |r| r.get(0),
-        )
+        .query_row(params![DEDUP_TEXT, DEDUP_USER, DEDUP_FROM, DEDUP_TO], |r| {
+            r.get(0)
+        })
         .ok();
     Ok(format!("{id:?}"))
 }
@@ -507,8 +531,16 @@ fn run_for(rows: i64, repeat: usize) -> Result<()> {
             legacy_ms[i],
             new_ms[i],
             speedup,
-            if has_heap_scan(&legacy_plan[i]) { "heap" } else { "ok" },
-            if has_heap_scan(&new_plan[i]) { "heap" } else { "ok" }
+            if has_heap_scan(&legacy_plan[i]) {
+                "heap"
+            } else {
+                "ok"
+            },
+            if has_heap_scan(&new_plan[i]) {
+                "heap"
+            } else {
+                "ok"
+            }
         );
         println!("    legacy plan: {}", legacy_plan[i]);
         println!("    new plan:    {}", new_plan[i]);

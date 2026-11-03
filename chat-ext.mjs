@@ -1,51 +1,25 @@
 /**
  * chat-ext: native omo extension driving the chat-bot host session.
  *
- * - Registers the SOLE send path `chat_send` (Bot API sendMessage/sendAnimation).
- *   The daemon never posts assistant text; a turn with zero `chat_send` calls
+ * - Registers the SOLE send path `chat_send`; a turn that calls no chat_send
  *   sends nothing (silence, equivalent to `[skip]`).
- * - Transport: the daemon hosts a unix socket at `<state>/control.sock` and this
- *   extension connects to it (no files). The daemon writes one line per batch,
- *   `{"push":{"delivery_id","text","deliverAs"}}`; the extension admits it via
- *   `admitExternalMessage` (idempotent per delivery_id) and answers
- *   `{"result":{"delivery_id","kind"}}`. A steer carries the current
- *   `turn_epoch`, so it lands in a RUNNING turn at the agent's next model step;
- *   `turn_conflict`/`held_draft` mean the runtime enqueued nothing, so the result
- *   says so and the daemon retries instead of counting it delivered.
+ * - Transport: the daemon hosts a unix socket at `<state>/control.sock`. The
+ *   daemon owns the Telegram token and every Bot API call. This file never
+ *   reads the token, never builds a Bot API URL and never calls fetch.
+ * - `chat_send`, `typing` and `gif_list` are RPC ops on that socket. The daemon
+ *   decides message parts (sticker + text is two messages), mints the answer in
+ *   its journal, writes the durable send intent before HTTP, and replays the
+ *   stored receipt for a repeated call with the same arguments.
+ * - A push carries the batch text, incoming ids and forum topic. The
+ *   extension admits it via `admitExternalMessage` and answers
+ *   `{"result":{"delivery_id","kind"}}`; the daemon retries a refusal.
  * - Delivery proof: `listAdmittedDeliveries()` is the only honest source for
  *   "the agent has it in context" (`emitted`) or "the session file refused it"
  *   (`failed`); both are mirrored into events as `delivery_state`.
  * - Events for the daemon land in `<state>/events.jsonl` (`turn_start`,
- *   `turn_end` with the turn's chat_send receipts, `admitted`, `admit_error`,
- *   `agent_end_aborted`, `compacted` with deliveries still active at compact
- *   time). The daemon waits on these instead of polling
- *   `omo state/read/wait`.
- * - Exactly-once sends across session restarts: receipts are cached in
- *   `<state>/sent-receipts.json` keyed by delivery_id; a re-admitted batch
- *   replays cached receipts without re-sending.
- * - `chat_send` sends one message per call and at most ONE media attachment
- *   per turn: a chat GIF by `gif_file_id` (sendAnimation), a sticker by
- *   `sticker_file_id` (sendSticker, no caption possible), or a local file by
- *   `media_path` (`.gif` -> sendAnimation, image/* -> sendPhoto, video/* ->
- *   sendVideo, anything else -> sendDocument). The three are mutually
- *   exclusive; a second media call in the same turn is refused.
- * - `gif_list` reads the FULL deduplicated GIF registry through the daemon
- *   (`{"call":{"op":"gif_list"}}` / `{"return":...}` on the same control
- *   socket) — only rows Telegram delivered as `animation`, never videos.
- *   The extension still never opens sqlite itself.
- * - `subagent` is the ONLY dispatch path and it is structurally gated: the
- *   daemon marks owner-authored message ids (`owner_msgs`) in each push, and
- *   the tool refuses unless the caller names one of them (`owner_message_id`).
- *   Owner = `CHATBOT_OWNER_USERNAME` / `CHATBOT_OWNER_ID` per crystal M1:
- *   subagents only on the owner's own request. Both may be unset — then nobody
- *   is the owner and dispatch stays locked (see env.example). The child is a
- *   one-shot `omo -p` process carrying the `general` persona (the native `task`
- *   tool is not part of this session's set and pulling its plugin in would drag
- *   memory/teams/rule injections into the character).
- *
- * No database access: GIF file_ids arrive from the daemon as `gif_file_id`
- * params (the daemon prints a `[gif:ID] -> file_id` catalog into the batch);
- * the full registry comes back through the daemon's control-socket handle.
+ *   `turn_end`, `admitted`, `admit_error`, `agent_end_aborted`, `compacted`).
+ * - `subagent` dispatches a one-shot `omo -p` process carrying the `general`
+ *   persona, allowed as the persona text describes.
  */
 
 import { spawn } from "node:child_process";
@@ -55,74 +29,20 @@ import path from "node:path";
 
 const SKIP_TOKEN = "[skip]";
 
-// ---- send classification (pure, unit-tested) ----
-// One chat_send carries at most ONE media attachment: a GIF from the catalog,
-// a sticker by file_id, or a local media file. Text-only calls and these three
-// are the only shapes; anything else is refused instead of guessing which
-// argument the model meant.
-export const MAX_MEDIA_PER_TURN = 1;
-export const TURN_MEDIA_ERROR =
-  "error: за ход можно отправить только одно медиа (гифку, стикер или файл) — второе не отправлено; захочешь ещё — следующим ходом";
-export const STICKER_TEXT_ERROR =
-  "error: стикер не принимает подпись — отправь текст отдельным chat_send без sticker_file_id";
-
-export function classifyChatSend(params) {
+// Pure argument shape for the daemon RPC. Kept exported so the send contract is
+// testable without an omo runtime; it contains no URL and no token.
+export function sendArgs(params, batchKey, threadId) {
   const p = params || {};
-  const gif = p.gif_file_id ? String(p.gif_file_id) : "";
-  const sticker = p.sticker_file_id ? String(p.sticker_file_id) : "";
-  const media = p.media_path ? String(p.media_path) : "";
-  const chosen = [gif ? "gif" : "", sticker ? "sticker" : "", media ? "media" : ""].filter(
-    Boolean,
-  );
-  if (chosen.length > 1)
-    return {
-      error: "error: gif_file_id, sticker_file_id и media_path взаимоисключающие",
-    };
-  if (!chosen.length) return { target: "text" };
-  // Telegram's sendSticker takes no caption; silently dropping the text would
-  // lose it, so the caller must send it as its own message.
-  if (chosen[0] === "sticker" && String(p.text || "").trim())
-    return { error: STICKER_TEXT_ERROR };
-  return { target: chosen[0] };
-}
-
-// One media attachment per turn: the hard, machine-checkable half of
-// "кидать активнее, но не перебарщивать" (the persona carries the judgement).
-export function allowsAnotherMedia(count) {
-  return Number(count) < MAX_MEDIA_PER_TURN;
-}
-
-// 45 MB stays under the Bot API upload ceiling; larger files are refused
-// before reading them so a huge batch file cannot stall the turn.
-const MEDIA_MAX_BYTES = 45 * 1024 * 1024;
-const MIME_BY_EXT = {
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".png": "image/png",
-  ".webp": "image/webp",
-  ".gif": "image/gif",
-  ".mp4": "video/mp4",
-  ".mov": "video/quicktime",
-  ".webm": "video/webm",
-  ".mkv": "video/x-matroska",
-  ".mp3": "audio/mpeg",
-  ".ogg": "audio/ogg",
-  ".pdf": "application/pdf",
-};
-
-// Upload target by file type. A `.gif` goes out as an ANIMATION (Telegram
-// shows it as a looping gif), not as a still photo; only other images use
-// sendPhoto.
-export function mediaSpec(filePath) {
-  const ext = path.extname(filePath).toLowerCase();
-  const mime = MIME_BY_EXT[ext] || "application/octet-stream";
-  if (ext === ".gif")
-    return { method: "sendAnimation", field: "animation", mime };
-  if (mime.startsWith("image/"))
-    return { method: "sendPhoto", field: "photo", mime };
-  if (mime.startsWith("video/"))
-    return { method: "sendVideo", field: "video", mime };
-  return { method: "sendDocument", field: "document", mime };
+  const out = { batch_key: String(batchKey || "") };
+  if (p.text !== undefined && p.text !== null) out.text = String(p.text);
+  if (p.reply_to !== undefined && p.reply_to !== null)
+    out.reply_to = Number(p.reply_to);
+  if (p.gif_file_id) out.gif_file_id = String(p.gif_file_id);
+  if (p.sticker_file_id) out.sticker_file_id = String(p.sticker_file_id);
+  if (p.media_path) out.media_path = String(p.media_path);
+  if (threadId !== undefined && threadId !== null)
+    out.thread_id = Number(threadId);
+  return out;
 }
 
 function env(name, fallback) {
@@ -135,42 +55,49 @@ function env(name, fallback) {
   return fallback;
 }
 
+// The handshake names the durable session and its generation, never the
+// configured session name. Exported so the frame shape is testable without a
+// running runtime.
+export function helloFrame(uid, generation, pid) {
+  return {
+    hello: {
+      session: String(uid || ""),
+      generation: Number(generation || 0),
+      pid: Number(pid || 0),
+    },
+  };
+}
+
+// A stale extension instance is dead for delivery: it must not reconnect and
+// re-arms only through a fresh session start.
+export function staleGate() {
+  let dead = false;
+  return {
+    isDead: () => dead,
+    markDead: () => {
+      dead = true;
+    },
+    rearm: () => {
+      dead = false;
+    },
+  };
+}
+
 export default function (pi) {
   const stateDir = env("CHATBOT_STATE_DIR", "./state");
   const controlSockPath = path.join(stateDir, "control.sock");
   const eventsPath = path.join(stateDir, "events.jsonl");
-  const receiptsPath = path.join(stateDir, "sent-receipts.json");
-  const apiBase = env("CHATBOT_API_BASE", "https://api.telegram.org");
-  const tokenFile = env("CHATBOT_TOKEN_FILE", "");
-  const chatId = env("CHATBOT_CHAT_ID", "");
-  // A bot without a token or a target chat can only misbehave; refuse to load
-  // instead of falling back to some inherited chat id.
-  if (!tokenFile) throw new Error("CHATBOT_TOKEN_FILE is not set");
-  if (!chatId) throw new Error("CHATBOT_CHAT_ID is not set");
 
-  // Owner-authored message ids of the CURRENT turn: filled from every pushed
-  // batch (`owner_msgs`), cleared on turn_end. The `subagent` tool demands one
-  // of them, so a permission can never outlive the message that granted it and
-  // nobody else's message can open dispatch.
-  let ownerMsgs = new Set();
-
-  // Incoming message ids of the CURRENT turn: filled from every pushed batch
-  // (`batch_ids`), cleared on turn_end. `chat_send` accepts `reply_to` only from
-  // this set, so a model can never quote the 50-message history window, the GIF
-  // catalog or a message from an earlier turn. An empty set (old daemon) keeps
-  // the previous unchecked behaviour.
-  let batchIds = new Set();
-
+  // Batches admitted in this turn: key, incoming ids and forum topic. The
+  // daemon validates reply targets and owns message_thread_id, but choosing
+  // WHICH batch an answer belongs to needs the ticket the push carried.
+  let activeBatches = [];
 
   // Delivery ids admitted by drain and served by the current turn. The daemon
   // serializes batches (one turn at a time), so this normally holds exactly one.
   let activeDeliveries = [];
-  // (reply_to, text, gif, sticker, media) -> receipt for the current turn
-  // (cross-turn replay is served from the receipts file below).
+  // argument fingerprint -> raw daemon response for the current turn.
   let turnSends = new Map();
-  // Media attachments already sent in this turn: the hard "не перебарщивать"
-  // bound (one per turn), reset on both turn boundaries.
-  let turnMediaCount = 0;
 
   function emit(ev) {
     try {
@@ -183,109 +110,61 @@ export default function (pi) {
     }
   }
 
-  function readToken() {
-    if (!tokenFile) throw new Error("CHATBOT_TOKEN_FILE is not set");
-    return fs.readFileSync(tokenFile, "utf8").trim();
-  }
-
-  async function botApi(method, params) {
-    const url = `${apiBase}/bot${readToken()}/${method}`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(params),
-    });
-    let data = null;
-    try {
-      data = await res.json();
-    } catch {
-      throw new Error(
-        `Bot API ${method}: HTTP ${res.status} (unparseable body)`,
-      );
+  function chooseBatch(replyTo) {
+    if (!activeBatches.length) return null;
+    const wanted = Number(replyTo);
+    if (Number.isInteger(wanted)) {
+      for (let i = activeBatches.length - 1; i >= 0; i--) {
+        if (activeBatches[i].ids.includes(wanted)) return activeBatches[i];
+      }
     }
-    if (!data || data.ok !== true) {
-      throw new Error(
-        `Bot API ${method}: ${JSON.stringify(data).slice(0, 300)}`,
-      );
-    }
-    return data.result;
-  }
-
-  function loadReceipts() {
-    try {
-      const raw = JSON.parse(fs.readFileSync(receiptsPath, "utf8"));
-      if (raw && typeof raw === "object") return raw;
-    } catch {
-      // Missing or corrupt: start empty (a corrupt cache must not block sends).
-    }
-    return {};
-  }
-
-  function saveReceipt(key, receipt) {
-    const all = loadReceipts();
-    all[key] = receipt;
-    try {
-      fs.writeFileSync(receiptsPath, JSON.stringify(all));
-    } catch {
-      // Cache write failure must not fail the send that already happened.
-    }
-  }
-
-  function receiptKey(
-    deliveryId,
-    replyTo,
-    text,
-    gifFileId,
-    stickerFileId,
-    mediaPath,
-  ) {
-    return `${deliveryId}::${replyTo === null || replyTo === undefined ? "" : replyTo}::${text}::${gifFileId || ""}::${stickerFileId || ""}::${mediaPath || ""}`;
-  }
-
-  // ---- media upload (Attachment 3) ----
-  async function botApiForm(method, form) {
-    const url = `${apiBase}/bot${readToken()}/${method}`;
-    const res = await fetch(url, { method: "POST", body: form });
-    let data = null;
-    try {
-      data = await res.json();
-    } catch {
-      throw new Error(
-        `Bot API ${method}: HTTP ${res.status} (unparseable body)`,
-      );
-    }
-    if (!data || data.ok !== true) {
-      throw new Error(
-        `Bot API ${method}: ${JSON.stringify(data).slice(0, 300)}`,
-      );
-    }
-    return data.result;
-  }
-
-  async function sendMediaFile(filePath, caption, replyTo) {
-    const spec = mediaSpec(filePath);
-    const buf = fs.readFileSync(filePath);
-    const form = new FormData();
-    form.append("chat_id", chatId);
-    form.append(spec.field, new Blob([buf], { type: spec.mime }), path.basename(filePath));
-    const cap = String(caption || "").slice(0, 1024);
-    if (cap.trim()) form.append("caption", cap);
-    if (replyTo !== null) form.append("reply_to_message_id", String(replyTo));
-    return botApiForm(spec.method, form);
+    return activeBatches[activeBatches.length - 1];
   }
 
   // Typing ownership: shown only while the agent is actually working, never
-  // blindly during daemon waits. Stopped on every turn/agent/session end so
-  // no timer outlives the work it signals.
+  // blindly during daemon waits. The call is RPC; the daemon owns the token and
+  // the topic parameter. Stopped on every turn/agent/session end.
   let typingTimer = null;
-  function startTyping() {
+  // The run's ticket (batch key + topic). It must OUTLIVE a single turn:
+  // `activeBatches` is cleared on `turn_end`, and a typing call without
+  // batch_key/thread would land in General instead of the user's topic
+  // (send.rs::typing falls back to thread_id=null without a key).
+  let runTicket = null;
+  // A push arms the indicator before the runtime starts a turn. If no turn ever
+  // starts (the session is held, the run was refused, the runtime is parked),
+  // the indicator must stop instead of burning: a lit indicator over a session
+  // that does nothing is a lie the owner already called out.
+  const TYPING_ARM_TIMEOUT_MS = Number(
+    env("CHATBOT_TYPING_ARM_TIMEOUT_MS", "120000"),
+  );
+  let typingArmedAt = 0;
+  let typingSawTurn = false;
+  function startTyping(ticket) {
+    if (ticket) {
+      runTicket = ticket;
+      if (typingSawTurn) {
+        // A steer that lands inside a live run keeps the run alive; reopening a
+        // no-turn window here would black out the indicator mid-generation.
+        typingArmedAt = 0;
+      } else if (!typingArmedAt) {
+        typingArmedAt = Date.now();
+      }
+    }
     if (typingTimer) return;
     const tick = () => {
-      try {
-        botApi("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
-      } catch {
-        // Token missing/unreadable: typing is best-effort only, never fail a turn.
+      if (
+        !typingSawTurn &&
+        typingArmedAt &&
+        Date.now() - typingArmedAt > TYPING_ARM_TIMEOUT_MS
+      ) {
+        stopTyping();
+        return;
       }
+      const t = runTicket;
+      const args = t
+        ? { batch_key: t.key, thread_id: t.thread ?? null }
+        : {};
+      controlCall("typing", args, 6000).catch(() => {});
     };
     tick();
     typingTimer = setInterval(tick, 4000);
@@ -295,26 +174,27 @@ export default function (pi) {
       clearInterval(typingTimer);
       typingTimer = null;
     }
+    runTicket = null;
+    typingArmedAt = 0;
+    typingSawTurn = false;
   }
-
   pi.registerTool({
     name: "chat_send",
     label: "Send chat message",
     description:
-      "The ONLY way to send a message to the Telegram chat. Call once per message " +
-      "with the reply target and AT MOST ONE media argument per turn: a chat GIF " +
-      "(gif_file_id), a sticker by file_id (sticker_file_id, no caption), or a " +
-      "local media file (media_path from a batch [file] marker). A turn that " +
-      "calls no chat_send sends nothing (silence). Never emit chat text outside " +
-      "this tool.",
+      "The ONLY way to send a message to the Telegram chat. Call once per message. " +
+      "The daemon owns the Bot API. A turn that calls no chat_send sends nothing. " +
+      "A repeat with identical arguments returns the same receipt without sending " +
+      "again; a different second answer in the same turn is refused. A sticker " +
+      "plus text is delivered as TWO messages. At most one media argument per call.",
     parameters: {
       type: "object",
       properties: {
         text: {
           type: "string",
           description:
-            "Message text (caption when gif_file_id or media_path is set; a " +
-            "sticker cannot carry a caption — send the text separately).",
+            "Message text (caption when gif_file_id or media_path is set). With " +
+            "sticker_file_id the text is sent as its own message.",
         },
         reply_to: {
           type: "integer",
@@ -328,177 +208,59 @@ export default function (pi) {
         },
         sticker_file_id: {
           type: "string",
-          description:
-            "file_id of a sticker from a batch [sticker] line; sent with " +
-            "sendSticker, so it takes no caption.",
+          description: "file_id of a sticker from a batch [sticker] line.",
         },
         media_path: {
           type: "string",
           description:
             "Absolute path of a local media file from a batch [file] marker " +
-            "(.gif -> sendAnimation, photo -> sendPhoto, video -> sendVideo, " +
-            "otherwise sendDocument).",
+            "(.gif -> animation, image -> photo, video -> video, else document).",
         },
       },
       additionalProperties: false,
     },
     execute: async (toolCallId, params) => {
-      // The daemon no longer parses markers: strip any stray `[reply:N]` /
-      // `[gif:N]` markers so they never leak into the chat verbatim.
-      let text = String(params.text || "")
+      const deny = (why) => ({
+        content: [{ type: "text", text: `error: ${why}` }],
+        isError: true,
+      });
+      const text = String(params.text || "")
         .replace(/^\s*\[reply:\d+\]\s*/, "")
         .replace(/\[gif:\d+\]/g, "")
         .trim();
-      const requestedReplyTo =
-        params.reply_to === undefined || params.reply_to === null
-          ? null
-          : Number(params.reply_to);
-      let replyTo = requestedReplyTo;
-      let replyDropped = false;
-      if (
-        replyTo !== null &&
-        batchIds.size > 0 &&
-        !batchIds.has(replyTo)
-      ) {
-        // A quote outside this batch is exactly the "ancient message" failure:
-        // drop the quote but keep the answer (exactly-once send is preserved and
-        // the model is told what happened).
-        emit({
-          kind: "chat_send_reply_dropped",
-          toolCallId,
-          reply_to: replyTo,
-          valid: [...batchIds],
-        });
-        replyDropped = true;
-        replyTo = null;
+      const batch = chooseBatch(params.reply_to);
+      if (!batch) {
+        return deny("нет активной пачки — chat_send вызывается только в ходе с доставленной пачкой");
       }
-      const dropNote = replyDropped
-        ? `\nsent without quote: reply_to ${requestedReplyTo} is not in this batch (valid: ${[
-            ...batchIds,
-          ].join(", ")})`
-        : "";
-      const gifFileId = params.gif_file_id ? String(params.gif_file_id) : "";
-      const stickerFileId = params.sticker_file_id
-        ? String(params.sticker_file_id)
-        : "";
-      const mediaPath = params.media_path ? String(params.media_path) : "";
-      const classified = classifyChatSend({ ...params, text });
-      if (classified.error) {
-        return {
-          content: [{ type: "text", text: classified.error }],
-          isError: true,
-        };
-      }
-      if (!text.trim() && !gifFileId && !stickerFileId && !mediaPath) {
-        return {
-          content: [{ type: "text", text: "error: empty body, nothing sent" }],
-          isError: true,
-        };
+      const args = sendArgs({ ...params, text }, batch.key, batch.thread);
+      if (!text && !args.gif_file_id && !args.sticker_file_id && !args.media_path) {
+        return deny("empty body, nothing sent");
       }
       if (text === SKIP_TOKEN) {
         return {
-          content: [
-            { type: "text", text: "silence acknowledged, nothing sent" },
-          ],
+          content: [{ type: "text", text: "silence acknowledged, nothing sent" }],
         };
       }
-      const turnKey = `${replyTo === null ? "" : replyTo}::${text}::${gifFileId}::${stickerFileId}::${mediaPath}`;
-      if (turnSends.has(turnKey)) {
-        return {
-          content: [
-            { type: "text", text: JSON.stringify(turnSends.get(turnKey)) },
-          ],
-        };
+      const key = JSON.stringify(args);
+      if (turnSends.has(key)) {
+        return { content: [{ type: "text", text: turnSends.get(key) }] };
       }
-      // Cross-turn replay: same delivery re-admitted after a session restart
-      // must not re-send. The daemon serializes batches, so activeDeliveries
-      // identifies this turn's batch.
-      const cached = loadReceipts();
-      for (const id of activeDeliveries) {
-        const hit = cached[
-          receiptKey(id, replyTo, text, gifFileId, stickerFileId, mediaPath)
-        ];
-        if (hit) {
-          turnSends.set(turnKey, hit);
-          emit({
-            kind: "chat_send_replay",
-            toolCallId,
-            delivery_id: id,
-            receipt: hit,
-          });
-          return {
-            content: [{ type: "text", text: JSON.stringify(hit) + dropNote }],
-          };
-        }
-      }
-      const isMediaSend = Boolean(gifFileId || stickerFileId || mediaPath);
-      if (isMediaSend && !allowsAnotherMedia(turnMediaCount)) {
-        return {
-          content: [{ type: "text", text: TURN_MEDIA_ERROR }],
-          isError: true,
-        };
-      }
-      let sent;
-      if (gifFileId) {
-        const p = { chat_id: chatId, animation: gifFileId };
-        if (text.trim()) p.caption = text.slice(0, 1024);
-        if (replyTo !== null) p.reply_to_message_id = replyTo;
-        sent = await botApi("sendAnimation", p);
-      } else if (stickerFileId) {
-        // sendSticker takes no caption: classifyChatSend already refused a
-        // sticker call that carried text, so nothing is dropped here.
-        const p = { chat_id: chatId, sticker: stickerFileId };
-        if (replyTo !== null) p.reply_to_message_id = replyTo;
-        sent = await botApi("sendSticker", p);
-      } else if (mediaPath) {
-        let stat = null;
+      try {
+        const raw = await controlCall("chat_send", args, 90000);
+        turnSends.set(key, raw);
+        let receipt = null;
         try {
-          stat = fs.statSync(mediaPath);
+          receipt = JSON.parse(raw);
         } catch {
-          return {
-            content: [
-              { type: "text", text: `error: media file not found: ${mediaPath}` },
-            ],
-            isError: true,
-          };
+          // The daemon's text is the contract; a non-JSON note is still valid.
         }
-        if (!stat.isFile()) {
-          return {
-            content: [
-              { type: "text", text: `error: not a regular file: ${mediaPath}` },
-            ],
-            isError: true,
-          };
-        }
-        if (stat.size > MEDIA_MAX_BYTES) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `error: file is ${Math.round(stat.size / 1048576)} MB, over the 45 MB send limit`,
-              },
-            ],
-            isError: true,
-          };
-        }
-        sent = await sendMediaFile(mediaPath, text, replyTo);
-      } else {
-        const p = { chat_id: chatId, text: text.slice(0, 4000) };
-        if (replyTo !== null) p.reply_to_message_id = replyTo;
-        sent = await botApi("sendMessage", p);
+        emit({ kind: "chat_send_result", toolCallId, receipt });
+        return { content: [{ type: "text", text: raw }] };
+      } catch (e) {
+        const msg = String(e).slice(0, 400);
+        emit({ kind: "chat_send_error", toolCallId, error: msg });
+        return deny(msg);
       }
-      const receipt = { message_id: sent.message_id, reply_to: replyTo, text };
-      if (isMediaSend) turnMediaCount += 1;
-      turnSends.set(turnKey, receipt);
-      for (const id of activeDeliveries)
-        saveReceipt(
-          receiptKey(id, replyTo, text, gifFileId, stickerFileId, mediaPath),
-          receipt,
-        );
-      emit({ kind: "chat_send_result", toolCallId, receipt });
-      return {
-        content: [{ type: "text", text: JSON.stringify(receipt) + dropNote }],
-      };
     },
   });
 
@@ -516,24 +278,25 @@ export default function (pi) {
       properties: {
         offset: {
           type: "integer",
-          description: "Skip this many GIFs (default 0).",
+          description: "Skip this many GIFs (default 0). Negative is an error.",
         },
         limit: {
           type: "integer",
-          description: "How many to return (default 200, max 500).",
+          description: "How many to return (default 30, max 200). Out-of-range is an error.",
         },
       },
       additionalProperties: false,
     },
     execute: async (toolCallId, params) => {
-      const offset = Number.isFinite(Number(params.offset))
-        ? Math.max(0, Math.trunc(Number(params.offset)))
-        : 0;
-      const limit = Number.isFinite(Number(params.limit))
-        ? Math.min(500, Math.max(1, Math.trunc(Number(params.limit))))
-        : 200;
+      // Bounds are the daemon's contract: pass them through unchanged so a bad
+      // offset/limit comes back as `bad offset` / `bad limit`, never clamped.
+      const args = {};
+      if (params.offset !== undefined && params.offset !== null)
+        args.offset = params.offset;
+      if (params.limit !== undefined && params.limit !== null)
+        args.limit = params.limit;
       try {
-        const text = await controlCall("gif_list", { offset, limit }, 5000);
+        const text = await controlCall("gif_list", args, 8000);
         return { content: [{ type: "text", text }] };
       } catch (e) {
         emit({ kind: "gif_list_error", error: String(e).slice(0, 200) });
@@ -550,13 +313,12 @@ export default function (pi) {
     },
   });
 
-  // ---- subagents (crystal M1) ----
+  // ---- subagents ----
   // ONE generic child role. The native `task` tool is absent from this session
   // and loading its plugin would pull memory/teams/rule injections into the
   // character, so a dispatch is a one-shot `omo -p` process with the `general`
-  // persona appended. Hard bounds: 2 concurrent children, 210 s each (under the
-  // daemon's 420 s turn budget), stdout capped, killed on session_shutdown.
-  const MAX_SUBAGENTS = 2;
+  // persona appended. The owner-only rule lives in the persona text; this tool
+  // enforces no behavioural gate of its own.
   const SUBAGENT_TIMEOUT_MS = 210_000;
   const SUBAGENT_OUT_CAP = 6800;
   const GENERAL_PERSONA = [
@@ -581,9 +343,7 @@ export default function (pi) {
       "Delegate one self-contained task to a general subagent and get its text " +
       "result back. ALLOWED ONLY when the owner (" +
       ownerLabel +
-      ") asked for it: " +
-      "pass owner_message_id = the [id] of the owner's message marked [владелец]. " +
-      "Without such a message the call is refused. Never call it on your own " +
+      ") asked for it, as the persona text describes. Never call it on your own " +
       "initiative and never for ordinary chat replies.",
     parameters: {
       type: "object",
@@ -592,17 +352,12 @@ export default function (pi) {
           type: "string",
           description: "What the subagent must do, with all needed context.",
         },
-        owner_message_id: {
-          type: "integer",
-          description:
-            "message_id of the owner's message (marked [владелец]) that asked for this.",
-        },
         label: {
           type: "string",
           description: "Short label for logs.",
         },
       },
-      required: ["task", "owner_message_id"],
+      required: ["task"],
       additionalProperties: false,
     },
     execute: async (toolCallId, params) => {
@@ -610,22 +365,8 @@ export default function (pi) {
         content: [{ type: "text", text: `error: ${why}` }],
         isError: true,
       });
-      const wanted = Number(params.owner_message_id);
-      if (!Number.isInteger(wanted) || !ownerMsgs.has(wanted)) {
-        return denied(
-          "subagent denied: pass owner_message_id of a message from the owner " +
-            "([владелец]) in this batch. Dispatching is allowed only when " +
-            ownerLabel +
-            " asked for it.",
-        );
-      }
       const task = String(params.task || "").trim();
       if (!task) return denied("empty task, nothing dispatched");
-      if (subagentProcs.size >= MAX_SUBAGENTS) {
-        return denied(
-          `too many subagents running (max ${MAX_SUBAGENTS}); wait for one to finish`,
-        );
-      }
       const model = env("CHATBOT_SUBAGENT_MODEL", "");
       const args = ["-p", "--no-session"];
       if (model) args.push("--model", model);
@@ -636,7 +377,6 @@ export default function (pi) {
         kind: "subagent_start",
         toolCallId,
         label: String(params.label || "").slice(0, 80),
-        owner_message_id: wanted,
       });
       const child = spawn("omo", args, {
         cwd: process.cwd(),
@@ -712,39 +452,43 @@ export default function (pi) {
 
   pi.on("turn_start", (ev) => {
     turnSends = new Map();
-    turnMediaCount = 0;
+    typingSawTurn = true;
     startTyping();
     emit({ kind: "turn_start", turnIndex: ev.turnIndex });
     emit({ kind: "agent_activity", phase: "working" });
   });
 
   pi.on("turn_end", (ev) => {
-    stopTyping();
+    // The indicator belongs to the RUN, not the turn: a run is a chain of turns
+    // and stopping here is what made it vanish while the agent still worked.
     emit({
       kind: "turn_end",
       turnIndex: ev.turnIndex,
-      chat_sends: [...turnSends.values()],
+      chat_sends: [...turnSends.values()].map((raw) => {
+        try {
+          return JSON.parse(raw);
+        } catch {
+          return null;
+        }
+      }),
     });
     activeDeliveries = [];
-    turnMediaCount = 0;
-    // A dispatch permission lives only for the turn whose batch carried the
-    // owner's message: never leave it standing for a later turn.
-    ownerMsgs = new Set();
-    // Reply targets are likewise per-turn: the next turn's batch re-fills them.
-    batchIds = new Set();
+    activeBatches = [];
     emit({ kind: "agent_activity", phase: "stopped" });
   });
 
   // A run fully settled: the only signal the daemon accepts as "the agent
   // finished with this turn and chose silence".
   pi.on("agent_settled", () => {
+    stopTyping();
     emit({ kind: "agent_settled" });
     reportDeliveryStates();
   });
 
   pi.on("agent_end", (ev) => {
     if (ev.aborted || ev.deadline) {
-      stopTyping();
+      // A retry is a continuation of the same run; only a terminal abort ends it.
+      if (!ev.willRetry) stopTyping();
       emit({
         kind: "agent_end_aborted",
         aborted: Boolean(ev.aborted),
@@ -880,21 +624,33 @@ export default function (pi) {
   // is dead for delivery, so it must STOP answering and release the socket —
   // the live instance (it gets its own session_start) then becomes the one the
   // daemon serves. Re-armed only by a fresh session_start.
-  let controlDead = false;
+  const gate = staleGate();
+  // Durable identity learned from the daemon's `session` frame. Until the
+  // daemon answers, hello carries an empty uid and the daemon fills it in.
+  let sessionIdentity = { uid: "", generation: 0 };
+
+  function sendHello() {
+    if (!controlSock) return;
+    try {
+      controlSock.write(
+        JSON.stringify(
+          helloFrame(sessionIdentity.uid, sessionIdentity.generation, process.pid),
+        ) + "\n",
+      );
+    } catch {
+      // The close handler owns reconnection; a write failure is not fatal.
+    }
+  }
 
   function connectControl() {
-    if (controlSock || controlRetry || controlDead) return;
+    if (controlSock || controlRetry || gate.isDead()) return;
     const sock = net.connect({ path: controlSockPath });
     sock.setEncoding("utf8");
     sock.on("connect", () => {
       controlSock = sock;
       controlBuf = "";
       controlAttempt = 0;
-      sock.write(
-        JSON.stringify({
-          hello: { session: env("CHATBOT_SESSION", ""), pid: process.pid },
-        }) + "\n",
-      );
+      sendHello();
       emit({ kind: "control_connected", path: controlSockPath });
     });
     sock.on("data", (chunk) => {
@@ -986,6 +742,26 @@ export default function (pi) {
 
   function handleControlLine(msg) {
     if (!msg) return;
+    if (msg.session) {
+      const uid = String(msg.session.uid || "");
+      const generation = Number(msg.session.generation || 0);
+      if (uid && sessionIdentity.uid && uid !== sessionIdentity.uid) {
+        // The daemon owns a different durable session: this runtime is stale.
+        gate.markDead();
+        emit({
+          kind: "control_stale_session",
+          claimed: sessionIdentity.uid,
+          live: uid,
+        });
+        closeControl();
+        return;
+      }
+      const changed =
+        uid && (uid !== sessionIdentity.uid || generation !== sessionIdentity.generation);
+      if (uid) sessionIdentity = { uid, generation };
+      if (changed) sendHello();
+      return;
+    }
     if (msg.return) {
       const r = msg.return;
       const wait = pendingCalls.get(String(r.id || ""));
@@ -1001,19 +777,23 @@ export default function (pi) {
     const deliveryId = String(push.delivery_id || "");
     const text = String(push.text || "");
     if (!deliveryId || !text) return;
-    // Owner-authored message ids travel with the batch. They are the ONLY
-    // proof the `subagent` tool accepts; a batch without them opens nothing.
-    for (const id of Array.isArray(push.owner_msgs) ? push.owner_msgs : []) {
-      const n = Number(id);
-      if (Number.isInteger(n) && n > 0) ownerMsgs.add(n);
-    }
-    // Incoming ids of this batch are the only legal `reply_to` targets for the
-    // turn. A steer batch in the same turn extends them; turn_end clears them.
-    for (const id of Array.isArray(push.batch_ids) ? push.batch_ids : []) {
-      const n = Number(id);
-      if (Number.isInteger(n) && n > 0) batchIds.add(n);
-    }
+    // The batch ticket: which incoming ids it carried and which forum topic it
+    // came from. A steer in the same turn adds a second batch; turn_end clears
+    // the list. The daemon validates reply targets itself.
+    const batchKey = deliveryId.split("#")[0];
+    const ids = (Array.isArray(push.batch_ids) ? push.batch_ids : [])
+      .map(Number)
+      .filter((n) => Number.isInteger(n) && n > 0);
+    activeBatches = activeBatches.filter((b) => b.key !== batchKey);
+    activeBatches.push({
+      key: batchKey,
+      ids,
+      thread: Number.isInteger(push.thread_id) ? push.thread_id : null,
+    });
     const kind = admitDelivery(deliveryId, text, push.deliverAs || "steer");
+    if (kind === "started" || kind === "steered" || kind === "queued") {
+      startTyping({ key: batchKey, thread: activeBatches[activeBatches.length - 1].thread });
+    }
     if (!controlSock) return;
     try {
       controlSock.write(
@@ -1069,7 +849,7 @@ export default function (pi) {
       if (stale) {
         // This instance can never admit again: disconnect and stay quiet so a
         // live instance can take the socket. The daemon retries the batch.
-        controlDead = true;
+        gate.markDead();
         emit({ kind: "control_stale", delivery_id: deliveryId });
         closeControl();
       }
@@ -1079,8 +859,12 @@ export default function (pi) {
 
   connectControl();
   pi.on("session_start", () => {
-    // A fresh session may re-bind this instance: it is usable again.
-    controlDead = false;
+    // A fresh session may re-bind this instance: it is usable again. Its old
+    // durable identity is gone, so hello starts empty and the daemon answers
+    // with the live uid + generation.
+    gate.rearm();
+    sessionIdentity = { uid: "", generation: 0 };
+    closeControl();
     connectControl();
   });
 }

@@ -8,6 +8,8 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -16,7 +18,19 @@ use std::time::{Duration, Instant};
 /// blocking sqlite work of the daemon runs there instead of on the
 /// `current_thread` runtime that also polls Telegram, admits batches and
 /// writes chat pushes.
+pub mod catalog;
+pub mod context;
 pub mod db;
+pub mod ledger;
+pub mod media;
+pub mod ops;
+pub mod send;
+pub mod session;
+
+pub use catalog::GIF_PAGE_SQL;
+pub use catalog::{Caption, FitsWhen, GifPage, GifRecord, GifSource, MediaKind};
+
+use crate::media::MediaState;
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messages(
@@ -64,25 +78,57 @@ pub fn state_dir() -> String {
     cfg("CHATBOT_STATE_DIR", "./state")
 }
 
-/// Warn once, in the daemon log, when nobody can authorise subagent dispatch.
-/// Called from the ingest path because that is the first point at which the
-/// setting matters; keeps an empty owner a loud misconfiguration instead of a
-/// bot that mysteriously refuses to delegate.
-fn warn_if_owner_unset() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if WARNED.swap(true, Ordering::Relaxed) {
-        return;
+/// Parse a usable Telegram chat id. Zero and non-numeric values are refused:
+/// migration v2 writes this value into every historic row, so a wrong value
+/// silently reassigns the identity of the whole mirror.
+pub fn parse_chat_id(raw: &str) -> Option<i64> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
     }
-    if cfg("CHATBOT_OWNER_USERNAME", "").is_empty() && cfg("CHATBOT_OWNER_ID", "0") == "0" {
-        dlog(
-            "warning: CHATBOT_OWNER_USERNAME/CHATBOT_OWNER_ID are not set; subagent dispatch \
-             stays locked for everybody. Set your own Telegram username in the environment file.",
-        );
+    match t.parse::<i64>() {
+        Ok(v) if v != 0 => Some(v),
+        _ => None,
     }
 }
 
-pub fn token() -> Result<String> {
+/// The chat id migration v2 may backfill: the environment wins, an already
+/// seeded `kv` value is the fallback (a restart without the variable still
+/// knows the identity it committed earlier).
+fn migration_chat_id(con: &Connection) -> Option<i64> {
+    if let Ok(raw) = std::env::var("CHATBOT_CHAT_ID") {
+        return parse_chat_id(&raw);
+    }
+    con.query_row("SELECT v FROM kv WHERE k='chat_id'", [], |r| {
+        r.get::<_, String>(0)
+    })
+    .ok()
+    .and_then(|v| parse_chat_id(&v))
+}
+
+/// Fail closed BEFORE any migration step. v1 commits `user_version=1` on its
+/// own, so validating inside v2 would leave the file half-migrated; this check
+/// runs while the version is still the original one.
+fn require_migration_chat_id(con: &Connection, version: i64) -> Result<()> {
+    if let Ok(raw) = std::env::var("CHATBOT_CHAT_ID") {
+        if !raw.trim().is_empty() && parse_chat_id(&raw).is_none() {
+            return Err(anyhow!(
+                "CHATBOT_CHAT_ID={raw:?} is not a valid numeric Telegram chat id; \
+                 refusing to migrate (user_version stays {version})"
+            ));
+        }
+    }
+    if version < 2 && migration_chat_id(con).is_none() {
+        return Err(anyhow!(
+            "CHATBOT_CHAT_ID is not set; refusing to migrate (user_version stays {version}). \
+             Set CHATBOT_CHAT_ID to the bot's numeric chat id (for example -1001234567890) \
+             and start again."
+        ));
+    }
+    Ok(())
+}
+
+fn token() -> Result<String> {
     let path = required_cfg("CHATBOT_TOKEN_FILE")?;
     let mode = std::fs::metadata(&path)
         .with_context(|| format!("token file stat: {path}"))?
@@ -97,7 +143,7 @@ pub fn token() -> Result<String> {
         .to_string())
 }
 
-pub fn api_base() -> String {
+fn api_base() -> String {
     cfg("CHATBOT_API_BASE", "https://api.telegram.org")
 }
 
@@ -115,8 +161,109 @@ pub async fn api(method: &str, params: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("Bot API {method}: no result"))
 }
 
+/// One helper for the topic parameter: every send method and `typing` reach
+/// the Bot API through `api_with_thread` or `api_multipart_with_thread`, so
+/// `message_thread_id` cannot silently diverge between them. An explicit topic
+/// rejection gets exactly one retry into General (DESIGN §5), not a second
+/// answer and not a permanent drop.
+pub fn apply_thread(params: &mut Value, thread: Option<i64>) {
+    if let Some(t) = thread {
+        params["message_thread_id"] = json!(t);
+    }
+}
+
+fn is_topic_error(detail: &str) -> bool {
+    let d = detail.to_lowercase();
+    d.contains("message_thread_id")
+        || d.contains("thread not found")
+        || d.contains("topic_id_invalid")
+        || d.contains("topic closed")
+        || d.contains("wrong topic")
+        || d.contains("thread_id_invalid")
+}
+
+pub async fn api_with_thread(method: &str, params: &Value, thread: Option<i64>) -> Result<Value> {
+    let mut p = params.clone();
+    apply_thread(&mut p, thread);
+    match api(method, &p).await {
+        Ok(v) => Ok(v),
+        Err(e) if thread.is_some() && is_topic_error(&e.to_string()) => {
+            dlog(&format!(
+                "{method}: topic {thread:?} rejected ({e}); retrying in General once"
+            ));
+            api(method, params).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Multipart upload with the same topic helper and the same one-shot General
+/// fallback. Kept beside `api_with_thread` so a new send method has one place
+/// to copy the rule from.
+pub async fn api_multipart_with_thread(
+    method: &str,
+    field: &str,
+    path: &str,
+    filename: &str,
+    mime: &str,
+    params: &Value,
+    thread: Option<i64>,
+) -> Result<Value> {
+    let upload = |thread: Option<i64>| {
+        let method = method.to_string();
+        let field = field.to_string();
+        let path = path.to_string();
+        let filename = filename.to_string();
+        let mime = mime.to_string();
+        async move {
+            let tok = token()?;
+            let url = format!("{}/bot{}/{}", api_base(), tok, method);
+            let bytes = std::fs::read(&path).with_context(|| format!("read media {path}"))?;
+            let part = reqwest::multipart::Part::bytes(bytes)
+                .file_name(filename)
+                .mime_str(&mime)?;
+            let mut p = params.clone();
+            apply_thread(&mut p, thread);
+            let mut form = reqwest::multipart::Form::new().part(field, part);
+            if let Some(obj) = p.as_object() {
+                for (k, v) in obj {
+                    let s = match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    form = form.text(k.clone(), s);
+                }
+            }
+            let client = reqwest::Client::builder().build()?;
+            let body: Value = client
+                .post(&url)
+                .multipart(form)
+                .send()
+                .await?
+                .json()
+                .await?;
+            if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                return Err(anyhow!("Bot API {method}: {body}"));
+            }
+            body.get("result")
+                .cloned()
+                .ok_or_else(|| anyhow!("Bot API {method}: no result"))
+        }
+    };
+    match upload(thread).await {
+        Ok(v) => Ok(v),
+        Err(e) if thread.is_some() && is_topic_error(&e.to_string()) => {
+            dlog(&format!(
+                "{method}: topic {thread:?} rejected ({e}); retrying in General once"
+            ));
+            upload(None).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// GET file download (Bot API file path -> local media dir).
-pub async fn download_media(file_id: &str, state: &str, prefix: &str) -> Result<String> {
+async fn download_media(file_id: &str, state: &str, prefix: &str) -> Result<String> {
     let info = api("getFile", &json!({"file_id": file_id})).await?;
     let rel = info
         .get("file_path")
@@ -143,27 +290,6 @@ pub async fn download_media(file_id: &str, state: &str, prefix: &str) -> Result<
     Ok(dest.to_string_lossy().to_string())
 }
 
-fn video_ext(path: &str) -> bool {
-    matches!(
-        Path::new(path)
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default()
-            .as_str(),
-        "mp4" | "mov" | "webm" | "mkv"
-    )
-}
-
-fn mime_is_video(mime: &str) -> bool {
-    let m = mime.to_lowercase();
-    m.starts_with("video/") || m == "image/gif" || m == "application/x-tgsticker"
-}
-
-fn mime_is_audio(mime: &str) -> bool {
-    let m = mime.to_lowercase();
-    m.starts_with("audio/") || m == "application/ogg" || m == "application/x-ogg"
-}
-
 pub async fn preview_frame(src: &str, timeout: Duration) -> Result<String> {
     // Strip extension then append.
     let stem = match src.rfind('.') {
@@ -177,7 +303,9 @@ pub async fn preview_frame(src: &str, timeout: Duration) -> Result<String> {
     let out = tokio::time::timeout(
         timeout,
         tokio::process::Command::new("ffmpeg")
-            .args(["-y", "-v", "error", "-ss", "0", "-i", src, "-vframes", "1", "-q:v", "4", &dst])
+            .args([
+                "-y", "-v", "error", "-ss", "0", "-i", src, "-vframes", "1", "-q:v", "4", &dst,
+            ])
             .output(),
     )
     .await
@@ -209,9 +337,360 @@ pub fn ensure_indexes(con: &Connection) -> Result<()> {
     Ok(())
 }
 
+// ---------- migrations ----------
+//
+// `PRAGMA user_version` is the single source of truth for how far the file
+// has been migrated. Every step runs in its own transaction, so a crash or a
+// failed check leaves the previous version intact and the daemon refuses to
+// serve an inconsistent schema instead of silently repairing it.
+
+fn migrate(con: &mut Connection) -> Result<()> {
+    let v: i64 = con.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if v < 1 {
+        migrate_v1(con)?;
+    }
+    if v < 2 {
+        migrate_v2(con)?;
+    }
+    if v < 3 {
+        migrate_v3(con)?;
+    }
+    if v < 4 {
+        migrate_v4(con)?;
+    }
+    if v < 5 {
+        migrate_v5(con)?;
+    }
+    if v < 6 {
+        migrate_v6(con)?;
+    }
+    Ok(())
+}
+
+/// v1: rebuild `messages` around the real identity `(chat_id, message_id)`.
+/// `id` is the surrogate rowid used by FTS and future foreign keys.
+/// `update_id` is kept as a UNIQUE legacy column only until cycle 2 replaces
+/// the old ingest path; the redesigned envelope path ignores it for identity.
+fn migrate_v1(con: &mut Connection) -> Result<()> {
+    let tx = con.transaction()?;
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS messages_ai;
+         DROP TABLE IF EXISTS messages_fts;
+         DROP TABLE IF EXISTS messages_v1;
+         CREATE TABLE messages_v1(
+           id INTEGER PRIMARY KEY,
+           chat_id INTEGER,
+           message_id INTEGER,
+           thread_id INTEGER,
+           date INTEGER,
+           user_id INTEGER,
+           username TEXT,
+           first_name TEXT,
+           text TEXT,
+           reply_to INTEGER,
+           media_path TEXT,
+           file_id TEXT,
+           file_unique_id TEXT,
+           media_kind TEXT,
+           source_chat INTEGER,
+           sender_chat INTEGER,
+           update_id INTEGER UNIQUE
+         );
+         INSERT INTO messages_v1(id,chat_id,message_id,thread_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind,source_chat,sender_chat,update_id)
+           SELECT rowid,NULL,message_id,NULL,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind,NULL,NULL,update_id FROM messages;
+         DROP TABLE messages;
+         ALTER TABLE messages_v1 RENAME TO messages;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_key ON messages(chat_id,message_id);",
+    )?;
+    tx.pragma_update(None, "user_version", 1)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// v2: backfill `chat_id` from `kv("chat_id")`. Channel posts never entered
+/// history, so the two id spaces cannot legitimately collide; if the data says
+/// otherwise the whole step rolls back with the number of conflicting rows.
+/// Silently collapsing rows is forbidden.
+pub fn migrate_v2(con: &mut Connection) -> Result<()> {
+    let tx = con.transaction()?;
+    let chat = migration_chat_id(&tx).ok_or_else(|| {
+        anyhow!(
+            "migration v2 aborted: CHATBOT_CHAT_ID is missing, empty or not a numeric chat id; \
+             user_version and every existing chat_id are unchanged"
+        )
+    })?;
+    let (keys, rows): (i64, i64) = tx.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(c),0) FROM (
+           SELECT COUNT(*) c FROM messages
+           WHERE chat_id IS NULL AND message_id IS NOT NULL
+           GROUP BY message_id HAVING COUNT(*) > 1
+         )",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if keys > 0 {
+        return Err(anyhow!(
+            "migration v2 aborted: {rows} rows in {keys} message_id groups collide on \
+             (chat_id, message_id); nothing was changed"
+        ));
+    }
+    tx.execute(
+        "UPDATE messages SET chat_id=? WHERE chat_id IS NULL",
+        params![chat],
+    )?;
+    tx.pragma_update(None, "user_version", 2)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// v3: FTS over the surrogate id with all three triggers. DELETE/UPDATE must
+/// keep the external-content index honest; `rebuild` seeds it from rows that
+/// existed before this migration.
+fn migrate_v3(con: &mut Connection) -> Result<()> {
+    let tx = con.transaction()?;
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS messages_ai;
+         DROP TRIGGER IF EXISTS messages_ad;
+         DROP TRIGGER IF EXISTS messages_au;
+         DROP TABLE IF EXISTS messages_fts;
+         CREATE VIRTUAL TABLE messages_fts USING fts5(
+           text, username, content='messages', content_rowid='id'
+         );
+         CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+           INSERT INTO messages_fts(rowid, text, username)
+           VALUES (new.id, new.text, new.username);
+         END;
+         CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+           INSERT INTO messages_fts(messages_fts, rowid, text, username)
+           VALUES('delete', old.id, old.text, old.username);
+         END;
+         CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+           INSERT INTO messages_fts(messages_fts, rowid, text, username)
+           VALUES('delete', old.id, old.text, old.username);
+           INSERT INTO messages_fts(rowid, text, username)
+           VALUES (new.id, new.text, new.username);
+         END;
+         INSERT INTO messages_fts(messages_fts) VALUES('rebuild');",
+    )?;
+    tx.pragma_update(None, "user_version", 3)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// v4: blob records. `messages.media_path` stays as the read projection until
+/// the media cycle moves readers to the blob, so no reader breaks here.
+fn migrate_v4(con: &mut Connection) -> Result<()> {
+    let tx = con.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS blobs(
+           id INTEGER PRIMARY KEY,
+           path TEXT NOT NULL UNIQUE,
+           kind TEXT,
+           size INTEGER,
+           created_at INTEGER NOT NULL
+         );
+         INSERT OR IGNORE INTO blobs(path, kind, size, created_at)
+           SELECT media_path, media_kind, NULL, CAST(strftime('%s','now') AS INTEGER)
+           FROM messages
+           WHERE media_path IS NOT NULL AND media_path <> '';",
+    )?;
+    tx.pragma_update(None, "user_version", 4)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// v6: two-phase media and the real identity. `update_id` loses its UNIQUE
+/// constraint (it is a stream cursor, not an identity); `blob_id` and
+/// `media_state` carry the media descriptor, while path/size/kind live in
+/// `blobs` once `finalize_blob` runs. FTS is rebuilt because the table is
+/// recreated.
+fn migrate_v6(con: &mut Connection) -> Result<()> {
+    let tx = con.transaction()?;
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS messages_ai;
+         DROP TRIGGER IF EXISTS messages_ad;
+         DROP TRIGGER IF EXISTS messages_au;
+         DROP TABLE IF EXISTS messages_fts;
+         DROP TABLE IF EXISTS messages_v6;
+         CREATE TABLE messages_v6(
+           id INTEGER PRIMARY KEY,
+           chat_id INTEGER,
+           message_id INTEGER,
+           thread_id INTEGER,
+           date INTEGER,
+           user_id INTEGER,
+           username TEXT,
+           first_name TEXT,
+           text TEXT,
+           reply_to INTEGER,
+           media_path TEXT,
+           file_id TEXT,
+           file_unique_id TEXT,
+           media_kind TEXT,
+           source_chat INTEGER,
+           sender_chat INTEGER,
+           update_id INTEGER,
+           media_state TEXT NOT NULL DEFAULT 'absent',
+           media_size INTEGER,
+           blob_id INTEGER
+         );
+         INSERT INTO messages_v6(id,chat_id,message_id,thread_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind,source_chat,sender_chat,update_id,media_state,media_size,blob_id)
+           SELECT id,chat_id,message_id,thread_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind,source_chat,sender_chat,update_id,
+             CASE
+               WHEN media_path IS NOT NULL AND media_path <> '' THEN 'ready'
+               WHEN media_kind IN ('animation','video','photo','video_note','document')
+                    AND file_id IS NOT NULL AND file_id <> '' THEN 'descriptor'
+               ELSE 'absent'
+             END,
+             NULL,
+             (SELECT b.id FROM blobs b WHERE b.path = messages.media_path)
+           FROM messages;
+         DROP TABLE messages;
+         ALTER TABLE messages_v6 RENAME TO messages;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_key ON messages(chat_id,message_id);
+         CREATE VIRTUAL TABLE messages_fts USING fts5(
+           text, username, content='messages', content_rowid='id'
+         );
+         CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+           INSERT INTO messages_fts(rowid, text, username)
+           VALUES (new.id, new.text, new.username);
+         END;
+         CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+           INSERT INTO messages_fts(messages_fts, rowid, text, username)
+           VALUES('delete', old.id, old.text, old.username);
+         END;
+         CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+           INSERT INTO messages_fts(messages_fts, rowid, text, username)
+           VALUES('delete', old.id, old.text, old.username);
+           INSERT INTO messages_fts(rowid, text, username)
+           VALUES (new.id, new.text, new.username);
+         END;
+         INSERT INTO messages_fts(messages_fts) VALUES('rebuild');",
+    )?;
+    tx.pragma_update(None, "user_version", 6)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// v5: journal skeleton. Cycles 3–5 own the transitions; this step only makes
+/// the tables exist with the keys the state machine addresses rows by.
+fn migrate_v5(con: &mut Connection) -> Result<()> {
+    let tx = con.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS batches(
+           id INTEGER PRIMARY KEY,
+           batch_key TEXT NOT NULL UNIQUE,
+           chat_id INTEGER,
+           thread_id INTEGER,
+           state TEXT NOT NULL,
+           outcome TEXT,
+           sealed_at INTEGER,
+           updated_at INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS attempts(
+           id INTEGER PRIMARY KEY,
+           batch_id INTEGER NOT NULL REFERENCES batches(id),
+           attempt_no INTEGER NOT NULL,
+           state TEXT NOT NULL,
+           started_at INTEGER,
+           settled_at INTEGER,
+           UNIQUE(batch_id, attempt_no)
+         );
+         CREATE TABLE IF NOT EXISTS answers(
+           id INTEGER PRIMARY KEY,
+           batch_id INTEGER REFERENCES batches(id),
+           state TEXT NOT NULL,
+           text TEXT,
+           created_at INTEGER,
+           closed_at INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS answer_batches(
+           answer_id INTEGER NOT NULL REFERENCES answers(id),
+           batch_id INTEGER NOT NULL REFERENCES batches(id),
+           PRIMARY KEY(answer_id, batch_id)
+         );
+         CREATE TABLE IF NOT EXISTS sends(
+           id INTEGER PRIMARY KEY,
+           answer_id INTEGER REFERENCES answers(id),
+           send_key TEXT NOT NULL UNIQUE,
+           kind TEXT NOT NULL,
+           state TEXT NOT NULL,
+           receipt TEXT,
+           created_at INTEGER,
+           updated_at INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS sessions(
+           id INTEGER PRIMARY KEY,
+           name TEXT NOT NULL UNIQUE,
+           session_uid TEXT,
+           generation INTEGER,
+           state TEXT NOT NULL,
+           updated_at INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS hosts(
+           id INTEGER PRIMARY KEY,
+           generation TEXT NOT NULL UNIQUE,
+           pid INTEGER,
+           ext_hash TEXT,
+           state TEXT NOT NULL,
+           updated_at INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS incidents(
+           id INTEGER PRIMARY KEY,
+           kind TEXT NOT NULL,
+           detail TEXT,
+           at INTEGER NOT NULL,
+           resolved_at INTEGER
+         );",
+    )?;
+    tx.pragma_update(None, "user_version", 5)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Single-instance guard: `flock` on `<state>/chatd.lock` for the lifetime of
+/// the returned handle. A second `run`/`sync` gets an error naming the state
+/// directory instead of racing the first on the same cursor.
+#[derive(Debug)]
+pub struct StateLock {
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+impl StateLock {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+pub fn acquire_state_lock(state: &str) -> Result<StateLock> {
+    std::fs::create_dir_all(state)?;
+    let path = Path::new(state).join("chatd.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open state lock {}", path.display()))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err(anyhow!(
+                "another chatd instance is already running for state {} (lock {} is held); \
+                 refusing to start a second instance",
+                state,
+                path.display()
+            ));
+        }
+        return Err(err).with_context(|| format!("flock {}", path.display()));
+    }
+    Ok(StateLock { _file: file, path })
+}
+
 pub fn db(state: &str) -> Result<Connection> {
     std::fs::create_dir_all(state)?;
-    let con = Connection::open(Path::new(state).join("history.db"))?;
+    let mut con = Connection::open(Path::new(state).join("history.db"))?;
     // The connection now lives in the `chatdb` worker thread for the whole
     // process lifetime (see `db.rs`), so prepared statements are worth
     // caching: `kv_get` alone runs several times per batch.
@@ -225,6 +704,10 @@ pub fn db(state: &str) -> Result<Connection> {
     // failure as `{"ok":false,"error":"busy"}` instead of waiting.
     let _ = con.pragma_update(None, "journal_mode", "WAL");
     con.busy_timeout(Duration::from_millis(300))?;
+    // Refuse before ANY schema write: a wrong/missing chat id must not advance
+    // user_version or touch a historic row. The error names the variable.
+    let version: i64 = con.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    require_migration_chat_id(&con, version)?;
     con.execute_batch(SCHEMA)?;
     // Column migrations (idempotent).
     let _ = con.execute("ALTER TABLE messages ADD COLUMN file_id TEXT", []);
@@ -236,12 +719,49 @@ pub fn db(state: &str) -> Result<Connection> {
     // bot's own mirrored sends: the kind is only knowable at ingest, and a
     // row without it is honestly NOT a gif (see GIF_PAGE_SQL).
     let _ = con.execute("ALTER TABLE messages ADD COLUMN media_kind TEXT", []);
+    // The chat identity is the only input of migration v2. Seed it while the
+    // environment still knows it; an absent/invalid value left v2 refusing to
+    // run above, so there is no silent zero backfill.
+    if let Ok(raw) = std::env::var("CHATBOT_CHAT_ID") {
+        let chat = raw.trim();
+        if !chat.is_empty() && chat.parse::<i64>().is_ok() {
+            let _ = con.execute("INSERT OR IGNORE INTO kv(k,v) VALUES('chat_id',?)", [chat]);
+        }
+    }
+    // Schema steps v1..v5 run before the daemon serves anything. A failure
+    // (for example v2's collision check) stops startup instead of guessing.
+    migrate(&mut con)?;
+    ensure_journal_columns(&con)?;
     // A missing index costs latency, not correctness: log instead of refusing to
     // start when the file is momentarily write-locked.
     if let Err(e) = ensure_indexes(&con) {
         dlog(&format!("ensure_indexes failed: {e:#}"));
     }
     Ok(con)
+}
+
+/// Cycle 3 columns on the v5 journal skeleton. Additive and idempotent, in the
+/// same spirit as the legacy `messages` ALTERs above: an existing database gains
+/// them at the next start without a table rebuild.
+fn ensure_journal_columns(con: &Connection) -> Result<()> {
+    for stmt in [
+        "ALTER TABLE batches ADD COLUMN message_ids TEXT",
+        "ALTER TABLE batches ADD COLUMN tome TEXT",
+        "ALTER TABLE answers ADD COLUMN fingerprint TEXT",
+        "ALTER TABLE answers ADD COLUMN response TEXT",
+        "ALTER TABLE attempts ADD COLUMN emitted_at INTEGER",
+        "ALTER TABLE sends ADD COLUMN request TEXT",
+    ] {
+        let _ = con.execute(stmt, []);
+    }
+    con.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
+         CREATE INDEX IF NOT EXISTS idx_answers_batch ON answers(batch_id);
+         CREATE INDEX IF NOT EXISTS idx_attempts_batch ON attempts(batch_id, id DESC);
+         CREATE INDEX IF NOT EXISTS idx_sends_answer ON sends(answer_id);
+         CREATE INDEX IF NOT EXISTS idx_sends_state ON sends(state);",
+    )?;
+    Ok(())
 }
 
 pub fn kv_get(con: &Connection, k: &str, default: &str) -> String {
@@ -262,7 +782,109 @@ pub fn kv_del(con: &Connection, k: &str) -> Result<()> {
 
 // ---------- messages ----------
 
+/// Telegram `message_id` inside one chat. A bare integer is ambiguous across
+/// chats, so it is only meaningful together with [`MessageKey::chat`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MessageId(pub i64);
+
+/// The mirror's identity. `update_id` deliberately does not appear here: a
+/// redelivery with a new `update_id` is the same message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MessageKey {
+    pub chat: i64,
+    pub message: MessageId,
+}
+
+/// Outcome of a page commit. `inserted + duplicate + ignored` is the number of
+/// envelopes the page carried; there is no `Ok(None)` that hides which case
+/// happened. A failed INSERT is an `Err`, never a silent duplicate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Applied {
+    pub inserted: usize,
+    pub duplicate: usize,
+    pub ignored: usize,
+}
+
+/// A row the page actually wrote. The ingest unit needs its surrogate id to
+/// enqueue the media fetch, and its key to build the batch row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsertedRow {
+    pub key: MessageKey,
+    pub row_id: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppliedPage {
+    pub applied: Applied,
+    pub inserted: Vec<InsertedRow>,
+}
+
+/// One admitted Telegram update, already parsed and detached from the JSON
+/// frame. It owns every string, so a page of envelopes moves into the database
+/// closure without borrowing the ingest task.
 #[derive(Debug, Clone)]
+pub struct Envelope {
+    pub key: MessageKey,
+    pub update_id: i64,
+    pub date: i64,
+    pub user_id: Option<i64>,
+    pub username: String,
+    pub first_name: String,
+    pub text: String,
+    pub reply_to: Option<i64>,
+    pub thread_id: Option<i64>,
+    pub media_path: String,
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub media_kind: String,
+    /// `Pending` for a downloadable kind, `Descriptor` for a marker-only kind,
+    /// `Absent` for text. A new row never starts `Ready`.
+    pub media_state: MediaState,
+    /// Telegram `file_size` when the message object carried it; the budget
+    /// uses it to refuse a download before any bytes are fetched.
+    pub media_size: Option<u64>,
+    pub source_chat: Option<i64>,
+    pub sender_chat: Option<i64>,
+    /// A channel post rather than a message in the bot's chat. Kept on the
+    /// envelope for routing/cursor bookkeeping; it is NOT an identity signal.
+    pub cross: bool,
+}
+
+impl Envelope {
+    /// A non-positive message id is not a message (service/placeholder frame):
+    /// it is counted as `ignored`, and the page still advances the cursor.
+    pub fn is_storable(&self) -> bool {
+        self.key.message.0 > 0
+    }
+
+    /// The row the batch/context renderer consumes. Media path is empty at
+    /// ingest: the text marker carries the kind until the fetcher finalizes.
+    pub fn to_batch_msg(&self) -> BatchMsg {
+        BatchMsg {
+            message_id: self.key.message.0,
+            user_id: self.user_id,
+            username: self.username.clone(),
+            first_name: self.first_name.clone(),
+            text: self.text.clone(),
+            reply_to: self.reply_to,
+            media_path: self.media_path.clone(),
+            file_id: self.file_id.clone(),
+            media_kind: self.media_kind.clone(),
+            to_me: false,
+        }
+    }
+}
+
+/// Result of the legacy single-message ingest path. `row` is `Some` only when a
+/// new row was written; a duplicate is explicit, and an INSERT failure is an
+/// `Err` from `store_prepared` instead of `Ok(None)`.
+#[derive(Debug, Clone)]
+pub struct StoredRow {
+    pub applied: Applied,
+    pub row: Option<BatchMsg>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct BatchMsg {
     pub message_id: i64,
     pub user_id: Option<i64>,
@@ -277,31 +899,10 @@ pub struct BatchMsg {
     /// Telegram file_id of the media, so a sticker can be re-sent verbatim.
     pub file_id: String,
     pub to_me: bool,
-    /// Author is the owner (`CHATBOT_OWNER_USERNAME` / `CHATBOT_OWNER_ID`).
-    /// Subagent dispatch is structurally gated on owner-authored messages,
-    /// so the batch text and the control frame both carry this mark.
-    pub owner: bool,
 }
 
-/// Owner = the one person whose direct request opens subagent dispatch
-/// (crystal M1: "только по запросу Димони"). Matched by username
-/// (`CHATBOT_OWNER_USERNAME`) or, as a fallback for accounts without a
-/// username, by numeric id (`CHATBOT_OWNER_ID`). Both default to unset, and
-/// unset matches nobody — a fresh clone cannot inherit our operator's identity.
-/// Deliberately not tied to `to_me`: an address/@mention is not required for
-/// the owner's own request to count.
-pub fn is_owner(username: &str, user_id: Option<i64>) -> bool {
-    let want = cfg("CHATBOT_OWNER_USERNAME", "").to_lowercase();
-    if !want.is_empty() && !username.is_empty() && username.to_lowercase() == want {
-        return true;
-    }
-    let id: i64 = cfg("CHATBOT_OWNER_ID", "0").parse().unwrap_or(0);
-    id != 0 && user_id == Some(id)
-}
-
-/// Everything needed to write one message, gathered BEFORE the database actor
-/// is touched: media downloads and ffmpeg previews are awaits and must not run
-/// inside a DB closure, where they would stall every other user of the database.
+/// Everything needed to write one message, parsed before the database actor is
+/// touched. Media is only described here; the download belongs to the fetcher.
 #[derive(Debug, Clone)]
 pub struct PreparedMessage {
     pub update_id: i64,
@@ -312,12 +913,17 @@ pub struct PreparedMessage {
     pub first_name: String,
     pub text: String,
     pub reply_to: Option<i64>,
+    pub thread_id: Option<i64>,
     pub media_path: String,
     pub file_id: String,
     pub file_unique_id: String,
     /// Telegram field the media arrived in (`animation` = gif, `video`,
     /// `photo`, `sticker`, ...); empty when the message had no media.
     pub media_kind: String,
+    pub media_state: MediaState,
+    pub media_size: Option<u64>,
+    pub source_chat: Option<i64>,
+    pub sender_chat: Option<i64>,
     pub cross: bool,
 }
 
@@ -328,58 +934,31 @@ pub struct PreparedMessage {
 /// (Telegram serves `.mp4` for both animation and video), so the field name is
 /// stored as `media_kind` and never guessed from the bytes.
 pub fn pick_media(msg: &Value) -> Option<(String, Value)> {
-    for key in [
-        "photo",
-        "animation",
-        "video",
-        "document",
-        "sticker",
-        "voice",
-        "audio",
-        "video_note",
-    ] {
-        if let Some(obj) = msg.get(key) {
-            let o = if obj.is_array() {
-                obj.as_array()
-                    .and_then(|a| a.last().cloned())
-                    .unwrap_or(json!(null))
-            } else {
-                obj.clone()
-            };
-            if o.get("file_id").and_then(|v| v.as_str()).is_some() {
-                return Some((key.to_string(), o));
-            }
-        }
-    }
-    None
+    crate::media::media_kind_of(msg).map(|(kind, obj)| (kind.as_str().to_string(), obj))
 }
 
-/// Parse one update and fetch its media. Returns None when the message does not
-/// belong to the bot's chat (strict mode) or carries no update id.
-pub async fn prepare_message(
+/// Parse one Telegram message into an envelope. No I/O: media is only
+/// described here, so the page can be committed before any download starts.
+/// Returns None when a strict-chat message belongs to another chat.
+pub fn envelope_from_message(
     msg: &Value,
-    state: &str,
+    update_id: i64,
     strict_chat: bool,
-) -> Result<Option<PreparedMessage>> {
-    warn_if_owner_unset();
-    let chat_id = required_cfg("CHATBOT_CHAT_ID")?;
+    fallback_chat: i64,
+) -> Result<Option<Envelope>> {
+    let chat = msg
+        .get("chat")
+        .and_then(|c| c.get("id"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(fallback_chat);
     if strict_chat {
-        let got = msg
-            .get("chat")
-            .and_then(|c| c.get("id"))
-            .map(|v| v.to_string().trim_matches('"').to_string())
-            .unwrap_or_default();
-        // chat id may be numeric; compare as strings.
-        let want = chat_id.clone();
-        let got_norm = got.trim_matches('"').to_string();
-        if got_norm != want {
+        let want: i64 = required_cfg("CHATBOT_CHAT_ID")?
+            .parse()
+            .unwrap_or(fallback_chat);
+        if chat != want {
             return Ok(None);
         }
     }
-    let update_id = msg
-        .get("_update_id")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow!("prepare_message: missing _update_id"))?;
     let frm = msg.get("from").cloned().unwrap_or(json!({}));
     let sch = msg.get("sender_chat").cloned().unwrap_or(json!({}));
     let user_id: Option<i64> = frm
@@ -404,99 +983,12 @@ pub async fn prepare_message(
         .or_else(|| msg.get("caption").and_then(|v| v.as_str()))
         .unwrap_or("")
         .to_string();
-    let message_id = msg.get("message_id").and_then(|v| v.as_i64());
+    let message_id = msg.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let date = msg.get("date").and_then(|v| v.as_i64()).unwrap_or(0);
-    let cross = msg.get("_cross_chat").and_then(|v| v.as_bool()).unwrap_or(false);
-
-    let mut media_path = String::new();
-    let mut file_id = String::new();
-    let mut file_unique_id = String::new();
-    let mut media_kind = String::new();
-    if let Some((key, obj)) = pick_media(msg) {
-        media_kind = key.clone();
-        let fid = obj.get("file_id").and_then(|v| v.as_str()).unwrap_or("");
-        file_id = fid.to_string();
-        file_unique_id = obj
-            .get("file_unique_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let duration = obj.get("duration").and_then(|v| v.as_i64());
-        let mime = obj.get("mime_type").and_then(|v| v.as_str()).unwrap_or("");
-        // A sticker is marker-only: it is re-sent by file_id through
-        // `sendSticker`, and downloading it would only feed the old
-        // misclassification (a .webm sticker was previewed and called a gif).
-        if key == "sticker" {
-            text.push_str(" [sticker]");
-        } else if key == "voice" || key == "audio" {
-            // Marker-only: agent read tool cannot render audio; keep file_id
-            // for future STT, never download.
-            let secs = duration.map(|d| format!("{d}")).unwrap_or_else(|| "?".to_string());
-            text.push_str(&format!(" [{key} message, {secs} sec]"));
-        } else if key == "video_note" {
-            match download_media(fid, state, &update_id.to_string()).await {
-                Ok(p) => match preview_frame(&p, Duration::from_secs(60)).await {
-                    Ok(f) => {
-                        media_path = f;
-                        text.push_str(" [video note]");
-                    }
-                    Err(e) => {
-                        dlog(&format!("frame failed: {e}"));
-                        text.push_str(" [video note, preview unavailable]");
-                    }
-                },
-                Err(e) => {
-                    dlog(&format!("media download failed: {e}"));
-                    text.push_str(" [media unavailable]");
-                }
-            }
-        } else {
-            // Document carrying an audio mime is voice-like: marker-only, never download.
-            if key == "document" && mime_is_audio(mime) {
-                let secs = duration.map(|d| d.to_string()).unwrap_or_else(|| "?".to_string());
-                text.push_str(&format!(" [audio message, {secs} sec]"));
-            } else {
-            match download_media(fid, state, &update_id.to_string()).await {
-                Ok(p) => {
-                    let ext_video = video_ext(&p);
-                    let is_video_kind = key == "animation" || key == "video";
-                    let mime_video = mime_is_video(mime)
-                        || mime.to_lowercase().starts_with("video/")
-                        || mime.to_lowercase() == "image/gif";
-                    if is_video_kind || ext_video || mime_video {
-                        // One preview frame is all the agent needs to read.
-                        // The TEXT marker follows the Telegram kind, so a
-                        // document that happens to be a video is shown as
-                        // [video] and never leaves as a gif-catalog entry
-                        // (media_kind stays `document`).
-                        match preview_frame(&p, Duration::from_secs(60)).await {
-                            Ok(f) => {
-                                media_path = f;
-                                let label = if key == "animation" { "gif" } else { "video" };
-                                text.push_str(&format!(" [{label}]"));
-                            }
-                            Err(e) => {
-                                dlog(&format!("frame failed: {e}"));
-                                media_path = String::new();
-                                text.push_str(&format!(" [{key}, preview unavailable]"));
-                            }
-                        }
-                    } else if key == "photo" {
-                        media_path = p;
-                        text.push_str(" [photo]");
-                    } else {
-                        media_path = p;
-                    }
-                }
-                Err(e) => {
-                    dlog(&format!("media download failed: {e}"));
-                    text.push_str(" [media unavailable]");
-                }
-            }
-            }
-        }
-    }
-
+    let cross = msg
+        .get("_cross_chat")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let reply_to: Option<i64> = if cross {
         None
     } else {
@@ -504,33 +996,116 @@ pub async fn prepare_message(
             .and_then(|r| r.get("message_id"))
             .and_then(|v| v.as_i64())
     };
+    let thread_id = msg.get("message_thread_id").and_then(|v| v.as_i64());
+    let source_chat = msg
+        .get("forward_from_chat")
+        .and_then(|c| c.get("id"))
+        .and_then(|v| v.as_i64());
+    let sender_chat = sch.get("id").and_then(|v| v.as_i64());
 
-    Ok(Some(PreparedMessage {
+    let mut file_id = String::new();
+    let mut file_unique_id = String::new();
+    let mut media_kind = String::new();
+    let mut media_state = MediaState::Absent;
+    let mut media_size = None;
+    if let Some((kind, obj)) = crate::media::media_kind_of(msg) {
+        media_kind = kind.as_str().to_string();
+        file_id = obj
+            .get("file_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        file_unique_id = obj
+            .get("file_unique_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        media_size = obj
+            .get("file_size")
+            .and_then(|v| v.as_i64())
+            .filter(|n| *n >= 0)
+            .map(|n| n as u64);
+        let duration = obj.get("duration").and_then(|v| v.as_i64());
+        let mime = obj.get("mime_type").and_then(|v| v.as_str()).unwrap_or("");
+        text.push(' ');
+        text.push_str(&kind.marker(mime, duration));
+        media_state = if kind.needs_download() && !file_id.is_empty() {
+            MediaState::Pending
+        } else {
+            MediaState::Descriptor
+        };
+    }
+
+    Ok(Some(Envelope {
+        key: MessageKey {
+            chat,
+            message: MessageId(message_id),
+        },
         update_id,
-        message_id,
         date,
         user_id,
         username,
         first_name,
         text,
         reply_to,
-        media_path,
+        thread_id,
+        media_path: String::new(),
         file_id,
         file_unique_id,
         media_kind,
+        media_state,
+        media_size,
+        source_chat,
+        sender_chat,
         cross,
     }))
 }
 
-/// Write a prepared message as ONE atomic step: duplicate lookup (and the DELETE
-/// that the 120-second text contract requires), INSERT and media prune. Splitting
-/// these across separate calls would let another unit insert a row between the
-/// check and the write, breaking that contract.
-pub fn store_prepared(
-    con: &Connection,
-    prep: &PreparedMessage,
-    state: &str,
-) -> Result<Option<BatchMsg>> {
+/// Legacy single-message entry point for `chatd sync`: parse only, never fetch.
+pub async fn prepare_message(
+    msg: &Value,
+    _state: &str,
+    strict_chat: bool,
+) -> Result<Option<PreparedMessage>> {
+    let update_id = msg
+        .get("_update_id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow!("prepare_message: missing _update_id"))?;
+    let fallback: i64 = cfg("CHATBOT_CHAT_ID", "0").parse().unwrap_or(0);
+    let Some(env) = envelope_from_message(msg, update_id, strict_chat, fallback)? else {
+        return Ok(None);
+    };
+    let cross = msg
+        .get("_cross_chat")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok(Some(PreparedMessage {
+        update_id: env.update_id,
+        message_id: Some(env.key.message.0),
+        date: env.date,
+        user_id: env.user_id,
+        username: env.username,
+        first_name: env.first_name,
+        text: env.text,
+        reply_to: env.reply_to,
+        thread_id: env.thread_id,
+        media_path: env.media_path,
+        file_id: env.file_id,
+        file_unique_id: env.file_unique_id,
+        media_kind: env.media_kind,
+        media_state: env.media_state,
+        media_size: env.media_size,
+        source_chat: env.source_chat,
+        sender_chat: env.sender_chat,
+        cross,
+    }))
+}
+
+/// Write a prepared message as ONE atomic step: the `(chat_id, message_id)`
+/// identity check and the INSERT. Content (author/date/text) is never an
+/// identity: two real Telegram messages that happen to say the same thing are
+/// two messages. Media is left `pending` for the fetcher.
+pub fn store_prepared(con: &Connection, prep: &PreparedMessage, _state: &str) -> Result<StoredRow> {
     let PreparedMessage {
         update_id,
         message_id,
@@ -540,59 +1115,71 @@ pub fn store_prepared(
         first_name,
         text,
         reply_to,
+        thread_id,
         media_path,
         file_id,
         file_unique_id,
         media_kind,
-        cross,
+        media_state,
+        media_size,
+        source_chat,
+        sender_chat,
+        cross: _cross,
     } = prep.clone();
-    if !text.trim().is_empty() && !username.is_empty() {
-        // Predicate order follows idx_messages_author_window (username, date):
-        // the 120-second window narrows the rows before `text` is compared.
-        if cross {
-            let dup: Option<i64> = con
-                .prepare_cached(
-                    "SELECT update_id FROM messages WHERE username=? AND date>=? AND date<=? AND text=? LIMIT 1",
-                )?
-                .query_row(params![username, date - 120, date, text], |r| r.get(0))
-                .ok();
-            if dup.is_some() {
-                return Ok(None);
-            }
-        } else {
-            let dup: Option<i64> = con
-                .prepare_cached(
-                    "SELECT update_id FROM messages WHERE username=? AND date>=? AND date<=? AND text=? AND user_id<0 LIMIT 1",
-                )?
-                .query_row(params![username, date - 120, date, text], |r| r.get(0))
-                .ok();
-            if let Some(d) = dup {
-                let _ = con.execute("DELETE FROM messages WHERE update_id=?", [d]);
-            }
+    let chat: i64 = kv_get(con, "chat_id", "0").parse().unwrap_or(0);
+    // The identity is (chat_id, message_id). `update_id` is only the stream
+    // cursor, so the same message redelivered under a new cursor is a
+    // duplicate here too.
+    if let Some(mid) = message_id {
+        let exists: Option<i64> = con
+            .prepare_cached("SELECT 1 FROM messages WHERE chat_id=? AND message_id=? LIMIT 1")?
+            .query_row(params![chat, mid], |r| r.get(0))
+            .ok();
+        if exists.is_some() {
+            return Ok(StoredRow {
+                applied: Applied {
+                    duplicate: 1,
+                    ..Default::default()
+                },
+                row: None,
+            });
         }
     }
-    let res = con.execute(
-        "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        params![update_id, message_id, date, user_id, username, first_name, text, reply_to, media_path, file_id, file_unique_id, media_kind],
-    );
-    if res.is_err() {
-        return Ok(None);
+    // Identity is (chat_id, message_id) only. Author/date/text are never a
+    // second key, so there is no content lookup here.
+    // `OR IGNORE` collapses only the (chat_id, message_id) key; every other
+    // failure (disk, schema, trigger) is still an Err.
+    let changed = con.execute(
+        "INSERT OR IGNORE INTO messages(chat_id,update_id,message_id,thread_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind,media_state,media_size,source_chat,sender_chat) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        params![chat, update_id, message_id, thread_id, date, user_id, username, first_name, text, reply_to, media_path, file_id, file_unique_id, media_kind, media_state.as_str(), media_size.map(|s| s as i64), source_chat, sender_chat],
+    )?;
+    if changed == 0 {
+        return Ok(StoredRow {
+            applied: Applied {
+                duplicate: 1,
+                ..Default::default()
+            },
+            row: None,
+        });
     }
-    maybe_prune_media(state);
-    let owner = is_owner(&username, user_id);
-    Ok(Some(BatchMsg {
-        message_id: message_id.unwrap_or(0),
-        user_id,
-        username,
-        first_name,
-        text,
-        reply_to,
-        media_path,
-        file_id,
-        media_kind,
-        to_me: false,
-        owner,
-    }))
+    Ok(StoredRow {
+        applied: Applied {
+            inserted: 1,
+            ..Default::default()
+        },
+        row: Some(BatchMsg {
+            message_id: message_id.unwrap_or(0),
+            user_id,
+            username,
+            first_name,
+            text,
+            reply_to,
+            media_path,
+            file_id,
+            media_kind,
+            to_me: false,
+        }),
+    })
 }
 
 /// Media sweep throttle. Measured (`dbbench --media-files 1500`): the sweep
@@ -623,7 +1210,9 @@ pub fn maybe_prune_media_n(state: &str, keep: usize, trigger: usize) {
     for e in entries.flatten() {
         let p = e.path();
         if p.is_file() {
-            let mt = std::fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH.into());
+            let mt = std::fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH.into());
             files.push((mt, p));
         }
     }
@@ -635,290 +1224,6 @@ pub fn maybe_prune_media_n(state: &str, keep: usize, trigger: usize) {
         let _ = std::fs::remove_file(p);
     }
 }
-
-/// Display name used in rendered batch/context lines (`@user`, first name, id).
-fn display_who(username: &str, first_name: &str, user_id: Option<i64>) -> String {
-    if !username.is_empty() {
-        format!("@{username}")
-    } else if !first_name.is_empty() {
-        first_name.to_string()
-    } else {
-        user_id.map(|u| u.to_string()).unwrap_or_default()
-    }
-}
-
-/// Nearest parent of a reply, rendered next to the incoming message. Only ONE
-/// hop is resolved: the crystal requires "только последнее из цепочки реплаев".
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ReplyParent {
-    pub who: String,
-    pub text: String,
-    /// Parent carried media but no text: rendered as `[file]`.
-    pub media: bool,
-}
-
-/// One parent text is capped so a long quoted message cannot flood the batch.
-const REPLY_PARENT_CAP: usize = 120;
-
-/// The batch header tells the model which ids are answer targets: history (the
-/// context window, the GIF catalog) uses the same `[id]` shape, and without
-/// this line those ids looked like reply targets.
-const BATCH_HEADER: &str = "Пачка: это сообщения, на которые можно ответить. reply_to — только id из этой пачки; id из контекста выше и каталога гифок — история, не цель ответа.";
-
-fn one_line_capped(text: &str, cap: usize) -> String {
-    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let cut: String = joined.chars().take(cap).collect();
-    if joined.chars().count() > cap {
-        format!("{cut}…")
-    } else {
-        cut
-    }
-}
-
-/// Resolve the nearest parent of every reply in `batch` from the mirror.
-/// One targeted PK lookup per distinct reply target (a batch is normally a few
-/// rows); `format_batch` stays a pure render function over the returned map.
-/// A missing parent is not invented: the renderer says so honestly.
-pub fn reply_parents(con: &Connection, batch: &[BatchMsg]) -> Result<HashMap<i64, ReplyParent>> {
-    let mut ids: Vec<i64> = batch.iter().filter_map(|m| m.reply_to).collect();
-    ids.sort_unstable();
-    ids.dedup();
-    let mut out = HashMap::new();
-    for id in ids {
-        let row: Option<(Option<String>, Option<String>, Option<i64>, Option<String>, Option<String>)> = con
-            .prepare_cached(
-                "SELECT username,first_name,user_id,text,media_path FROM messages WHERE message_id=? LIMIT 1",
-            )
-            .and_then(|mut stmt| {
-                stmt.query_row([id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-                })
-            })
-            .ok();
-        if let Some((username, first_name, user_id, text, media)) = row {
-            let username = username.unwrap_or_default();
-            let first_name = first_name.unwrap_or_default();
-            out.insert(
-                id,
-                ReplyParent {
-                    who: display_who(&username, &first_name, user_id),
-                    text: text.unwrap_or_default(),
-                    media: !media.unwrap_or_default().is_empty(),
-                },
-            );
-        }
-    }
-    Ok(out)
-}
-
-/// Message body as the model sees it. A sticker has no caption and no media
-/// file, so its file_id is the only way to re-send it: print it next to the
-/// `[sticker]` marker.
-fn message_body(text: &str, media_kind: &str, file_id: &str) -> String {
-    if media_kind == "sticker" && !file_id.is_empty() {
-        if text.trim().is_empty() {
-            format!("[sticker] file_id={file_id}")
-        } else {
-            format!("{text} file_id={file_id}")
-        }
-    } else {
-        text.to_string()
-    }
-}
-
-pub fn format_batch(batch: &[BatchMsg], parents: &HashMap<i64, ReplyParent>) -> String {
-    if batch.is_empty() {
-        return String::new();
-    }
-    let mut lines = vec![BATCH_HEADER.to_string()];
-    for m in batch {
-        let who = display_who(&m.username, &m.first_name, m.user_id);
-        let mut head = format!("[{}] {}:", m.message_id, who);
-        if m.to_me {
-            head.push_str(" [к тебе]");
-        }
-        if m.owner {
-            head.push_str(" [владелец]");
-        }
-        if let Some(r) = m.reply_to {
-            let marker = match parents.get(&r) {
-                Some(p) => {
-                    let body = if !p.text.trim().is_empty() {
-                        format!("«{}»", one_line_capped(&p.text, REPLY_PARENT_CAP))
-                    } else if p.media {
-                        "[file]".to_string()
-                    } else {
-                        "без текста".to_string()
-                    };
-                    let who = if p.who.trim().is_empty() {
-                        format!("[{r}]")
-                    } else {
-                        format!("[{r}] {}:", p.who.trim())
-                    };
-                    format!(" (ответ на {who} {body})")
-                }
-                None => format!(" (ответ на [{r}]: сообщения нет в базе)"),
-            };
-            head.push_str(&marker);
-        }
-        if !m.text.is_empty() || (m.media_kind == "sticker" && !m.file_id.is_empty()) {
-            lines.push(format!(
-                "{head} {}",
-                message_body(&m.text, &m.media_kind, &m.file_id)
-            ));
-        }
-        if !m.media_path.is_empty() {
-            lines.push(format!("{head} [file] {} -- read it via read tool", m.media_path));
-        }
-    }
-    lines.join("\n")
-}
-
-/// One deduplicated GIF in the chat mirror.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GifEntry {
-    /// 1-based position in the full registry (stable ordering: newest first).
-    pub idx: i64,
-    pub file_id: String,
-    /// Caption text of the freshest message showing this GIF (may be empty).
-    pub text: String,
-    /// What was being discussed when the GIF was dropped: the text of the
-    /// message it answered, else of the message right before it. This is the
-    /// honest hint of WHEN the GIF fits; empty when the chat left none.
-    pub context: String,
-}
-
-/// Caps a caption so one long message cannot flood the batch context.
-const GIF_TEXT_CAP: usize = 160;
-
-fn gif_one_line(text: &str) -> String {
-    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let cut: String = joined.chars().take(GIF_TEXT_CAP).collect();
-    if joined.chars().count() > GIF_TEXT_CAP {
-        format!("{cut}…")
-    } else {
-        cut
-    }
-}
-
-/// Deduplicated GIF registry: only rows Telegram itself delivered as
-/// `animation` (a real GIF) — never a video, photo, document or sticker that
-/// merely carries a file_id. Historic rows have no `media_kind` and are
-/// therefore excluded: the kind cannot be recovered from file_id after the
-/// fact, and calling a video a GIF is worse than a shorter registry.
-///
-/// Dedup key: `file_unique_id` when present, else `file_id`.
-///
-/// The page and the registry total come from one pass: `COUNT(*) OVER ()`
-/// rides along with the page instead of the second full scan `gif_count`
-/// used to pay. Kept as a constant so `dbbench` explains exactly this text.
-pub const GIF_PAGE_SQL: &str = "WITH grouped AS (
-           SELECT COALESCE(NULLIF(file_unique_id,''), file_id) AS dedup_key,
-                  file_id, text, date, message_id, reply_to,
-                  ROW_NUMBER() OVER (
-                    PARTITION BY COALESCE(NULLIF(file_unique_id,''), file_id)
-                    ORDER BY date DESC, message_id DESC) AS rn
-           FROM messages
-           WHERE media_kind='animation' AND file_id IS NOT NULL AND file_id <> ''
-         ),
-         page AS (
-           SELECT file_id, text, date, message_id, reply_to, COUNT(*) OVER () AS total
-           FROM grouped WHERE rn = 1
-           ORDER BY date DESC, message_id DESC LIMIT ? OFFSET ?
-         )
-         SELECT file_id, text, total,
-                COALESCE(
-                  (SELECT NULLIF(TRIM(substr(m2.text,1,120)),'')
-                     FROM messages m2 WHERE m2.message_id = page.reply_to LIMIT 1),
-                  (SELECT NULLIF(TRIM(substr(m3.text,1,120)),'')
-                     FROM messages m3
-                    WHERE (m3.date, m3.message_id) < (page.date, page.message_id)
-                      AND m3.text IS NOT NULL AND TRIM(m3.text) <> ''
-                    ORDER BY m3.date DESC, m3.message_id DESC LIMIT 1),
-                  ''
-                ) AS context
-         FROM page ORDER BY date DESC, message_id DESC";
-
-pub fn gif_page(con: &Connection, offset: i64, limit: i64) -> Result<(Vec<GifEntry>, i64)> {
-    let offset = offset.max(0);
-    let limit = limit.clamp(1, 500);
-    let mut stmt = con.prepare_cached(GIF_PAGE_SQL)?;
-    let rows: Vec<(String, Option<String>, i64, Option<String>)> = stmt
-        .query_map(params![limit, offset], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
-        .flatten()
-        .collect();
-    let total = rows.first().map(|r| r.2).unwrap_or(0);
-    Ok((
-        rows.into_iter()
-            .enumerate()
-            .map(|(i, (file_id, text, _, context))| GifEntry {
-                idx: offset + i as i64 + 1,
-                file_id,
-                text: gif_one_line(text.as_deref().unwrap_or("")),
-                context: gif_one_line(context.as_deref().unwrap_or("")),
-            })
-            .collect(),
-        total,
-    ))
-}
-
-/// Deduplicated GIF registry, newest first.
-pub fn gif_registry(con: &Connection, offset: i64, limit: i64) -> Result<Vec<GifEntry>> {
-    Ok(gif_page(con, offset, limit)?.0)
-}
-
-/// Total number of deduplicated GIFs (same key rule as `gif_registry`).
-pub fn gif_count(con: &Connection) -> Result<i64> {
-    Ok(con
-        .prepare_cached(
-            "SELECT COUNT(DISTINCT COALESCE(NULLIF(file_unique_id,''), file_id)) FROM messages WHERE media_kind='animation' AND file_id IS NOT NULL AND file_id <> ''",
-        )?
-        .query_row([], |r| r.get(0))?)
-}
-
-fn gif_entry_line(e: &GifEntry) -> String {
-    let mut line = format!("[gif:{}] file_id={}", e.idx, e.file_id);
-    if e.text.is_empty() {
-        line.push_str(" · (без подписи)");
-    } else {
-        line.push_str(&format!(" · «{}»", e.text));
-    }
-    if !e.context.is_empty() {
-        line.push_str(&format!(" · момент: «{}»", e.context));
-    }
-    line
-}
-
-/// Batch-context catalog: at most `limit` deduplicated GIFs with captions and
-/// the `момент` hint. The full list is served on demand by the `gif_list` tool
-/// through the daemon (`gif_list_text`).
-pub fn gif_catalog(con: &Connection, limit: i64) -> Result<String> {
-    let entries = gif_registry(con, 0, limit)?;
-    if entries.is_empty() {
-        return Ok(String::new());
-    }
-    let lines: Vec<String> = entries.iter().map(gif_entry_line).collect();
-    Ok(format!(
-        "Гифки, уже побывавшие в чате (только настоящие анимации; подпись — что было под гифкой, момент — на что её отвечали, подсказка, когда уместно). Чтобы отправить — передай file_id в параметр gif_file_id тула chat_send, текст рядом станет подписью. Полный список — тул gif_list:\n{}",
-        lines.join("\n")
-    ))
-}
-
-/// Full-registry frame for the daemon `gif_list` call (read-only).
-pub fn gif_list_text(entries: &[GifEntry], total: i64) -> String {
-    if entries.is_empty() {
-        return "Гифок в истории пока нет (только подтверждённые анимации; старые записи без типа не угадываются).".to_string();
-    }
-    let lines: Vec<String> = entries.iter().map(gif_entry_line).collect();
-    format!(
-        "Все известные гифки ({} из {total}):\n{}",
-        entries.len(),
-        lines.join("\n")
-    )
-}
-
 
 // ---------- omo host ----------
 
@@ -941,22 +1246,36 @@ pub fn host_socket() -> String {
 /// reaches the journal, so the file is the reliable record an external
 /// watchdog greps. Uses state_dir(), never panics on I/O errors.
 pub fn dlog(msg: &str) {
+    dlog_at(&state_dir(), msg);
+}
+
+/// Same append/rotation contract as [`dlog`], against an explicit state dir.
+/// The ops tests need a log they can read without racing other tests over the
+/// process-wide `CHATBOT_STATE_DIR`.
+pub fn dlog_at(dir: &str, msg: &str) {
     eprintln!("{msg}");
-    let dir = state_dir();
-    let path = Path::new(&dir).join("chatd.log");
-    if std::fs::create_dir_all(&dir).is_err() {
+    let path = Path::new(dir).join("chatd.log");
+    if std::fs::create_dir_all(dir).is_err() {
         return;
     }
     if let Ok(m) = std::fs::metadata(&path) {
         if m.len() > 2_000_000 {
-            let prev = Path::new(&dir).join("chatd.log.1");
+            let prev = Path::new(dir).join("chatd.log.1");
             let _ = std::fs::remove_file(&prev);
             let _ = std::fs::rename(&path, &prev);
         }
     }
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{} {msg}", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"));
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(
+            f,
+            "{} {msg}",
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
+        );
     }
 }
 
@@ -979,7 +1298,11 @@ pub fn host_alive() -> bool {
 fn agent_env(cmd: &mut tokio::process::Command) {
     let agent_dir = cfg("CHATBOT_AGENT_DIR", "");
     if !agent_dir.is_empty() {
-        for k in ["OMO_CODING_AGENT_DIR", "SENPI_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"] {
+        for k in [
+            "OMO_CODING_AGENT_DIR",
+            "SENPI_CODING_AGENT_DIR",
+            "PI_CODING_AGENT_DIR",
+        ] {
             cmd.env(k, &agent_dir);
         }
     }
@@ -1046,15 +1369,19 @@ pub async fn omo_on(args: &[&str], timeout: Duration, sock: &str) -> Result<Valu
         let shown = args.join(" ");
         let pos = "unknown";
         let _ = (e, pos);
-        anyhow!("omo {shown}: bad output: {}", stdout.get(..80).unwrap_or(&stdout))
+        anyhow!(
+            "omo {shown}: bad output: {}",
+            stdout.get(..80).unwrap_or(&stdout)
+        )
     })
 }
 
-pub async fn omo_with_env(args: &[&str], timeout: Duration, extra_env: &HashMap<String, String>) -> Result<Value> {
-    let sock = extra_env
-        .get("SOCK")
-        .cloned()
-        .unwrap_or_else(host_socket);
+pub async fn omo_with_env(
+    args: &[&str],
+    timeout: Duration,
+    extra_env: &HashMap<String, String>,
+) -> Result<Value> {
+    let sock = extra_env.get("SOCK").cloned().unwrap_or_else(host_socket);
     let mut cmd = tokio::process::Command::new("omo");
     cmd.arg("host").arg("session");
     for a in args {
@@ -1062,9 +1389,9 @@ pub async fn omo_with_env(args: &[&str], timeout: Duration, extra_env: &HashMap<
     }
     cmd.arg("--socket").arg(&sock);
     agent_env(&mut cmd);
-    let out = tokio::time::timeout(timeout, cmd.output()).await.map_err(|_| {
-        anyhow!("omo {}: timeout", args.join(" "))
-    })??;
+    let out = tokio::time::timeout(timeout, cmd.output())
+        .await
+        .map_err(|_| anyhow!("omo {}: timeout", args.join(" ")))??;
     if !out.status.success() {
         return Err(anyhow!(
             "omo {}: rc={} {}",
@@ -1134,9 +1461,7 @@ pub fn write_launch_spec(state: &str, include_ext: bool) -> Result<PathBuf> {
         "core": {"session_runtime": "in-process", "multi_session": true, "extensions": exts},
         "env": {
             "OMO_CHATBOT_STATE_DIR": state,
-            "OMO_CHATBOT_TOKEN_FILE": required_cfg("CHATBOT_TOKEN_FILE")?,
             "OMO_CHATBOT_CHAT_ID": required_cfg("CHATBOT_CHAT_ID")?,
-            "OMO_CHATBOT_API_BASE": api_base(),
         },
     });
     // A persistent host never idle-exits, which is what keeps the bot alive
@@ -1145,13 +1470,14 @@ pub fn write_launch_spec(state: &str, include_ext: bool) -> Result<PathBuf> {
     // supervisor+child pair at an unreachable path. Only the chat host gets it.
     if include_ext {
         if let Some(env) = spec.get_mut("env").and_then(|e| e.as_object_mut()) {
-            env.insert(
-                "SENPI_RPC_HOST_COLD_START".to_string(),
-                json!("persistent"),
-            );
+            env.insert("SENPI_RPC_HOST_COLD_START".to_string(), json!("persistent"));
         }
     }
-    let spec_path = state_path.join(if include_ext { "launch-spec.json" } else { "launch-spec-summary.json" });
+    let spec_path = state_path.join(if include_ext {
+        "launch-spec.json"
+    } else {
+        "launch-spec-summary.json"
+    });
     std::fs::write(&spec_path, serde_json::to_string(&spec)?)?;
     Ok(spec_path)
 }
@@ -1175,9 +1501,18 @@ pub async fn ensure_host_on(state: &str, include_ext: bool, sock: &str) -> Resul
     // reuses a live one (which keeps the extension it was spawned with).
     let pre_alive = host_alive();
     let mut cmd = tokio::process::Command::new("omo");
-    cmd.arg("host").arg("ensure").arg("--launch-spec").arg(&spec_path).arg("--socket").arg(&sock);
+    cmd.arg("host")
+        .arg("ensure")
+        .arg("--launch-spec")
+        .arg(&spec_path)
+        .arg("--socket")
+        .arg(&sock);
     if !agent_dir.is_empty() {
-        for k in ["OMO_CODING_AGENT_DIR", "SENPI_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"] {
+        for k in [
+            "OMO_CODING_AGENT_DIR",
+            "SENPI_CODING_AGENT_DIR",
+            "PI_CODING_AGENT_DIR",
+        ] {
             cmd.env(k, &agent_dir);
         }
     }
@@ -1186,7 +1521,12 @@ pub async fn ensure_host_on(state: &str, include_ext: bool, sock: &str) -> Resul
         return Err(anyhow!(
             "omo host ensure: rc={} {}",
             out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stderr).trim().chars().rev().take(200).collect::<String>()
+            String::from_utf8_lossy(&out.stderr)
+                .trim()
+                .chars()
+                .rev()
+                .take(200)
+                .collect::<String>()
         ));
     }
     if include_ext && !pre_alive {
@@ -1236,7 +1576,12 @@ pub async fn stop_host_on(sock: &str) -> Result<()> {
         return Err(anyhow!(
             "omo host stop: rc={} {}",
             out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stderr).trim().chars().rev().take(200).collect::<String>()
+            String::from_utf8_lossy(&out.stderr)
+                .trim()
+                .chars()
+                .rev()
+                .take(200)
+                .collect::<String>()
         ));
     }
     Ok(())
@@ -1246,56 +1591,90 @@ pub async fn ensure_host(state: &str) -> Result<PathBuf> {
     ensure_host_with(state, true).await
 }
 
-pub async fn close_named_sessions(ref_: &str) {
-    close_named_sessions_on(ref_, &host_socket()).await
-}
-
-/// Same as close_named_sessions() but against an explicit host socket.
-#[allow(dead_code)]
-pub async fn close_named_sessions_on(ref_: &str, sock: &str) {
-    let data = match omo_on(&["list"], Duration::from_secs(30), sock).await {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    let sessions = data.get("sessions").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    for s in sessions {
-        if s.get("name").and_then(|v| v.as_str()) != Some(ref_) {
-            continue;
-        }
-        let sid = s
-            .get("durableSessionId")
-            .or_else(|| s.get("sessionId"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if sid.is_empty() {
-            continue;
-        }
-        let _ = omo_on(&["close", &sid], Duration::from_secs(30), sock).await;
-    }
-}
-
-pub async fn ensure_session(system_path: &str, ref_: Option<&str>) -> Result<String> {
-    let r = ref_.map(|s| s.to_string()).unwrap_or_else(|| cfg("CHATBOT_SESSION", "chat-participant"));
+/// Ensure exactly one LIVE session carries the configured name, then use it.
+/// Reuses the recorded durable id when the host still has it; otherwise picks
+/// the surviving session the repair kept. Only when no session carries the
+/// name does it open a new one. Every close inside the repair goes by durable
+/// id — a name is never a close argument.
+pub async fn ensure_session(
+    db: &crate::db::Db,
+    system_path: &str,
+    ref_: Option<&str>,
+) -> Result<String> {
+    let r = ref_
+        .map(|s| s.to_string())
+        .unwrap_or_else(session::configured_name);
     let state = state_dir();
     ensure_host(&state).await?;
-    close_named_sessions(&r).await;
+    let recorded = db
+        .call(|con| session::live_identity(con))
+        .await
+        .ok()
+        .flatten()
+        .map(|(uid, _)| uid);
+    let report = session::repair_sessions_on(&r, &host_socket(), recorded.as_deref()).await?;
+    if let Some(uid) = report.keep {
+        let name = r.clone();
+        let live = uid.clone();
+        db.write(move |tx| {
+            session::record_live(tx.handle(), &name, &live)?;
+            Ok(())
+        })
+        .await?;
+        return Ok(uid);
+    }
     let out = omo(
-        &["open", "--cwd", &cfg("CHATBOT_CWD", "."), "--name", &r, "--prompt", &format!("@{system_path}")],
+        &[
+            "open",
+            "--cwd",
+            &cfg("CHATBOT_CWD", "."),
+            "--name",
+            &r,
+            "--prompt",
+            &format!("@{system_path}"),
+        ],
         Duration::from_secs(120),
     )
     .await?;
-    Ok(out.get("durableSessionId").and_then(|v| v.as_str()).unwrap_or(&r).to_string())
+    let uid = out
+        .get("durableSessionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&r)
+        .to_string();
+    let name = r.clone();
+    let live = uid.clone();
+    db.write(move |tx| {
+        session::record_live(tx.handle(), &name, &live)?;
+        Ok(())
+    })
+    .await?;
+    Ok(uid)
 }
 
-pub async fn recreate_session(sid: &str, system_path: &str, ref_: Option<&str>, reason: &str) -> Result<String> {
+pub async fn recreate_session(
+    db: &crate::db::Db,
+    sid: &str,
+    system_path: &str,
+    ref_: Option<&str>,
+    reason: &str,
+) -> Result<String> {
     if !reason.is_empty() {
         dlog(&format!("recreate session {sid}: {reason}"));
     }
-    if let Err(e) = omo(&["close", sid], Duration::from_secs(30)).await {
-        dlog(&format!("recreate session {sid}: close failed ({e:#}), sweeping by name in ensure"));
+    match omo(&["close", sid], Duration::from_secs(30)).await {
+        Ok(_) => {
+            let dead = sid.to_string();
+            db.write(move |tx| {
+                session::mark_dead(tx.handle(), &dead)?;
+                Ok(())
+            })
+            .await?;
+        }
+        Err(e) => dlog(&format!(
+            "recreate session {sid}: close by id failed ({e:#}); keeping it instead of creating a duplicate"
+        )),
     }
-    ensure_session(system_path, ref_).await
+    ensure_session(db, system_path, ref_).await
 }
 
 // ---------- context blocks ----------
@@ -1363,7 +1742,11 @@ pub fn render_recent_context(
         } else {
             who
         };
-        let mark = if self_id != 0 && *uid == Some(self_id) { " [моё]" } else { "" };
+        let mark = if self_id != 0 && *uid == Some(self_id) {
+            " [моё]"
+        } else {
+            ""
+        };
         let mut head = format!("[{}] {}{}:", mid.unwrap_or(0), who, mark);
         if mid.map(|m| answered.contains(&m)).unwrap_or(false) {
             head.push_str(" [на это уже отвечено — не отвечать]");
@@ -1372,7 +1755,7 @@ pub fn render_recent_context(
         let kind = media_kind.clone().unwrap_or_default();
         let fid = file_id.clone().unwrap_or_default();
         let body = if kind == "sticker" && !fid.is_empty() {
-            message_body(text.as_deref().unwrap_or(""), &kind, &fid)
+            crate::context::message_body(text.as_deref().unwrap_or(""), &kind, &fid)
         } else {
             text.clone().unwrap_or_default()
         };
@@ -1389,15 +1772,30 @@ pub fn render_recent_context(
             blocks.push(chunk.join("\n"));
         }
     }
-    let tail: Vec<String> = blocks.into_iter().rev().take(limit as usize).rev().collect();
+    let tail: Vec<String> = blocks
+        .into_iter()
+        .rev()
+        .take(limit as usize)
+        .rev()
+        .collect();
     if tail.is_empty() {
         return String::new();
     }
-    format!("Контекст чата (последние {}):\n{}", tail.len(), tail.join("\n"))
+    format!(
+        "Контекст чата (последние {}):\n{}",
+        tail.len(),
+        tail.join("\n")
+    )
 }
 
 /// Context block for callers that hold no precomputed answered set.
-pub fn recent_context(state: &str, con: &Connection, batch_ids: &HashSet<i64>, limit: i64, cap: usize) -> Result<String> {
+pub fn recent_context(
+    state: &str,
+    con: &Connection,
+    batch_ids: &HashSet<i64>,
+    limit: i64,
+    cap: usize,
+) -> Result<String> {
     let answered = answered_ids(state, con);
     recent_context_with(con, batch_ids, limit, cap, &answered)
 }
@@ -1413,10 +1811,17 @@ pub fn recent_context_with(
 ) -> Result<String> {
     let self_id: i64 = kv_get(con, "self_id", "0").parse().unwrap_or(0);
     let rows = recent_rows(con, limit + batch_ids.len() as i64 + 5)?;
-    Ok(render_recent_context(&rows, batch_ids, limit, cap, self_id, answered))
+    Ok(render_recent_context(
+        &rows, batch_ids, limit, cap, self_id, answered,
+    ))
 }
 
-pub fn mirror_own_send(con: &Connection, message_id: i64, text: &str, reply_to: Option<i64>) -> Result<()> {
+pub fn mirror_own_send(
+    con: &Connection,
+    message_id: i64,
+    text: &str,
+    reply_to: Option<i64>,
+) -> Result<()> {
     let self_id: i64 = kv_get(con, "self_id", "0").parse().unwrap_or(0);
     let mut self_id = self_id;
     if self_id == 0 {
@@ -1427,14 +1832,20 @@ pub fn mirror_own_send(con: &Connection, message_id: i64, text: &str, reply_to: 
     let username = kv_get(con, "self_username", "");
     let first = kv_get(con, "self_first", "");
     let now = chrono::Utc::now().timestamp();
+    let chat: i64 = kv_get(con, "chat_id", "0").parse().unwrap_or(0);
     let _ = con.execute(
-        "INSERT OR IGNORE INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        params![-message_id, message_id, now, self_id, username, first, text, reply_to, "", ""],
+        "INSERT OR IGNORE INTO messages(chat_id,update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        params![chat, -message_id, message_id, now, self_id, username, first, text, reply_to, "", ""],
     )?;
     Ok(())
 }
 
-pub async fn mirror_own_send_auto(con: &Connection, message_id: i64, text: &str, reply_to: Option<i64>) -> Result<()> {
+pub async fn mirror_own_send_auto(
+    con: &Connection,
+    message_id: i64,
+    text: &str,
+    reply_to: Option<i64>,
+) -> Result<()> {
     let self_id: i64 = kv_get(con, "self_id", "0").parse().unwrap_or(0);
     if self_id == 0 {
         match api("getMe", &json!({})).await {
@@ -1444,8 +1855,16 @@ pub async fn mirror_own_send_auto(con: &Connection, message_id: i64, text: &str,
                     return Ok(());
                 }
                 kv_set(con, "self_id", &id.to_string())?;
-                kv_set(con, "self_username", me.get("username").and_then(|v| v.as_str()).unwrap_or(""))?;
-                kv_set(con, "self_first", me.get("first_name").and_then(|v| v.as_str()).unwrap_or(""))?;
+                kv_set(
+                    con,
+                    "self_username",
+                    me.get("username").and_then(|v| v.as_str()).unwrap_or(""),
+                )?;
+                kv_set(
+                    con,
+                    "self_first",
+                    me.get("first_name").and_then(|v| v.as_str()).unwrap_or(""),
+                )?;
                 mirror_own_send(con, message_id, text, reply_to)?;
             }
             Err(_) => {}
@@ -1463,8 +1882,10 @@ pub fn answered_guard(con: &Connection, limit: i64) -> Result<String> {
     let mut stmt = con.prepare_cached(
         "SELECT reply_to, substr(text, 1, 120) FROM messages WHERE user_id=? AND reply_to IS NOT NULL ORDER BY date DESC LIMIT ?",
     )?;
-    let rows: Vec<(Option<i64>, Option<String>)> =
-        stmt.query_map(params![self_id, limit], |r| Ok((r.get(0)?, r.get(1)?)))?.flatten().collect();
+    let rows: Vec<(Option<i64>, Option<String>)> = stmt
+        .query_map(params![self_id, limit], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .flatten()
+        .collect();
     let mut lines = vec![];
     for (qid, ans) in rows {
         let qid = match qid {
@@ -1477,7 +1898,11 @@ pub fn answered_guard(con: &Connection, limit: i64) -> Result<String> {
             .ok();
         let q = qtext.unwrap_or_else(|| "?".to_string());
         let a = ans.unwrap_or_else(|| "[gif]".to_string());
-        let a = if a.trim().is_empty() { "[gif]".to_string() } else { a.trim().to_string() };
+        let a = if a.trim().is_empty() {
+            "[gif]".to_string()
+        } else {
+            a.trim().to_string()
+        };
         lines.push(format!("- [{qid}] «{q}» → ты уже ответил: «{a}»"));
     }
     if lines.is_empty() {
@@ -1498,7 +1923,11 @@ pub fn recent_receipt_reply_tos(state: &str) -> HashSet<i64> {
     };
     const TAIL: usize = 256 * 1024;
     let cut = data.len() > TAIL;
-    let slice = if cut { &data[data.len() - TAIL..] } else { &data[..] };
+    let slice = if cut {
+        &data[data.len() - TAIL..]
+    } else {
+        &data[..]
+    };
     let text = String::from_utf8_lossy(slice);
     let mut out = HashSet::new();
     let mut first = true;
@@ -1522,7 +1951,11 @@ pub fn recent_receipt_reply_tos(state: &str) -> HashSet<i64> {
         if kind != "chat_send_result" && kind != "chat_send_replay" {
             continue;
         }
-        if let Some(q) = v.get("receipt").and_then(|r| r.get("reply_to")).and_then(|x| x.as_i64()) {
+        if let Some(q) = v
+            .get("receipt")
+            .and_then(|r| r.get("reply_to"))
+            .and_then(|x| x.as_i64())
+        {
             out.insert(q);
         }
     }
@@ -1536,6 +1969,21 @@ pub fn recent_receipt_reply_tos(state: &str) -> HashSet<i64> {
 pub fn answered_ids(state: &str, con: &Connection) -> HashSet<i64> {
     let self_id: i64 = kv_get(con, "self_id", "0").parse().unwrap_or(0);
     let mut out = recent_receipt_reply_tos(state);
+    // Journal closure is the authority, not the quote. An answer sent without
+    // `reply_to` has no mirror row pointing at the question, but the batch it
+    // closed still names every incoming id it covered. Keeping those here is
+    // what stops a compact/recovery from regenerating that batch.
+    if let Ok(mut stmt) = con.prepare_cached(
+        "SELECT message_ids FROM batches WHERE state='closed' AND message_ids IS NOT NULL",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for raw in rows.flatten() {
+                if let Ok(ids) = serde_json::from_str::<Vec<i64>>(&raw) {
+                    out.extend(ids);
+                }
+            }
+        }
+    }
     if self_id == 0 {
         return out;
     }
@@ -1597,7 +2045,11 @@ pub fn pending_ids(con: &Connection) -> Vec<String> {
         return vec![];
     }
     serde_json::from_str::<Vec<Value>>(&raw)
-        .map(|v| v.iter().map(|x| x.to_string().trim_matches('"').to_string()).collect())
+        .map(|v| {
+            v.iter()
+                .map(|x| x.to_string().trim_matches('"').to_string())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1612,7 +2064,11 @@ pub fn done_ids(con: &Connection) -> HashSet<String> {
         return HashSet::new();
     }
     serde_json::from_str::<Vec<Value>>(&raw)
-        .map(|v| v.iter().map(|x| x.to_string().trim_matches('"').to_string()).collect())
+        .map(|v| {
+            v.iter()
+                .map(|x| x.to_string().trim_matches('"').to_string())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1657,7 +2113,9 @@ pub fn frame_id(sig: &str) -> String {
 /// Batch sig behind a frame id: `sig`, or `sig#n` from a later attempt.
 pub fn sig_of_frame(frame: &str) -> &str {
     match frame.rfind('#') {
-        Some(i) if i + 1 < frame.len() && frame[i + 1..].bytes().all(|b| b.is_ascii_digit()) => &frame[..i],
+        Some(i) if i + 1 < frame.len() && frame[i + 1..].bytes().all(|b| b.is_ascii_digit()) => {
+            &frame[..i]
+        }
         _ => frame,
     }
 }
@@ -1667,7 +2125,13 @@ pub fn frame_for(frame: &str, sig: &str) -> bool {
     sig_of_frame(frame) == sig
 }
 
-pub async fn wait_for(state: &str, mut offset: u64, want: &str, sig: &str, budget: Duration) -> Result<(Option<Value>, Vec<Value>, u64)> {
+pub async fn wait_for(
+    state: &str,
+    mut offset: u64,
+    want: &str,
+    sig: &str,
+    budget: Duration,
+) -> Result<(Option<Value>, Vec<Value>, u64)> {
     let deadline = Instant::now() + budget;
     let mut receipts = vec![];
     while Instant::now() < deadline {
@@ -1675,10 +2139,18 @@ pub async fn wait_for(state: &str, mut offset: u64, want: &str, sig: &str, budge
         offset = noff;
         for ev in events {
             let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-            if (kind == "chat_send_result" || kind == "chat_send_replay") && ev.get("receipt").map(|r| r.is_object()).unwrap_or(false) {
+            if (kind == "chat_send_result" || kind == "chat_send_replay")
+                && ev.get("receipt").map(|r| r.is_object()).unwrap_or(false)
+            {
                 receipts.push(ev.get("receipt").unwrap().clone());
             }
-            if kind == want && (want != "admitted" || frame_for(ev.get("delivery_id").and_then(|v| v.as_str()).unwrap_or(""), sig)) {
+            if kind == want
+                && (want != "admitted"
+                    || frame_for(
+                        ev.get("delivery_id").and_then(|v| v.as_str()).unwrap_or(""),
+                        sig,
+                    ))
+            {
                 return Ok((Some(ev), receipts, offset));
             }
         }
@@ -1690,7 +2162,9 @@ pub async fn wait_for(state: &str, mut offset: u64, want: &str, sig: &str, budge
 pub fn batch_rows_by_ids(con: &Connection, ids: &[Value]) -> Result<Vec<BatchMsg>> {
     let mut out = vec![];
     for mid in ids {
-        let mid_int: Option<i64> = mid.as_i64().or_else(|| mid.as_str().and_then(|s| s.parse().ok()));
+        let mid_int: Option<i64> = mid
+            .as_i64()
+            .or_else(|| mid.as_str().and_then(|s| s.parse().ok()));
         let mid_int = match mid_int {
             Some(m) => m,
             None => continue,
@@ -1730,7 +2204,6 @@ pub fn batch_rows_by_ids(con: &Connection, ids: &[Value]) -> Result<Vec<BatchMsg
             out.push(BatchMsg {
                 message_id: m.unwrap_or(mid_int),
                 user_id: u,
-                owner: is_owner(&username, u),
                 username,
                 first_name: f.unwrap_or_default(),
                 text: t.unwrap_or_default(),
@@ -1746,64 +2219,36 @@ pub fn batch_rows_by_ids(con: &Connection, ids: &[Value]) -> Result<Vec<BatchMsg
 }
 
 pub fn regen_text(state: &str, con: &Connection, sig: &str) -> Result<Option<String>> {
-    let raw_ids = kv_get(con, &format!("pending_batch_ids:{sig}"), "");
-    let ids: Vec<Value> = if raw_ids.is_empty() { vec![] } else { serde_json::from_str(&raw_ids).unwrap_or_default() };
+    let ids = crate::ledger::message_ids(con, sig)?;
     if ids.is_empty() {
         return Ok(None);
     }
-    let mut id_set = HashSet::new();
-    for mid in &ids {
-        if let Some(m) = mid.as_i64().or_else(|| mid.as_str().and_then(|s| s.parse().ok())) {
-            id_set.insert(m);
-        }
-    }
-    if id_set.is_empty() {
-        return Ok(None);
-    }
+    let ids: Vec<Value> = ids.into_iter().map(|i| json!(i)).collect();
     let mut rows = batch_rows_by_ids(con, &ids)?;
     if rows.is_empty() {
         return Ok(None);
     }
-    // Same structural filter as the fresh-batch path: never re-ask answered
-    // rows after a compact. When nothing unanswered remains, close the batch.
-    let answered = answered_ids(state, con);
-    rows.retain(|r| !answered.contains(&r.message_id));
-    if rows.is_empty() {
-        mark_done(con, state, sig)?;
-        dlog(&format!("compacted: {sig} fully answered since flush, closing"));
-        return Ok(None);
-    }
-    let raw_tome = kv_get(con, &format!("pending_tome:{sig}"), "");
-    let tome: HashSet<i64> = if raw_tome.is_empty() {
-        HashSet::new()
-    } else {
-        serde_json::from_str::<Vec<Value>>(&raw_tome)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-            .collect()
-    };
-    for r in rows.iter_mut() {
-        if tome.contains(&r.message_id) {
-            r.to_me = true;
+    if let Some(view) = crate::ledger::view(con, sig)? {
+        // A closed batch is terminal, with or without a quote. Regenerating it
+        // would let a `compacted` event push the same question again.
+        if view.state == "closed" || view.close_reason().is_some() {
+            return Ok(None);
+        }
+        let tome: HashSet<i64> = view.tome.into_iter().collect();
+        for r in rows.iter_mut() {
+            if tome.contains(&r.message_id) {
+                r.to_me = true;
+            }
         }
     }
-    let context = recent_context_with(con, &id_set, 50, 300, &answered)?;
-    let guard = answered_guard(con, 5)?;
-    let catalog = gif_catalog(con, 20)?;
-    let parents = reply_parents(con, &rows)?;
-    let mut parts = vec![];
-    if !context.is_empty() {
-        parts.push(context);
+    // The rebuild goes through the SAME builder as a fresh batch: the only
+    // difference is that the rows arrive from the journal instead of ingest.
+    let built = crate::context::build(state, con, &rows)?;
+    if built.ids.is_empty() {
+        dlog(&format!("compacted: {sig} has no unanswered rows left"));
+        return Ok(None);
     }
-    if !guard.is_empty() {
-        parts.push(guard);
-    }
-    if !catalog.is_empty() {
-        parts.push(catalog);
-    }
-    parts.push(format_batch(&rows, &parents));
-    Ok(Some(parts.join("\n")))
+    Ok(Some(built.text))
 }
 
 /// Agent-cycle liveness from extension activity events. Some(true) = the
@@ -1821,21 +2266,6 @@ pub fn activity_phase(ev: &Value) -> Option<bool> {
     }
 }
 
-/// Owner-authored message ids of a pending batch, as written to the ledger at
-/// admit time. Recovery paths re-push the same frame, so they must rebuild the
-/// same owner set instead of guessing.
-pub fn pending_owner_ids(con: &Connection, sig: &str) -> Vec<i64> {
-    let raw = kv_get(con, &format!("pending_owner:{sig}"), "");
-    if raw.is_empty() {
-        return vec![];
-    }
-    serde_json::from_str::<Vec<Value>>(&raw)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-        .collect()
-}
-
 /// Incoming message ids of a pending batch, as written to the ledger at admit
 /// time. The extension needs them to refuse a `reply_to` that names anything
 /// outside this batch (history window, GIF catalog, another turn).
@@ -1847,7 +2277,10 @@ pub fn pending_batch_ids(con: &Connection, sig: &str) -> Vec<i64> {
     serde_json::from_str::<Vec<Value>>(&raw)
         .unwrap_or_default()
         .iter()
-        .filter_map(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .filter_map(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
         .collect()
 }
 
@@ -1875,7 +2308,11 @@ pub fn pending_marks_clear(con: &Connection, sig: &str) -> Result<()> {
 /// Delivery phase of a pending batch. `inboxed` = pushed, not accepted yet;
 /// `admitted` = the runtime took it; `emitted` = the context entry exists (the
 /// agent has the text); `settled` = a run finished after that emission.
-pub fn delivery_phase(admitted_at: Option<i64>, emitted_at: Option<i64>, settled_at: Option<i64>) -> &'static str {
+pub fn delivery_phase(
+    admitted_at: Option<i64>,
+    emitted_at: Option<i64>,
+    settled_at: Option<i64>,
+) -> &'static str {
     match (admitted_at, emitted_at, settled_at) {
         (None, _, _) => "inboxed",
         (Some(_), None, _) => "admitted",
@@ -1888,7 +2325,11 @@ pub fn delivery_phase(admitted_at: Option<i64>, emitted_at: Option<i64>, settled
 /// the agent's own answer, plus one explicit exception: the run settled after
 /// the delivery was emitted, so the batch was in context and the agent chose
 /// silence (`[skip]`). Elapsed time and bare turn boundaries never retire.
-pub fn should_retire(all_answered: bool, emitted_at: Option<i64>, settled_at: Option<i64>) -> Option<&'static str> {
+pub fn should_retire(
+    all_answered: bool,
+    emitted_at: Option<i64>,
+    settled_at: Option<i64>,
+) -> Option<&'static str> {
     if all_answered {
         return Some("answered");
     }
@@ -1902,7 +2343,13 @@ pub fn should_retire(all_answered: bool, emitted_at: Option<i64>, settled_at: Op
 
 /// No-progress clock: a batch has shown no new evidence for `budget_secs`
 /// (extended while the agent is working, hard-capped by the same `extra_secs`).
-pub fn stalled(now: i64, last_progress: i64, budget_secs: u64, working: bool, extra_secs: u64) -> bool {
+pub fn stalled(
+    now: i64,
+    last_progress: i64,
+    budget_secs: u64,
+    working: bool,
+    extra_secs: u64,
+) -> bool {
     let limit = budget_secs as i64 + if working { extra_secs as i64 } else { 0 };
     now.saturating_sub(last_progress) >= limit.saturating_mul(1000)
 }
@@ -1920,7 +2367,12 @@ pub fn mirror_receipts(con: &Connection, receipts: &[Value]) -> Result<()> {
     Ok(())
 }
 
-pub async fn settle_session(state: &str, db: &crate::db::Db, offset: u64, budget: Duration) -> Result<u64> {
+pub async fn settle_session(
+    state: &str,
+    db: &crate::db::Db,
+    offset: u64,
+    budget: Duration,
+) -> Result<u64> {
     let (_ev, receipts, offset) = wait_for(state, offset, "turn_end", "", budget).await?;
     if !receipts.is_empty() {
         let receipts = receipts.clone();
@@ -1933,45 +2385,15 @@ pub fn build_batch_text(
     state: &str,
     con: &Connection,
     batch: &[BatchMsg],
-) -> Result<(String, String, Vec<i64>, Vec<i64>, Vec<i64>, String)> {
-    // Drop answered rows structurally (not just via the guard block): after a
-    // session recreate the agent is memory-less and re-answers anything it is
-    // handed, paraphrased. Exact message_id match only — a user re-asking the
-    // same thing sends a NEW id and is unaffected.
-    let answered = answered_ids(state, con);
-    let batch: Vec<BatchMsg> = batch.iter().filter(|m| !answered.contains(&m.message_id)).cloned().collect();
-    let batch_ids: HashSet<i64> = batch.iter().map(|m| m.message_id).collect();
-    // ONE read of the recent window feeds both the context block and the
-    // window anchor that used to cost a second, identical pass.
-    let rows = recent_rows(con, 50 + batch_ids.len() as i64 + 5)?;
-    let self_id: i64 = kv_get(con, "self_id", "0").parse().unwrap_or(0);
-    let context = render_recent_context(&rows, &batch_ids, 50, 300, self_id, &answered);
-    let guard = answered_guard(con, 5)?;
-    let catalog = gif_catalog(con, 20)?;
-    let parents = reply_parents(con, &batch)?;
-    let mut parts = vec![];
-    if !context.is_empty() {
-        parts.push(context);
-    }
-    if !guard.is_empty() {
-        parts.push(guard);
-    }
-    if !catalog.is_empty() {
-        parts.push(catalog);
-    }
-    parts.push(format_batch(&batch, &parents));
-    let text = parts.join("\n");
-    let sig = batch_sig(&text);
-    let ids: Vec<i64> = batch.iter().map(|m| m.message_id).collect();
-    let tome: Vec<i64> = batch.iter().filter(|m| m.to_me).map(|m| m.message_id).collect();
-    let owners: Vec<i64> = batch.iter().filter(|m| m.owner).map(|m| m.message_id).collect();
-    let anchor = rows
-        .iter()
-        .filter_map(|r| r.0)
-        .filter(|id| !batch_ids.contains(id))
-        .max()
-        .unwrap_or(0);
-    Ok((text, sig, ids, tome, owners, anchor.to_string()))
+) -> Result<(String, String, Vec<i64>, Vec<i64>, String)> {
+    let built = crate::context::build(state, con, batch)?;
+    Ok((
+        built.text,
+        built.sig,
+        built.ids,
+        built.tome,
+        built.anchor.to_string(),
+    ))
 }
 
 /// Summarize isolation: open a session on a SEPARATE host socket whose
@@ -2006,10 +2428,19 @@ pub async fn summarize_isolated_session(system_path: &str) -> Result<(String, St
     let state = state_dir();
     ensure_host_on(&state, false, &sock).await?;
     let r = cfg("CHATBOT_SUMMARY_SESSION", "chat-summary");
-    // List sessions on the scratch host to close strays best-effort.
-    close_named_sessions_on(&r, &sock).await;
+    // List sessions on the scratch host to close strays best-effort; each
+    // close names a durable id, never a session name.
+    let _ = session::close_all_sessions_on(&sock).await;
     let out = omo_on(
-        &["open", "--cwd", &cfg("CHATBOT_CWD", "."), "--name", &r, "--prompt", &format!("@{system_path}")],
+        &[
+            "open",
+            "--cwd",
+            &cfg("CHATBOT_CWD", "."),
+            "--name",
+            &r,
+            "--prompt",
+            &format!("@{system_path}"),
+        ],
         Duration::from_secs(120),
         &sock,
     )
@@ -2021,15 +2452,23 @@ pub async fn summarize_isolated_session(system_path: &str) -> Result<(String, St
             return Err(e);
         }
     };
-    let sid = out.get("durableSessionId").and_then(|v| v.as_str()).unwrap_or(&r).to_string();
+    let sid = out
+        .get("durableSessionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&r)
+        .to_string();
     // Verify no chat_send tool. The CLI offers no `tools` subcommand;
     // `state` is the introspection it has. Structural isolation already
     // holds via the extension-free launch-spec; this fails closed if a
     // chat_send tool entry ever shows up in the fresh session state.
-    let st = omo_on(&["state", &sid], Duration::from_secs(30), &sock).await.unwrap_or(json!({}));
+    let st = omo_on(&["state", &sid], Duration::from_secs(30), &sock)
+        .await
+        .unwrap_or(json!({}));
     if json_has_tool_name(&st, "chat_send") {
         close_summary_session(&sid, &sock).await;
-        return Err(anyhow!("summary session exposes chat_send: isolation violated"));
+        return Err(anyhow!(
+            "summary session exposes chat_send: isolation violated"
+        ));
     }
     Ok((sid, sock))
 }
@@ -2058,6 +2497,35 @@ pub fn last_event_ts(state: &str, kind: &str) -> Option<i64> {
 /// host passes only launch-spec keys, and the state dir is already one of them.
 pub fn control_sock_path(state: &str) -> PathBuf {
     Path::new(state).join("control.sock")
+}
+
+/// Read-only MCP tool socket served by the daemon. It is separate from the
+/// control socket because the extension owns that one connection; a tool call
+/// must not evict it. Only the daemon can answer here, so the Bot API token and
+/// every HTTP call stay inside this process.
+pub fn tool_socket_path(state: &str) -> PathBuf {
+    Path::new(state).join("tool.sock")
+}
+
+/// One daemon-owned tool operation. `get_media` is the only op that needs the
+/// Bot API: the tool receives the cached path and byte count, never the token.
+pub async fn tool_call(state: &str, op: &str, args: &Value) -> Result<String> {
+    match op {
+        "get_media" => {
+            let file_id = args
+                .get("file_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if file_id.is_empty() {
+                return Err(anyhow!("file_id is required"));
+            }
+            let path = download_media(file_id, state, "").await?;
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            Ok(json!({"path": path, "bytes": bytes}).to_string())
+        }
+        other => Err(anyhow!("unknown tool op: {other}")),
+    }
 }
 
 /// A socket file left behind by a previous daemon makes `bind` fail with
@@ -2136,9 +2604,8 @@ mod tests {
             media_kind: "".into(),
             file_id: "".into(),
             to_me: true,
-            owner: false,
         }];
-        let s = format_batch(&b, &HashMap::new());
+        let s = crate::context::render_batch(&b, &HashMap::new());
         assert!(s.contains("[1] @u: [к тебе] hi"));
     }
 
@@ -2150,18 +2617,21 @@ mod tests {
         let mut parents = HashMap::new();
         parents.insert(
             101,
-            ReplyParent {
+            crate::context::ReplyParent {
                 who: "@u".into(),
                 text: long,
                 media: false,
             },
         );
-        let s = format_batch(&[m], &parents);
-        assert!(s.contains("(ответ на [101] @u: «длинный родитель"), "got: {s}");
+        let s = crate::context::render_batch(&[m], &parents);
+        assert!(
+            s.contains("(ответ на [101] @u: «длинный родитель"),
+            "got: {s}"
+        );
         assert!(s.contains('…'), "parent text was not capped: {s}");
         let body = s.split('«').nth(1).unwrap().split('»').next().unwrap();
         assert!(
-            body.chars().count() <= REPLY_PARENT_CAP + 1,
+            body.chars().count() <= crate::context::REPLY_PARENT_CAP + 1,
             "cap exceeded: {} chars",
             body.chars().count()
         );
@@ -2169,22 +2639,27 @@ mod tests {
 
     #[test]
     fn format_batch_renders_media_missing_parent_and_header() {
-        assert!(format_batch(&[], &HashMap::new()).is_empty());
+        assert!(crate::context::render_batch(&[], &HashMap::new()).is_empty());
         let mut m = mk_batch_msg(102, "x");
         m.reply_to = Some(101);
-        let missing = format_batch(&[m.clone()], &HashMap::new());
-        assert!(missing.contains("(ответ на [101]: сообщения нет в базе)"), "got: {missing}");
+        let missing = crate::context::render_batch(&[m.clone()], &HashMap::new());
+        assert!(
+            missing.contains("(ответ на [101]: сообщения нет в базе)"),
+            "got: {missing}"
+        );
         let mut parents = HashMap::new();
         parents.insert(
             101,
-            ReplyParent {
+            crate::context::ReplyParent {
                 who: "@u".into(),
                 text: "".into(),
                 media: true,
             },
         );
-        assert!(format_batch(&[m], &parents).contains("(ответ на [101] @u: [file])"));
-        let header = format_batch(&[mk_batch_msg(1, "hi")], &HashMap::new());
+        assert!(
+            crate::context::render_batch(&[m], &parents).contains("(ответ на [101] @u: [file])")
+        );
+        let header = crate::context::render_batch(&[mk_batch_msg(1, "hi")], &HashMap::new());
         assert!(
             header.contains("reply_to — только id из этой пачки"),
             "batch header missing: {header}"
@@ -2202,7 +2677,13 @@ mod tests {
         kv_set(&con, "self_first", "Bot").unwrap();
         mirror_own_send(&con, 7, "hello", None).unwrap();
         mirror_own_send(&con, 7, "hello", None).unwrap(); // INSERT OR IGNORE
-        let n: i64 = con.query_row("SELECT COUNT(*) FROM messages WHERE message_id=7", [], |r| r.get(0)).unwrap();
+        let n: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE message_id=7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(n, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2268,7 +2749,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let state = dir.to_string_lossy().to_string();
         std::fs::create_dir_all(&state).unwrap();
-        std::fs::write(events_path(&state), b"{\"kind\":\"turn_end\"}\n{\"kind\":" ).unwrap();
+        std::fs::write(events_path(&state), b"{\"kind\":\"turn_end\"}\n{\"kind\":").unwrap();
         let (evs, _) = read_events(&state, 0).unwrap();
         assert_eq!(evs.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2286,7 +2767,6 @@ mod tests {
             media_kind: "".into(),
             file_id: "".into(),
             to_me: true,
-            owner: false,
         }
     }
 
@@ -2295,27 +2775,33 @@ mod tests {
         let mut photo = mk_batch_msg(1, "подпись [photo]");
         photo.media_kind = "photo".into();
         photo.media_path = "/s/media/p.jpg".into();
-        let rendered = format_batch(&[photo], &HashMap::new());
+        let rendered = crate::context::render_batch(&[photo], &HashMap::new());
         assert!(rendered.contains("[photo]"), "got: {rendered}");
-        assert!(rendered.contains("[file] /s/media/p.jpg"), "got: {rendered}");
+        assert!(
+            rendered.contains("[file] /s/media/p.jpg"),
+            "got: {rendered}"
+        );
 
         let mut gif = mk_batch_msg(2, "[gif]");
         gif.media_kind = "animation".into();
         gif.media_path = "/s/media/a_frame.jpg".into();
-        assert!(format_batch(&[gif], &HashMap::new()).contains("[gif]"));
+        assert!(crate::context::render_batch(&[gif], &HashMap::new()).contains("[gif]"));
 
         let mut video = mk_batch_msg(3, "[video]");
         video.media_kind = "video".into();
         video.media_path = "/s/media/v_frame.jpg".into();
-        assert!(format_batch(&[video], &HashMap::new()).contains("[video]"));
+        assert!(crate::context::render_batch(&[video], &HashMap::new()).contains("[video]"));
 
         // A sticker has no caption and no media file: its file_id must be in
         // the rendered line, otherwise the model cannot re-send it.
         let mut sticker = mk_batch_msg(4, "[sticker]");
         sticker.media_kind = "sticker".into();
         sticker.file_id = "sticker_fid_1".into();
-        let s = format_batch(&[sticker], &HashMap::new());
-        assert!(s.contains("[sticker]") && s.contains("file_id=sticker_fid_1"), "got: {s}");
+        let s = crate::context::render_batch(&[sticker], &HashMap::new());
+        assert!(
+            s.contains("[sticker]") && s.contains("file_id=sticker_fid_1"),
+            "got: {s}"
+        );
     }
 
     #[test]
@@ -2337,33 +2823,13 @@ mod tests {
             assert!(obj.get("file_id").is_some(), "{key} lost its file_id");
         }
         // A photo arrives as an array: the last (largest) size wins.
-        let (_, biggest) = pick_media(&json!({"photo": [{"file_id": "small"}, {"file_id": "big"}]})).unwrap();
+        let (_, biggest) =
+            pick_media(&json!({"photo": [{"file_id": "small"}, {"file_id": "big"}]})).unwrap();
         assert_eq!(biggest.get("file_id").and_then(|v| v.as_str()), Some("big"));
     }
 
-    #[test]
-    fn format_batch_marks_owner() {
-        let mut m = mk_batch_msg(5, "слушай");
-        m.owner = true;
-        let s = format_batch(&[m], &HashMap::new());
-        assert!(s.contains("[владелец] слушай"), "got: {s}");
-    }
-
-    #[test]
-    fn is_owner_matrix() {
-        std::env::set_var("CHATBOT_OWNER_USERNAME", "dungeonmastergui");
-        std::env::set_var("CHATBOT_OWNER_ID", "777");
-        assert!(is_owner("dungeonmastergui", Some(1)));
-        assert!(is_owner("DungeonMasterGui", Some(1)));
-        assert!(is_owner("", Some(777)));
-        assert!(!is_owner("someone", Some(778)));
-        assert!(!is_owner("someone", None));
-        assert!(!is_owner("", None));
-        std::env::remove_var("CHATBOT_OWNER_USERNAME");
-        std::env::remove_var("CHATBOT_OWNER_ID");
-    }
-
     fn seed_qa(state: &str) -> Connection {
+        std::env::set_var("CHATBOT_CHAT_ID", "-100");
         let con = db(state).unwrap();
         kv_set(&con, "self_id", "42").unwrap();
         kv_set(&con, "self_username", "bot").unwrap();
@@ -2407,117 +2873,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let state = dir.to_string_lossy().to_string();
         let con = seed_qa(&state);
-        let batch = vec![mk_batch_msg(100, "старый вопрос"), mk_batch_msg(101, "новый вопрос")];
-        let (text, _sig, ids, _tome, _owners, _anchor) = build_batch_text(&state, &con, &batch).unwrap();
+        let batch = vec![
+            mk_batch_msg(100, "старый вопрос"),
+            mk_batch_msg(101, "новый вопрос"),
+        ];
+        let (text, _sig, ids, _tome, _anchor) = build_batch_text(&state, &con, &batch).unwrap();
         assert_eq!(ids, vec![101]);
-        assert!(text.contains("[100]") && text.contains("уже отвечено"), "got: {text}");
+        assert!(
+            text.contains("[100]") && text.contains("уже отвечено"),
+            "got: {text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn regen_closes_fully_answered_batch() {
+    fn regen_drops_a_fully_answered_batch() {
         let dir = std::env::temp_dir().join(format!("chat-rc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let state = dir.to_string_lossy().to_string();
         let con = seed_qa(&state);
-        kv_set(&con, "pending_batch_ids:s1", "[100]").unwrap();
-        kv_set(&con, "pending_tome:s1", "[]").unwrap();
-        kv_set(&con, "pending_window:s1", "?").unwrap();
-        save_pending(&con, &["s1".to_string()]).unwrap();
+        // The batch identity now lives in the journal; a fully answered set is
+        // dropped from the regenerated text instead of being re-asked.
+        con.execute(
+            "INSERT INTO batches(batch_key,chat_id,state,sealed_at,updated_at,message_ids) VALUES('s1',0,'queued',0,0,'[100]')",
+            [],
+        )
+        .unwrap();
         let regen = regen_text(&state, &con, "s1").unwrap();
         assert!(regen.is_none());
-        assert!(done_ids(&con).contains("s1"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn gif_registry_dedupes_limits_and_orders() {
-        let dir = std::env::temp_dir().join(format!("chat-gif-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let state = dir.to_string_lossy().to_string();
-        let con = db(&state).unwrap();
-        fn ins_with_reply(
-            con: &Connection,
-            uid: i64,
-            mid: i64,
-            date: i64,
-            fid: &str,
-            fu: &str,
-            text: &str,
-            reply: Option<i64>,
-            kind: &str,
-        ) {
-            let kind: Option<&str> = if kind.is_empty() { None } else { Some(kind) };
-            con.execute(
-                "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind) VALUES (?,?,?,7,'u','U',?,?,'',?,?,?)",
-                params![uid, mid, date, text, reply, fid, fu, kind],
-            )
-            .unwrap();
-        }
-        let ins = |uid: i64, mid: i64, date: i64, fid: &str, fu: &str, text: &str, kind: &str| {
-            ins_with_reply(&con, uid, mid, date, fid, fu, text, None, kind);
-        };
-        // Same unique id twice: one row, freshest caption wins.
-        ins(1, 500, 900, "", "", "про кота", "");
-        ins(2, 501, 1000, "fid_a_old", "uniq_a", "старая подпись", "animation");
-        ins(3, 502, 2000, "fid_a_new", "uniq_a", "новая подпись", "animation");
-        // Historical rows without file_unique_id dedupe by file_id.
-        ins(4, 903, 9170, "fid_b", "", "", "animation");
-        ins(5, 904, 9240, "fid_b", "", "повтор с тем же file_id", "animation");
-        ins(6, 905, 9190, "fid_c", "uniq_c", "третья гифка", "animation");
-        // A gif that answered a message: its context is that message's text.
-        ins_with_reply(&con, 7, 906, 9300, "fid_d", "uniq_d", "гифка в ответ на кота", Some(500), "animation");
-        // NOT gifs, whatever file_id they carry: video, sticker, document,
-        // and a historic row whose kind is unknown.
-        ins(8, 907, 9400, "fid_video", "uniq_v", "видео", "video");
-        ins(9, 908, 9410, "fid_sticker", "uniq_s", "стикер", "sticker");
-        ins(10, 909, 9420, "fid_doc", "uniq_doc", "документ", "document");
-        ins(11, 910, 9430, "fid_legacy", "uniq_l", "старая строка без типа", "");
-
-        let all = gif_registry(&con, 0, 20).unwrap();
-        assert_eq!(all.len(), 4, "non-animations leaked into the registry: {all:?}");
-        assert_eq!(all[0].file_id, "fid_d", "newest first");
-        assert_eq!(all[0].context, "про кота", "reply text is the moment: {all:?}");
-        assert_eq!(all[1].file_id, "fid_b");
-        assert_eq!(all[1].text, "повтор с тем же file_id");
-        assert_eq!(all[1].context, "третья гифка", "previous message is the fallback moment");
-        assert_eq!(all[2].file_id, "fid_c");
-        assert_eq!(all[2].context, "новая подпись");
-        assert_eq!(all[3].file_id, "fid_a_new");
-        assert_eq!(all[3].text, "новая подпись", "freshest caption of the group wins");
-        assert_eq!(all[3].context, "старая подпись");
-        assert_eq!(all[0].idx, 1);
-        assert_eq!(all[3].idx, 4);
-
-        let two = gif_registry(&con, 0, 2).unwrap();
-        assert_eq!(two.len(), 2);
-        assert_eq!(two[1].file_id, "fid_b");
-        let page = gif_registry(&con, 2, 2).unwrap();
-        assert_eq!(page.len(), 2);
-        assert_eq!(page[0].file_id, "fid_c");
-        assert_eq!(page[0].idx, 3);
-
-        let cat = gif_catalog(&con, 2).unwrap();
-        assert_eq!(cat.matches("[gif:").count(), 2);
-        assert!(cat.contains("«третья гифка»"), "captions are shown: {cat}");
-        assert!(cat.contains("момент: «"), "moment hint is shown: {cat}");
-        let list = gif_list_text(&gif_registry(&con, 0, 200).unwrap(), gif_count(&con).unwrap());
-        assert_eq!(list.matches("[gif:").count(), 4);
-        assert!(list.contains("4 из 4"));
-        assert_eq!(gif_count(&con).unwrap(), 4);
-        for not_a_gif in ["fid_video", "fid_sticker", "fid_doc", "fid_legacy"] {
-            assert!(!list.contains(not_a_gif), "{not_a_gif} leaked: {list}");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn gif_catalog_empty_is_silent() {
-        let dir = std::env::temp_dir().join(format!("chat-gif0-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let state = dir.to_string_lossy().to_string();
-        let con = db(&state).unwrap();
-        assert_eq!(gif_catalog(&con, 20).unwrap(), "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2545,10 +2928,312 @@ mod tests {
         assert!(frame_for(&a, "abc123"));
         assert!(frame_for(&b, "abc123"));
         assert!(frame_for("abc123", "abc123"), "a plain sig still matches");
-        assert!(!frame_for(&a, "abc12"), "a prefix of the sig is not the batch");
-        assert!(!frame_for("abc123#x", "abc123"), "a non-numeric suffix is no frame");
+        assert!(
+            !frame_for(&a, "abc12"),
+            "a prefix of the sig is not the batch"
+        );
+        assert!(
+            !frame_for("abc123#x", "abc123"),
+            "a non-numeric suffix is no frame"
+        );
         assert_eq!(sig_of_frame(&a), "abc123");
         assert_eq!(sig_of_frame("abc123"), "abc123");
         assert_eq!(sig_of_frame("abc#7#2"), "abc#7");
+    }
+
+    /// The lock is exclusive for the process lifetime: a second open+flock on
+    /// the same state file is refused with a message naming the state, and the
+    /// lock is released when the first handle drops.
+    #[test]
+    fn second_state_lock_is_refused_with_clear_message() {
+        let dir = std::env::temp_dir().join(format!("chat-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.to_string_lossy().to_string();
+        let first = acquire_state_lock(&state).unwrap();
+        let err = acquire_state_lock(&state).unwrap_err();
+        assert!(
+            err.to_string().contains("another chatd instance"),
+            "unclear second-instance error: {err}"
+        );
+        drop(first);
+        assert!(acquire_state_lock(&state).is_ok(), "lock was not released");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- data layer cycle 1 ----------
+
+    fn envelope(chat: i64, message: i64, update_id: i64, text: &str) -> Envelope {
+        Envelope {
+            key: MessageKey {
+                chat,
+                message: MessageId(message),
+            },
+            update_id,
+            date: 1_700_000_000 + update_id,
+            user_id: Some(7),
+            username: "u".into(),
+            first_name: "U".into(),
+            text: text.into(),
+            reply_to: None,
+            thread_id: None,
+            media_path: String::new(),
+            file_id: String::new(),
+            file_unique_id: String::new(),
+            media_kind: String::new(),
+            media_state: MediaState::Absent,
+            media_size: None,
+            source_chat: None,
+            sender_chat: None,
+            cross: false,
+        }
+    }
+
+    fn temp_db(tag: &str) -> (String, Connection) {
+        let dir = std::env::temp_dir().join(format!("chat-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.to_string_lossy().to_string();
+        let con = db(&state).unwrap();
+        (state, con)
+    }
+
+    /// The identity is (chat_id, message_id): a redelivery under a NEW
+    /// update_id is a duplicate, not a second row, and the cursor still moves.
+    #[test]
+    fn commit_page_redelivery_with_new_update_id_is_duplicate() {
+        let (state, mut con) = temp_db("cp-conflict");
+        kv_set(&con, "offset", "10").unwrap();
+        {
+            let mut tx = crate::db::WriteTxn::new(&mut con).unwrap();
+            let page = tx
+                .commit_page(
+                    vec![
+                        envelope(-100, 100, 11, "first"),
+                        envelope(-100, 101, 12, "second"),
+                    ],
+                    12,
+                )
+                .unwrap();
+            assert_eq!(page.applied.inserted, 2);
+            tx.commit().unwrap();
+        }
+        assert_eq!(kv_get(&con, "offset", "0"), "12");
+
+        let page = {
+            let mut tx = crate::db::WriteTxn::new(&mut con).unwrap();
+            let page = tx
+                .commit_page(
+                    vec![
+                        envelope(-100, 101, 13, "duplicate key"),
+                        envelope(-100, 102, 14, "new row"),
+                    ],
+                    14,
+                )
+                .unwrap();
+            tx.commit().unwrap();
+            page
+        };
+        assert_eq!(page.applied.inserted, 1);
+        assert_eq!(page.applied.duplicate, 1);
+        assert_eq!(kv_get(&con, "offset", "0"), "14");
+        let rows: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE message_id IN (101,102)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2, "the redelivered key must not create a second row");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A genuine INSERT failure (not a UNIQUE conflict) also leaves the cursor
+    /// and every row of the page untouched.
+    #[test]
+    fn commit_page_insert_error_keeps_offset() {
+        let (state, mut con) = temp_db("cp-error");
+        kv_set(&con, "offset", "5").unwrap();
+        con.execute_batch(
+            "CREATE TRIGGER force_insert_failure BEFORE INSERT ON messages
+             WHEN NEW.message_id = 999
+             BEGIN SELECT RAISE(ABORT, 'forced insert failure'); END;",
+        )
+        .unwrap();
+        let err = {
+            let mut tx = crate::db::WriteTxn::new(&mut con).unwrap();
+            tx.commit_page(
+                vec![
+                    envelope(-100, 998, 6, "would be written"),
+                    envelope(-100, 999, 7, "forced to fail"),
+                ],
+                7,
+            )
+            .unwrap_err()
+        };
+        assert!(
+            format!("{err:#}").contains("forced insert failure"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(kv_get(&con, "offset", "0"), "5");
+        let rows: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE message_id IN (998,999)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "partial page survived the failed INSERT");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// v2 backfills the configured chat id; a fabricated id-space collision
+    /// rolls the whole step back and reports the number of conflicting rows.
+    #[test]
+    fn migration_v2_backfills_and_rolls_back_on_collision() {
+        let dir = std::env::temp_dir().join(format!("chat-mig2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = |name: &str| -> Connection {
+            let con = Connection::open(dir.join(name)).unwrap();
+            con.execute_batch(
+                "CREATE TABLE messages(
+                   id INTEGER PRIMARY KEY,
+                   chat_id INTEGER,
+                   message_id INTEGER,
+                   text TEXT
+                 );
+                 CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT);",
+            )
+            .unwrap();
+            con.pragma_update(None, "user_version", 1).unwrap();
+            con
+        };
+
+        // Happy path: every old row gets the configured chat id.
+        let mut con = legacy("ok.db");
+        con.execute_batch(
+            "INSERT INTO messages(chat_id,message_id,text) VALUES
+               (NULL,100,'a'),(NULL,101,'b');
+             INSERT INTO kv(k,v) VALUES('chat_id','-100');",
+        )
+        .unwrap();
+        migrate_v2(&mut con).unwrap();
+        let filled: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE chat_id=-100 AND message_id IN (100,101)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(filled, 2);
+        let v: i64 = con
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 2);
+        drop(con);
+
+        // Collision: two rows claim the same message_id. Nothing changes and
+        // the error states how many rows are involved.
+        let mut con = legacy("collision.db");
+        con.execute_batch(
+            "INSERT INTO messages(chat_id,message_id,text) VALUES
+               (NULL,200,'a'),(NULL,200,'b'),(NULL,201,'c');
+             INSERT INTO kv(k,v) VALUES('chat_id','-100');",
+        )
+        .unwrap();
+        let err = migrate_v2(&mut con).unwrap_err();
+        assert!(
+            err.to_string().contains("2 rows"),
+            "error must state the conflicting row count: {err}"
+        );
+        let still_null: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE chat_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_null, 3, "v2 changed rows despite rolling back");
+        let v: i64 = con
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 1, "v2 advanced user_version although it failed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Full v1..v6 on a legacy file: surrogate id, backfilled chat id, FTS on
+    /// the new rowid, two-phase media columns, no UNIQUE on update_id, and a
+    /// second run is a no-op.
+    #[test]
+    fn migrations_v1_to_v6_are_idempotent() {
+        let dir = std::env::temp_dir().join(format!("chat-mig-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut con = Connection::open(dir.join("history.db")).unwrap();
+        con.execute_batch(SCHEMA).unwrap();
+        con.execute(
+            "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id)
+             VALUES(1,77,1000,7,'u','U','привет мир',NULL,'','')",
+            [],
+        )
+        .unwrap();
+        con.execute_batch("INSERT INTO kv(k,v) VALUES('chat_id','-100');")
+            .unwrap();
+        migrate(&mut con).unwrap();
+        migrate(&mut con).unwrap();
+        let v: i64 = con
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 6);
+        let (id, chat): (i64, i64) = con
+            .query_row(
+                "SELECT id,chat_id FROM messages WHERE update_id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(chat, -100);
+        let found: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'привет'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, 1, "FTS lost the migrated row");
+        con.execute("UPDATE messages SET text='прощай мир' WHERE id=?", [id])
+            .unwrap();
+        let old: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'привет'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let new: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'прощай'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((old, new), (0, 1), "update trigger left a stale FTS row");
+        con.execute("DELETE FROM messages WHERE id=?", [id])
+            .unwrap();
+        let gone: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'прощай'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, 0, "delete trigger left an FTS row");
+        // update_id is a cursor, not an identity: the same value may appear
+        // on two different messages without a UNIQUE conflict.
+        con.execute(
+            "INSERT INTO messages(chat_id,update_id,message_id,date,text) VALUES(-100,1,78,1001,'second')",
+            [],
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

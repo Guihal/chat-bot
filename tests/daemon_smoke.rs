@@ -8,8 +8,8 @@
 //!  2. a control call is answered promptly while ANOTHER process holds a write
 //!     transaction on the same database and the socket keeps working afterwards;
 //!  3. ingest still writes: an update fetched from Telegram ends up in
-//!     `messages` with its own message_id/text, and a second copy inside the
-//!     120-second window is dropped by the dedup contract instead of doubling.
+//!     `messages` with its own message_id/text, a distinct message_id with the
+//!     same words is a second row, and a redelivered id stays one row.
 //!
 //! The daemon shells out to `omo`; the test puts a stub `omo` first in PATH so
 //! nothing touches a real agent host.
@@ -66,9 +66,25 @@ fn serve(mut stream: TcpStream, queue: Arc<Mutex<Vec<Value>>>) {
     }
     let mut body = vec![0u8; content_len];
     let _ = reader.read_exact(&mut body);
-    let path = request_line.split_whitespace().nth(1).unwrap_or("/").to_string();
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_string();
+    if path.contains("/file/bot") {
+        let bytes = b"smoke-photo-bytes";
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        );
+        let _ = stream.write_all(bytes);
+        return;
+    }
     let payload = if path.ends_with("/getMe") {
         json!({"ok": true, "result": {"id": 550001, "is_bot": true, "first_name": "Smoke", "username": "smokebot"}})
+    } else if path.ends_with("/getFile") {
+        json!({"ok": true, "result": {"file_path": "photos/smoke_photo.jpg"}})
     } else if path.ends_with("/getUpdates") {
         let drained: Vec<Value> = {
             let mut q = queue.lock().unwrap();
@@ -80,7 +96,9 @@ fn serve(mut stream: TcpStream, queue: Arc<Mutex<Vec<Value>>>) {
         }
         json!({"ok": true, "result": drained})
     } else {
-        json!({"ok": true, "result": {}})
+        // Every Bot API send method reports a message id, so the daemon's
+        // receipt transaction has the coordinate it must persist.
+        json!({"ok": true, "result": {"message_id": 551001}})
     };
     let body = payload.to_string();
     let _ = write!(
@@ -96,6 +114,7 @@ struct Daemon {
     dir: PathBuf,
     state: String,
     sock: PathBuf,
+    tool_sock: PathBuf,
 }
 
 impl Drop for Daemon {
@@ -118,18 +137,19 @@ fn write_stub_omo(dir: &Path) -> std::io::Result<()> {
 }
 
 fn seed_mirror(state: &str) {
+    std::env::set_var("CHATBOT_CHAT_ID", "-100");
     let con = db(state).unwrap();
     kv_set(&con, "self_id", "550001").unwrap();
     kv_set(&con, "self_username", "smokebot").unwrap();
     con.execute(
-        "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind) VALUES(7,4800,1700000000,556,'smoker','Smoke','seeded gif caption',NULL,'','gif_seed_file','gif_seed_unique','animation')",
+        "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind,media_state,media_size) VALUES(7,4800,1700000000,556,'smoker','Smoke','seeded gif caption',NULL,'','gif_seed_file','gif_seed_unique','animation','ready',4096)",
         [],
     )
     .unwrap();
     // Same shape, different Telegram kind: a video with a file_id must never
     // reach the gif catalog (crystal M1: gifs and videos are not the same).
     con.execute(
-        "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind) VALUES(8,4801,1700000100,556,'smoker','Smoke','seeded video caption',NULL,'','video_seed_file','video_seed_unique','video')",
+        "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind,media_state,media_size) VALUES(8,4801,1700000100,556,'smoker','Smoke','seeded video caption',NULL,'','video_seed_file','video_seed_unique','video','ready',4096)",
         [],
     )
     .unwrap();
@@ -179,6 +199,7 @@ fn start_daemon(api_base: &str) -> Daemon {
     Daemon {
         child,
         sock: control_sock_path(&state),
+        tool_sock: tool_socket_path(&state),
         dir,
         state,
     }
@@ -205,7 +226,9 @@ fn call_control(sock: &Path, op: &str, args: Value) -> (Value, Duration) {
         }
         stream.unwrap_or_else(|| panic!("connect control socket: {last_err:?}"))
     };
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
     let frame = json!({"call": {"id": "t1", "op": op, "args": args}});
@@ -233,9 +256,37 @@ fn wait_ready(daemon: &Daemon) {
     panic!("daemon did not open {} in time", daemon.sock.display());
 }
 
+/// One request/response on the daemon's tool socket (the path that replaced
+/// every direct Bot API call in tg-chat).
+fn call_tool(sock: &Path, op: &str, args: Value) -> Value {
+    let stream = {
+        let mut stream = None;
+        for _ in 0..60 {
+            match UnixStream::connect(sock) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        stream.unwrap_or_else(|| panic!("connect tool socket {}", sock.display()))
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    writeln!(writer, "{}", json!({"op": op, "args": args})).unwrap();
+    writer.flush().unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    serde_json::from_str(line.trim()).expect("tool reply is json")
+}
+
 fn chatd_log_tail(daemon: &Daemon) -> String {
-    let body = std::fs::read_to_string(Path::new(&daemon.state).join("chatd.log"))
-        .unwrap_or_default();
+    let body =
+        std::fs::read_to_string(Path::new(&daemon.state).join("chatd.log")).unwrap_or_default();
     let tail: Vec<char> = body.chars().rev().take(2500).collect();
     tail.into_iter().rev().collect()
 }
@@ -257,11 +308,9 @@ fn open_control_stream(sock: &Path, wait: Duration) -> UnixStream {
 
 fn row_count_with_text(daemon: &Daemon, text: &str) -> i64 {
     let con = rusqlite::Connection::open(Path::new(&daemon.state).join("history.db")).unwrap();
-    con.query_row(
-        "SELECT COUNT(*) FROM messages WHERE text=?",
-        [text],
-        |r| r.get(0),
-    )
+    con.query_row("SELECT COUNT(*) FROM messages WHERE text=?", [text], |r| {
+        r.get(0)
+    })
     .unwrap()
 }
 
@@ -290,9 +339,56 @@ fn daemon_serves_control_calls_and_ingests() {
     let daemon = start_daemon(&api.base);
     wait_ready(&daemon);
 
+    // 0a. Media is fetched through the daemon's tool socket: the reply points
+    //     at real bytes, so tg-chat never needs the token or an HTTP client.
+    let reply = call_tool(
+        &daemon.tool_sock,
+        "get_media",
+        json!({"file_id": "smoke_photo"}),
+    );
+    assert_eq!(reply["ok"], json!(true), "tool reply: {reply}");
+    let payload: Value = serde_json::from_str(reply["text"].as_str().unwrap()).unwrap();
+    let path = payload["path"].as_str().unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(
+        bytes, b"smoke-photo-bytes",
+        "tool op returned no media bytes"
+    );
+    assert_eq!(payload["bytes"], json!(17));
+
+    // 0. Facts are published by the daemon itself: poll_ok_at comes from a
+    // real successful getUpdates, and health.json carries no verdict.
+    let health_path = Path::new(&daemon.state).join("health.json");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let health: Value = loop {
+        if let Ok(raw) = std::fs::read_to_string(&health_path) {
+            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                break v;
+            }
+        }
+        assert!(Instant::now() < deadline, "health.json was not published");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        health.get("poll_ok_at").and_then(|v| v.as_i64()).is_some(),
+        "health.json has no poll_ok_at: {health}"
+    );
+    assert!(
+        health.get("verdict").is_none(),
+        "health.json must contain facts, not a verdict: {health}"
+    );
+    assert!(
+        health.get("ingest").is_some(),
+        "ingest facts missing: {health}"
+    );
+
     // 1. Seeded rows come back through the control socket / DB actor.
     let (ret, elapsed) = call_control(&daemon.sock, "gif_list", json!({"limit": 10}));
-    assert_eq!(ret.get("ok").and_then(|v| v.as_bool()), Some(true), "frame: {ret}");
+    assert_eq!(
+        ret.get("ok").and_then(|v| v.as_bool()),
+        Some(true),
+        "frame: {ret}"
+    );
     let text = ret.get("text").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         text.contains("gif_seed_file") && text.contains("seeded gif caption"),
@@ -302,7 +398,10 @@ fn daemon_serves_control_calls_and_ingests() {
         !text.contains("video_seed_file") && !text.contains("seeded video caption"),
         "a video leaked into the gif registry: {text}"
     );
-    assert!(elapsed < Duration::from_secs(5), "gif_list took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "gif_list took {elapsed:?}"
+    );
 
     // 2. Another process holds the write lock: the control call must not hang,
     //    and the socket must still work straight after.
@@ -336,8 +435,9 @@ fn daemon_serves_control_calls_and_ingests() {
     assert!(wait_for_row(&daemon, 4811), "ingested row never appeared");
     assert_eq!(row_count_with_text(&daemon, "hello smoke"), 1);
 
-    // 3b. The same text inside the 120-second window, from the cross-chat path,
-    //     is dropped by the dedup contract instead of being stored twice.
+    // 3b. Identity is (chat_id, message_id) ONLY. A different message_id with
+    //     the same author/date/text is a second real Telegram message and must
+    //     persist as its own row, not be dropped by a content window.
     api.queue.lock().unwrap().push(json!({
         "update_id": 9201,
         "channel_post": {
@@ -347,21 +447,91 @@ fn daemon_serves_control_calls_and_ingests() {
             "text": "hello smoke"
         }
     }));
-    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(
+        wait_for_row(&daemon, 4888),
+        "identical-text message with a new message_id was dropped"
+    );
+    assert_eq!(
+        row_count_with_text(&daemon, "hello smoke"),
+        2,
+        "content-based dedupe still collapses distinct message ids"
+    );
+    // 3b'. The SAME message_id redelivered under a new update cursor is one
+    //      identity, so it must not create a third row.
+    api.queue.lock().unwrap().push(json!({
+        "update_id": 9401,
+        "message": {
+            "message_id": 4811,
+            "date": now,
+            "chat": {"id": -100},
+            "from": {"id": 557, "username": "smoker", "first_name": "Smoke"},
+            "text": "hello smoke"
+        }
+    }));
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(
+        row_count_with_text(&daemon, "hello smoke"),
+        2,
+        "a redelivered message_id minted a second row"
+    );
+
+    // 3c. A photo is ingested in the pending state and the fetcher finalizes
+    //     it: path, kind and size land in `blobs`, and the row becomes ready.
+    api.queue.lock().unwrap().push(json!({
+        "update_id": 9500,
+        "message": {
+            "message_id": 4812,
+            "date": now,
+            "chat": {"id": -100},
+            "from": {"id": 557, "username": "smoker", "first_name": "Smoke"},
+            "photo": [{"file_id": "smoke_photo", "file_unique_id": "smoke_photo_u", "file_size": 17}]
+        }
+    }));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut ready = false;
     while Instant::now() < deadline {
-        let ingested: i64 = rusqlite::Connection::open(Path::new(&daemon.state).join("history.db"))
-            .and_then(|c| c.query_row("SELECT COUNT(*) FROM messages WHERE message_id=4888", [], |r| r.get(0)))
-            .unwrap_or(0);
-        if ingested == 0 && row_count_with_text(&daemon, "hello smoke") == 1 {
+        let con = rusqlite::Connection::open(Path::new(&daemon.state).join("history.db")).unwrap();
+        let state: Option<String> = con
+            .query_row(
+                "SELECT media_state FROM messages WHERE message_id=4812",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if state.as_deref() == Some("ready") {
+            ready = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(
-        row_count_with_text(&daemon, "hello smoke"),
-        1,
-        "120-second dedup window no longer collapses the duplicate"
+    let row: Option<(Option<String>, Option<String>, Option<i64>)> =
+        rusqlite::Connection::open(Path::new(&daemon.state).join("history.db"))
+            .ok()
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT media_state,file_id,media_size FROM messages WHERE message_id=4812",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok()
+            });
+    assert!(
+        ready,
+        "photo never reached the ready state (row={row:?}): {}",
+        chatd_log_tail(&daemon)
+    );
+    let con = rusqlite::Connection::open(Path::new(&daemon.state).join("history.db")).unwrap();
+    let (kind, size, path): (String, i64, String) = con
+        .query_row(
+            "SELECT b.kind, b.size, b.path FROM messages m JOIN blobs b ON b.id=m.blob_id WHERE m.message_id=4812",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((kind.as_str(), size), ("photo", 17));
+    assert!(
+        Path::new(&path).exists(),
+        "finalized media file is missing: {path}"
     );
 }
 
@@ -453,5 +623,105 @@ fn push_frame_carries_batch_ids_and_reply_parent() {
         text.contains("(ответ на [4900] @smoker: «родительский текст»)"),
         "reply parent not rendered one hop deep: {text}"
     );
-    assert!(text.contains("ответ на него"), "incoming text missing: {text}");
+    assert!(
+        text.contains("ответ на него"),
+        "incoming text missing: {text}"
+    );
+}
+
+/// Live RPC path: the extension sends `chat_send` over the control socket, the
+/// daemon answers the Bot API and closes the journal batch. This is the one
+/// seam unit tests cannot prove: socket frame -> send -> receipt -> mirror.
+#[test]
+fn chat_send_rpc_closes_the_journal_batch() {
+    let api = start_fake_api();
+    let daemon = start_daemon(&api.base);
+    wait_ready(&daemon);
+    let stream = open_control_stream(&daemon.sock, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    std::fs::write(
+        Path::new(&daemon.state).join("events.jsonl"),
+        "{\"kind\":\"turn_end\"}\n",
+    )
+    .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    api.queue.lock().unwrap().push(json!({
+        "update_id": 9311,
+        "message": {
+            "message_id": 4920,
+            "date": now,
+            "chat": {"id": -100},
+            "from": {"id": 557, "username": "smoker", "first_name": "Smoke"},
+            "text": "живой вопрос"
+        }
+    }));
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let push = loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            panic!("control socket closed; log: {}", chatd_log_tail(&daemon));
+        }
+        let v: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+        if let Some(p) = v.get("push") {
+            break p.clone();
+        }
+    };
+    let delivery = push
+        .get("delivery_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let key = delivery.split('#').next().unwrap_or("").to_string();
+    writeln!(
+        stream.try_clone().unwrap(),
+        "{}",
+        json!({"result": {"delivery_id": delivery, "kind": "steered"}})
+    )
+    .unwrap();
+    let reply = json!({
+        "call": {
+            "id": "send-1",
+            "op": "chat_send",
+            "args": {"batch_key": key, "text": "живой ответ"}
+        }
+    });
+    writeln!(stream.try_clone().unwrap(), "{reply}").unwrap();
+    let ret = loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            panic!(
+                "control socket closed before return; log: {}",
+                chatd_log_tail(&daemon)
+            );
+        }
+        let v: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+        if let Some(r) = v.get("return") {
+            break r.clone();
+        }
+    };
+    assert_eq!(ret.get("ok").and_then(|v| v.as_bool()), Some(true), "{ret}");
+    let text = ret.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(text.contains("message_id"), "{text}");
+    let con = rusqlite::Connection::open(Path::new(&daemon.state).join("history.db")).unwrap();
+    let (state, outcome): (String, Option<String>) = con
+        .query_row(
+            "SELECT state, outcome FROM batches WHERE batch_key=?",
+            [&key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (state.as_str(), outcome.as_deref()),
+        ("closed", Some("delivered"))
+    );
+    let sent: i64 = con
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE text='живой ответ' AND username='smokebot'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(sent, 1, "mirror row missing after RPC send");
 }

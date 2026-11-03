@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use chat_bot::*;
 use serde_json::{json, Value};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::time::Duration;
 
 fn mcp_state_dir() -> String {
     // Same rule as the daemon: the only fallback is ./state, so a clone never
@@ -41,7 +42,11 @@ fn load_portrait(name: &str) -> Option<(String, String)> {
         return None;
     }
     let d = portraits_dir();
-    let files: Vec<String> = std::fs::read_dir(&d).ok()?.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+    let files: Vec<String> = std::fs::read_dir(&d)
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
     let mut lower: std::collections::HashMap<String, String> = Default::default();
     for f in &files {
         lower.insert(f.to_lowercase(), f.clone());
@@ -68,7 +73,8 @@ fn tool_history(args: &Value) -> String {
         Ok(c) => c,
         Err(e) => return json!({"error": e.to_string()}).to_string(),
     };
-    let mut q = "SELECT message_id, username, first_name, text, reply_to, media_path FROM messages".to_string();
+    let mut q = "SELECT message_id, username, first_name, text, reply_to, media_path FROM messages"
+        .to_string();
     let mut params: Vec<Value> = vec![];
     if let Some(b) = args.get("before").and_then(|v| v.as_i64()) {
         q.push_str(" WHERE update_id < ?");
@@ -81,7 +87,10 @@ fn tool_history(args: &Value) -> String {
         Ok(s) => s,
         Err(e) => return json!({"error": e.to_string()}).to_string(),
     };
-    let p: Vec<Box<dyn rusqlite::ToSql>> = params.iter().map(|v| Box::new(v.as_i64().unwrap_or(0)) as Box<dyn rusqlite::ToSql>).collect();
+    let p: Vec<Box<dyn rusqlite::ToSql>> = params
+        .iter()
+        .map(|v| Box::new(v.as_i64().unwrap_or(0)) as Box<dyn rusqlite::ToSql>)
+        .collect();
     let refs: Vec<&dyn rusqlite::ToSql> = p.iter().map(|b| b.as_ref()).collect();
     let rows: Vec<Value> = stmt
         .query_map(refs.as_slice(), |r| {
@@ -108,7 +117,7 @@ fn tool_search(args: &Value) -> String {
     };
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
-    let sql = "SELECT m.message_id, m.username, m.text FROM messages_fts f JOIN messages m ON m.update_id = f.rowid WHERE messages_fts MATCH ? LIMIT ?";
+    let sql = "SELECT m.message_id, m.username, m.text FROM messages_fts f JOIN messages m ON m.id = f.rowid WHERE messages_fts MATCH ? LIMIT ?";
     let run = |q: &str| -> Result<Vec<Value>> {
         let mut stmt = con.prepare(sql)?;
         let rows: Vec<Value> = stmt
@@ -137,12 +146,45 @@ fn tool_search(args: &Value) -> String {
     serde_json::to_string(&trimmed).unwrap_or_default()
 }
 
-async fn tool_get_media(args: &Value) -> String {
+fn tool_get_media(args: &Value) -> String {
     let fid = args.get("file_id").and_then(|v| v.as_str()).unwrap_or("");
-    let state = mcp_state_dir();
-    match download_media(fid, &state, "").await {
-        Ok(p) => json!({"path": p}).to_string(),
+    match daemon_tool("get_media", &json!({"file_id": fid})) {
+        Ok(text) => text,
         Err(e) => json!({"error": e.to_string()}).to_string(),
+    }
+}
+
+/// Every Bot API/media operation belongs to the daemon: this process only asks
+/// over its tool socket and never reads the token or builds a Telegram URL.
+fn daemon_tool(op: &str, args: &Value) -> Result<String> {
+    let state = mcp_state_dir();
+    let sock = tool_socket_path(&state);
+    let stream = std::os::unix::net::UnixStream::connect(&sock).with_context(|| {
+        format!(
+            "daemon tool socket {} is unavailable (is chatd running?)",
+            sock.display()
+        )
+    })?;
+    stream.set_read_timeout(Some(Duration::from_secs(180)))?;
+    let mut writer = stream.try_clone()?;
+    writeln!(writer, "{}", json!({"op": op, "args": args}))?;
+    writer.flush()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let v: Value = serde_json::from_str(line.trim())?;
+    if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
+        Ok(v.get("text")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string())
+    } else {
+        Err(anyhow!(
+            "{}",
+            v.get("error")
+                .and_then(|x| x.as_str())
+                .unwrap_or("tool call failed")
+        ))
     }
 }
 
@@ -156,7 +198,11 @@ fn tool_chatter_brief(args: &Value) -> String {
         Ok(c) => c,
         Err(e) => return json!({"error": e.to_string()}).to_string(),
     };
-    let at = if name.starts_with('@') { name.clone() } else { format!("@{name}") };
+    let at = if name.starts_with('@') {
+        name.clone()
+    } else {
+        format!("@{name}")
+    };
     let row: (i64, Option<i64>, Option<i64>) = con
         .query_row(
             "SELECT COUNT(*), MIN(date), MAX(date) FROM messages WHERE username = ? COLLATE NOCASE OR first_name = ? COLLATE NOCASE OR ('@' || username) = ? COLLATE NOCASE",
@@ -168,13 +214,25 @@ fn tool_chatter_brief(args: &Value) -> String {
         .prepare("SELECT text FROM messages WHERE (username = ? COLLATE NOCASE OR first_name = ? COLLATE NOCASE) AND text <> '' ORDER BY update_id DESC LIMIT 3")
         .unwrap();
     let samples: Vec<String> = stmt
-        .query_map(rusqlite::params![name, name], |r| r.get::<_, Option<String>>(0))
-        .map(|it| it.flatten().flatten().map(|s| s.chars().take(200).collect()).collect())
+        .query_map(rusqlite::params![name, name], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .map(|it| {
+            it.flatten()
+                .flatten()
+                .map(|s| s.chars().take(200).collect())
+                .collect()
+        })
         .unwrap_or_default();
     let mut lines = vec![format!("@{name} — {} messages in mirror", row.0)];
     if let Some((f, text)) = load_portrait(&name) {
         lines.push(format!("portrait ({f}):"));
-        lines.extend(text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).take(4));
+        lines.extend(
+            text.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .take(4),
+        );
     } else {
         lines.push("no portrait on file".to_string());
     }
@@ -205,27 +263,50 @@ fn tool_chat_stats() -> String {
     };
     let myself: i64 = kv_get(&con, "self_id", "0").parse().unwrap_or(0);
     let excl = format!("WHERE user_id IS NULL OR user_id != {myself}");
-    let total: i64 = con.query_row(&format!("SELECT COUNT(*) FROM messages {excl}"), [], |r| r.get(0)).unwrap_or(0);
+    let total: i64 = con
+        .query_row(&format!("SELECT COUNT(*) FROM messages {excl}"), [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
     let media: i64 = con
         .query_row(&format!("SELECT COUNT(*) FROM messages WHERE media_path <> '' AND (user_id IS NULL OR user_id != {myself})"), [], |r| r.get(0))
         .unwrap_or(0);
-    let bounds: (Option<i64>, Option<i64>) = con.query_row(&format!("SELECT MIN(date), MAX(date) FROM messages {excl}"), [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap_or((None, None));
+    let bounds: (Option<i64>, Option<i64>) = con
+        .query_row(
+            &format!("SELECT MIN(date), MAX(date) FROM messages {excl}"),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((None, None));
     let mut stmt = con.prepare(&format!("SELECT COALESCE(NULLIF(username, ''), first_name, CAST(user_id AS TEXT)), COUNT(*) FROM messages {excl} GROUP BY 1 ORDER BY 2 DESC LIMIT 10")).unwrap();
-    let top: Vec<(Option<String>, i64)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map(|it| it.flatten().collect()).unwrap_or_default();
+    let top: Vec<(Option<String>, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map(|it| it.flatten().collect())
+        .unwrap_or_default();
     let days_rows: Vec<Option<i64>> = {
         let mut s = con.prepare(&format!("SELECT date FROM messages WHERE date > 0 AND (user_id IS NULL OR user_id != {myself})")).unwrap();
-        s.query_map([], |r| r.get(0)).map(|it| it.flatten().collect()).unwrap_or_default()
+        s.query_map([], |r| r.get(0))
+            .map(|it| it.flatten().collect())
+            .unwrap_or_default()
     };
     let mut days: std::collections::HashMap<String, i64> = Default::default();
     for ts in days_rows.into_iter().flatten() {
-        let d = chrono::DateTime::from_timestamp(ts, 0).map(|t| t.format("%Y-%m-%d").to_string()).unwrap_or_default();
+        let d = chrono::DateTime::from_timestamp(ts, 0)
+            .map(|t| t.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
         if !d.is_empty() {
             *days.entry(d).or_default() += 1;
         }
     }
     let mut recent: Vec<(String, i64)> = days.into_iter().collect();
     recent.sort();
-    let recent: Vec<Value> = recent.into_iter().rev().take(14).rev().map(|(d, c)| json!({"day": d, "messages": c})).collect();
+    let recent: Vec<Value> = recent
+        .into_iter()
+        .rev()
+        .take(14)
+        .rev()
+        .map(|(d, c)| json!({"day": d, "messages": c}))
+        .collect();
     json!({
         "total_messages": total,
         "media_messages": media,
@@ -260,7 +341,13 @@ fn read_msg() -> Result<Option<Value>> {
     let mut length = 0usize;
     for line in header_s.split("\r\n") {
         if line.to_lowercase().starts_with("content-length:") {
-            length = line.split(':').nth(1).unwrap_or("0").trim().parse().unwrap_or(0);
+            length = line
+                .split(':')
+                .nth(1)
+                .unwrap_or("0")
+                .trim()
+                .parse()
+                .unwrap_or(0);
         }
     }
     let mut body = vec![0u8; length];
@@ -280,6 +367,12 @@ fn write_msg(obj: &Value) -> Result<()> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // Refuse to start on a database that still needs migration without a valid
+    // chat id: migration v2 would otherwise assign chat_id=0 to every row.
+    if let Err(e) = db(&mcp_state_dir()) {
+        eprintln!("tg-chat: {e:#}");
+        std::process::exit(1);
+    }
     loop {
         let req = read_msg()?;
         let req = match req {
@@ -289,7 +382,9 @@ async fn main() -> Result<()> {
         let rid = req.get("id").cloned().unwrap_or(Value::Null);
         let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
         match method {
-            "initialize" => write_msg(&json!({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "tg-chat", "version": "0.1"}}}))?,
+            "initialize" => write_msg(
+                &json!({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "tg-chat", "version": "0.1"}}}),
+            )?,
             "notifications/initialized" => {}
             "ping" => write_msg(&json!({"jsonrpc": "2.0", "id": rid, "result": {}}))?,
             "tools/list" => write_msg(&json!({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
@@ -301,30 +396,42 @@ async fn main() -> Result<()> {
                 {"name": "chat_stats", "description": "Chat statistics from the local mirror (~10s behind live): message counts, top chatters, activity", "inputSchema": {"type": "object", "properties": {}}}
             ]}}))?,
             "tools/call" => {
-                let name = req.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or("");
-                let args = req.pointer("/params/arguments").cloned().unwrap_or(json!({}));
+                let name = req
+                    .pointer("/params/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let args = req
+                    .pointer("/params/arguments")
+                    .cloned()
+                    .unwrap_or(json!({}));
                 let text = match name {
                     "history" => tool_history(&args),
                     "search" => tool_search(&args),
-                    "get_media" => tool_get_media(&args).await,
+                    "get_media" => tool_get_media(&args),
                     "chatter_brief" => tool_chatter_brief(&args),
                     "chatter_full" => tool_chatter_full(&args),
                     "chat_stats" => tool_chat_stats(),
                     _ => {
-                        write_msg(&json!({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "unknown tool"}}))?;
+                        write_msg(
+                            &json!({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "unknown tool"}}),
+                        )?;
                         continue;
                     }
                 };
                 // Any handler may return {"error": ...}; surface isError so the
                 // agent never mistakes an error string for data.
-                let is_err = serde_json::from_str::<Value>(&text).map(|v| v.get("error").is_some()).unwrap_or(false);
+                let is_err = serde_json::from_str::<Value>(&text)
+                    .map(|v| v.get("error").is_some())
+                    .unwrap_or(false);
                 let mut res = json!({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}});
                 if is_err {
                     res["result"]["isError"] = json!(true);
                 }
                 write_msg(&res)?;
             }
-            _ => write_msg(&json!({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "unknown method"}}))?,
+            _ => write_msg(
+                &json!({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "unknown method"}}),
+            )?,
         }
     }
 }
