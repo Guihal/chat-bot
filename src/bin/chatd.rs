@@ -1375,6 +1375,12 @@ async fn track_loop(
         Ok((_, o)) => o,
         Err(_) => 0,
     };
+    // The initial pass replays the JOURNAL, not the present: without this reset a
+    // boot inherits "working" from the last old turn and the indicator burns in a
+    // session that is doing nothing.
+    activity()
+        .working
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     let mut inflight: HashSet<String> = HashSet::new();
     let mut last_progress: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
