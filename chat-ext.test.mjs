@@ -13,7 +13,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import chatExt, { helloFrame, sendArgs, staleGate } from "./chat-ext.mjs";
+import chatExt, {
+  helloFrame,
+  sanitizePayload,
+  sendArgs,
+  staleGate,
+  terminalProviderError,
+} from "./chat-ext.mjs";
 
 test("hello carries the durable session id and generation, never the name", () => {
   assert.deepEqual(helloFrame("dur-7f3a", 4, 1234), {
@@ -368,4 +374,133 @@ test("a steer inside a live run never reopens the no-turn window", async (t) => 
     true,
     "a steer during a run must not silence the indicator",
   );
+});
+
+// ---- gateway-rejected media in tool results -------------------------------
+
+// The installed runtime serializes a tool result as
+// {type:"function_call_output", call_id, output:[{type:"input_image",
+//  detail:"auto", image_url:"data:<mime>;base64,..."}]} and the gateway accepts
+// only raster images there. A video part left in that position makes EVERY
+// later request fail on the same history index, so the sanitizer must find the
+// part in exactly this shape.
+function responsesPayload(outputParts) {
+  return {
+    model: "muse-spark-1.3-contributor",
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "смотри" }] },
+      { type: "function_call_output", call_id: "call_1", output: outputParts },
+    ],
+  };
+}
+
+test("sanitizePayload replaces video inside a tool result", () => {
+  const payload = responsesPayload([
+    { type: "input_text", text: 'Read video file "clip.mp4" [video/mp4]' },
+    { type: "input_image", detail: "auto", image_url: "data:video/mp4;base64,AAAAIGZ0eXA" },
+  ]);
+  const result = sanitizePayload(payload);
+  assert.equal(result.changed, true);
+  assert.equal(result.removed, 1);
+  assert.deepEqual(result.mimes, ["video/mp4"]);
+  const parts = result.payload.input[1].output;
+  assert.equal(parts.length, 2);
+  assert.equal(parts[0].text, 'Read video file "clip.mp4" [video/mp4]', "the name of the file stays");
+  assert.equal(parts[1].type, "input_text");
+  assert.match(parts[1].text, /video\/mp4/);
+  assert.equal("image_url" in parts[1], false);
+});
+
+test("sanitizePayload leaves an image inside a tool result untouched", () => {
+  const payload = responsesPayload([
+    { type: "input_image", detail: "auto", image_url: "data:image/png;base64,iVBORw0KG" },
+  ]);
+  const result = sanitizePayload(payload);
+  assert.equal(result.changed, false);
+  assert.equal(result.removed, 0);
+  assert.equal(result.payload, payload, "an unchanged request must be sent identically");
+});
+
+test("sanitizePayload leaves user-message media untouched", () => {
+  const payload = {
+    input: [
+      { role: "user", content: [{ type: "input_image", image_url: "data:video/mp4;base64,AAAA" }] },
+    ],
+  };
+  const result = sanitizePayload(payload);
+  assert.equal(result.changed, false);
+  assert.equal(result.payload, payload);
+});
+
+test("sanitizePayload is a no-op for string outputs and media-free payloads", () => {
+  const stringOut = responsesPayload("plain text output");
+  assert.equal(sanitizePayload(stringOut).changed, false);
+  const plain = { model: "m", input: "Say hi" };
+  assert.equal(sanitizePayload(plain).payload, plain);
+});
+
+test("sanitizePayload handles the anthropic tool_result shape", () => {
+  const payload = {
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tu_1",
+            content: [{ type: "image", source: { type: "base64", media_type: "video/webm", data: "AAAA" } }],
+          },
+        ],
+      },
+    ],
+  };
+  const result = sanitizePayload(payload);
+  assert.equal(result.changed, true);
+  const part = result.payload.messages[0].content[0].content[0];
+  assert.equal(part.type, "text");
+  assert.match(part.text, /video\/webm/);
+});
+
+// ---- terminal provider failure vs model silence ---------------------------
+
+function assistantEnd(extra) {
+  return {
+    messages: [
+      { message: { role: "user" } },
+      {
+        message: {
+          role: "assistant",
+          stopReason: "error",
+          errorMessage:
+            'opencode-go API error (400): {"message":"unsupported media type at input[43].output[1]: `video/mp4`"}',
+        },
+      },
+    ],
+    ...extra,
+  };
+}
+
+test("terminalProviderError names a provider error", () => {
+  const text = terminalProviderError(assistantEnd());
+  assert.match(text, /unsupported media type/);
+});
+
+test("terminalProviderError treats a provider abort as terminal, a user abort not", () => {
+  const providerAbort = {
+    aborted: true,
+    abortSource: "provider",
+    messages: [{ message: { role: "assistant", stopReason: "aborted" } }],
+  };
+  assert.match(terminalProviderError(providerAbort), /aborted by provider/);
+  const userAbort = {
+    aborted: true,
+    abortSource: "user",
+    messages: [{ message: { role: "assistant", stopReason: "aborted" } }],
+  };
+  assert.equal(terminalProviderError(userAbort), "");
+});
+
+test("terminalProviderError stays empty for a clean run", () => {
+  const clean = { messages: [{ message: { role: "assistant", stopReason: "stop" } }] };
+  assert.equal(terminalProviderError(clean), "");
 });

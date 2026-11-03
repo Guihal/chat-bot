@@ -1154,7 +1154,14 @@ async fn recover_pending(
         }
         if view.emitted_at.is_some() && view.settled_at.is_none() {
             if let Some(settled) = last_event_ts(state, "agent_settled") {
-                if view.admitted_at.map(|a| settled >= a).unwrap_or(false) {
+                // A run that failed terminally after this batch was admitted has
+                // NOT been settled cleanly, and its context may be wedged: never
+                // stamp the late settle that would retire it as silent.
+                let failed_after_admit = last_event_ts(state, "run_failed")
+                    .zip(view.admitted_at)
+                    .map(|(failed, admitted)| failed >= admitted)
+                    .unwrap_or(false);
+                if !failed_after_admit && view.admitted_at.map(|a| settled >= a).unwrap_or(false) {
                     let sig_db = sig.clone();
                     let _ = db.write(move |tx| tx.mark_settled(&sig_db, settled)).await;
                     view.settled_at = Some(settled);
@@ -1210,6 +1217,60 @@ async fn recover_pending(
     }
 }
 
+/// How many automatic re-pushes a batch gets before the daemon stops trying and
+/// tells the owner instead of spinning on a broken provider path.
+const FAIL_RETRY_LIMIT: u32 = 3;
+
+/// Verdict for one batch at the end of a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleDecision {
+    /// The run ended cleanly: an unanswered batch is the model choosing silence.
+    Settle,
+    /// The gateway rejected media in the context: recreate the session, re-push.
+    HealAndRepush,
+    /// A terminal provider error: re-push in the same session.
+    Retry,
+    /// Automated recovery is exhausted: keep the batch OPEN, tell the owner once.
+    Escalate,
+}
+
+/// The single place that decides what a finished run means for a batch.
+///
+/// Ordering matters: the runtime emits `agent_end` (→ `run_failed`) BEFORE
+/// `agent_settled`, so this runs before any settle mark is written and keeps a
+/// failed attempt from being retired as "the model was silent".
+fn settle_decision(
+    poisoned: bool,
+    failed: bool,
+    healed: bool,
+    tries: u32,
+    limit: u32,
+) -> SettleDecision {
+    if poisoned {
+        return if healed {
+            SettleDecision::Escalate
+        } else {
+            SettleDecision::HealAndRepush
+        };
+    }
+    if failed {
+        return if tries < limit {
+            SettleDecision::Retry
+        } else {
+            SettleDecision::Escalate
+        };
+    }
+    SettleDecision::Settle
+}
+
+/// Frame suffix of a delivery id (`<sig>#<n>`). A larger number is a new attempt.
+fn frame_seq(id: &str) -> u64 {
+    id.rsplit('#')
+        .next()
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 /// Track unit: owns the events cursor, mirrors receipts, records delivery
 /// proofs, retires batches and asks the admit unit to recover stalled ones.
 async fn track_loop(
@@ -1232,12 +1293,25 @@ async fn track_loop(
         std::collections::HashMap::new();
     let mut emit_warned: HashSet<String> = HashSet::new();
     let mut last_working_at: i64 = 0;
-    // Timestamp of the last fully settled run. The runtime may report the
-    // delivery proof AFTER the run settled (observed live 2026-11-01: emitted
-    // 11s after the answer, i.e. after agent_settled), so the settle must be
-    // re-applied to a proof that arrives late — otherwise the batch never
-    // retires and a restart re-asks it.
-    let mut last_settled_at: i64 = 0;
+    // Timestamp of the last fully settled run, PER BATCH. The runtime may
+    // report the delivery proof AFTER the run settled (observed live 2026-11-01:
+    // emitted 11s after the answer, i.e. after agent_settled), so a late proof
+    // re-applies the settle — but only for batches whose run actually settled
+    // cleanly. A failed run leaves no entry here, which is what keeps it from
+    // being closed as "the model was silent".
+    let mut settled_sigs: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    // A terminal provider failure belongs to the ATTEMPT that produced it.
+    // `run_failed` arrives from the extension on `agent_end`, which the runtime
+    // emits BEFORE `agent_settled`: without these marks the batch would be
+    // stamped settled in the same pass and closed as `skipped`, losing the
+    // message the run died on.
+    let mut poisoned: HashSet<String> = HashSet::new();
+    let mut terminal_failed: HashSet<String> = HashSet::new();
+    let mut healed: HashSet<String> = HashSet::new();
+    let mut tries: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut seen_frames: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     // A run is in flight from its turn_start until it ends or settles. While
     // it is, no recovery may touch the session: the extension emits no events
     // during a long model step, so silence there is normal.
@@ -1289,20 +1363,111 @@ async fn track_loop(
                             // it stops the liveness clock and nothing else.
                             turn_in_flight = false;
                         }
+                        "run_failed" => {
+                            // The extension classifies the run's end: a terminal
+                            // provider failure means this batch was NOT delivered,
+                            // which is different from the model choosing silence.
+                            let media = ev
+                                .get("media_rejected")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let error = ev
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            dlog(&format!(
+                                "run failed ({}): {}",
+                                if media { "gateway rejected media" } else { "provider error" },
+                                error
+                            ));
+                            for sig in inflight.iter() {
+                                if media {
+                                    poisoned.insert(sig.clone());
+                                }
+                                terminal_failed.insert(sig.clone());
+                            }
+                        }
                         "agent_settled" => {
                             turn_in_flight = false;
                             let at = ev.get("t").and_then(|v| v.as_i64()).unwrap_or_else(now_ms);
-                            last_settled_at = at;
                             let sigs: Vec<String> = inflight.iter().cloned().collect();
-                            if !sigs.is_empty() {
+                            let mut settle_now: Vec<String> = vec![];
+                            let mut heal_now: Vec<String> = vec![];
+                            let mut retry_now: Vec<String> = vec![];
+                            let mut escalate_now: Vec<String> = vec![];
+                            for sig in &sigs {
+                                let decision = settle_decision(
+                                    poisoned.contains(sig),
+                                    terminal_failed.contains(sig),
+                                    healed.contains(sig),
+                                    tries.get(sig).copied().unwrap_or(0),
+                                    FAIL_RETRY_LIMIT,
+                                );
+                                match decision {
+                                    SettleDecision::Settle => settle_now.push(sig.clone()),
+                                    SettleDecision::HealAndRepush => heal_now.push(sig.clone()),
+                                    SettleDecision::Retry => retry_now.push(sig.clone()),
+                                    SettleDecision::Escalate => escalate_now.push(sig.clone()),
+                                }
+                            }
+                            if !settle_now.is_empty() {
+                                let sigs_db = settle_now.clone();
                                 let _ = db
                                     .write(move |tx| {
-                                        for sig in &sigs {
+                                        for sig in &sigs_db {
                                             tx.mark_settled(sig, at)?;
                                         }
                                         Ok(())
                                     })
                                     .await;
+                                for sig in &settle_now {
+                                    settled_sigs.insert(sig.clone(), at);
+                                }
+                            }
+                            for sig in heal_now {
+                                // The gateway rejected media inside a tool result:
+                                // the transcript is wedged on that entry, so a
+                                // fresh session is the only cure. One heal per
+                                // batch, otherwise a repeat failure loops.
+                                healed.insert(sig.clone());
+                                *tries.entry(sig.clone()).or_insert(0) += 1;
+                                dlog(&format!(
+                                    "batch {sig}: run failed on gateway-rejected media; healing the session and re-pushing"
+                                ));
+                                let _ = recover_tx.send(Recover {
+                                    sig: sig.clone(),
+                                    recreate: true,
+                                });
+                            }
+                            for sig in retry_now {
+                                *tries.entry(sig.clone()).or_insert(0) += 1;
+                                dlog(&format!(
+                                    "batch {sig}: run failed with a provider error; re-pushing"
+                                ));
+                                let _ = recover_tx.send(Recover {
+                                    sig: sig.clone(),
+                                    recreate: false,
+                                });
+                            }
+                            for sig in escalate_now {
+                                // Automated recovery is exhausted. The batch stays
+                                // OPEN (a batch is closed by an answer or a proven
+                                // clean run), and the owner hears about it once.
+                                dlog(&format!(
+                                    "batch {sig}: automated retries exhausted after a terminal provider failure; batch left open"
+                                ));
+                                ops::alert_transition(
+                                    &format!("run_failed:{sig}"),
+                                    true,
+                                    &format!(
+                                        "batch {sig} could not be delivered after retries; left open"
+                                    ),
+                                );
+                                // The marks stay: the batch is still the attempt
+                                // that failed, so a later settle from another run
+                                // cannot close it as "the model was silent".
+                                // Only a NEW frame (a fresh attempt) clears them.
                             }
                         }
                         "delivery_state" => {
@@ -1324,7 +1489,21 @@ async fn track_loop(
                                     // event carries the frame id (`sig#n`), the
                                     // ledger is keyed by the batch sig.
                                     let id_db = sig_of_frame(&id).to_string();
-                                    let settled_seen = last_settled_at;
+                                    // A new frame number is a NEW attempt: the
+                                    // verdict of the previous one no longer
+                                    // applies to it.
+                                    let seq = frame_seq(&id);
+                                    let prev = seen_frames.get(&id_db).copied().unwrap_or(0);
+                                    if seq > prev {
+                                        seen_frames.insert(id_db.clone(), seq);
+                                        poisoned.remove(&id_db);
+                                        terminal_failed.remove(&id_db);
+                                    }
+                                    // The proof may arrive after the run settled;
+                                    // apply the settle only when the reducer
+                                    // decided this batch settled cleanly.
+                                    let settled_seen =
+                                        settled_sigs.get(&id_db).copied().unwrap_or(0);
                                     let _ = db
                                         .write(move |tx| {
                                             tx.mark_emitted(&id_db, at)?;
@@ -1876,5 +2055,160 @@ async fn media_maintenance_loop(
                 ops::db_failure("media_resume", &e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::{frame_seq, settle_decision, SettleDecision};
+
+    const LIMIT: u32 = 3;
+
+    /// Fold a run's event sequence into the decisions the daemon would take.
+    fn fold(events: &[(&str, bool)], limit: u32) -> Vec<SettleDecision> {
+        let mut poisoned = false;
+        let mut failed = false;
+        let mut healed = false;
+        let mut tries = 0u32;
+        let mut out = vec![];
+        for (kind, media) in events {
+            match *kind {
+                "run_failed" => {
+                    if *media {
+                        poisoned = true;
+                    }
+                    failed = true;
+                }
+                "new_frame" => {
+                    poisoned = false;
+                    failed = false;
+                }
+                "agent_settled" => {
+                    let decision = settle_decision(poisoned, failed, healed, tries, limit);
+                    out.push(decision);
+                    match decision {
+                        SettleDecision::HealAndRepush => {
+                            healed = true;
+                            tries += 1;
+                        }
+                        SettleDecision::Retry => tries += 1,
+                        SettleDecision::Settle => {
+                            failed = false;
+                            poisoned = false;
+                        }
+                        SettleDecision::Escalate => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn silent_run_closes_as_before() {
+        assert_eq!(fold(&[("agent_settled", false)], LIMIT), vec![SettleDecision::Settle]);
+    }
+
+    #[test]
+    fn media_failure_heals_instead_of_closing_the_batch() {
+        // The proven production shape: agent_end(run_failed) lands before the
+        // settle, and the batch must be healed, never closed as skipped.
+        assert_eq!(
+            fold(&[("run_failed", true), ("agent_settled", false)], LIMIT),
+            vec![SettleDecision::HealAndRepush]
+        );
+    }
+
+    #[test]
+    fn a_second_media_failure_escalates_instead_of_looping() {
+        assert_eq!(
+            fold(
+                &[
+                    ("run_failed", true),
+                    ("agent_settled", false),
+                    ("new_frame", false),
+                    ("run_failed", true),
+                    ("agent_settled", false),
+                ],
+                LIMIT
+            ),
+            vec![SettleDecision::HealAndRepush, SettleDecision::Escalate]
+        );
+    }
+
+    #[test]
+    fn provider_errors_retry_up_to_the_limit_then_escalate() {
+        assert_eq!(
+            fold(
+                &[
+                    ("run_failed", false),
+                    ("agent_settled", false),
+                    ("new_frame", false),
+                    ("run_failed", false),
+                    ("agent_settled", false),
+                    ("new_frame", false),
+                    ("run_failed", false),
+                    ("agent_settled", false),
+                    ("new_frame", false),
+                    ("run_failed", false),
+                    ("agent_settled", false),
+                ],
+                LIMIT
+            ),
+            vec![
+                SettleDecision::Retry,
+                SettleDecision::Retry,
+                SettleDecision::Retry,
+                SettleDecision::Escalate
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_frame_starts_a_clean_attempt() {
+        assert_eq!(
+            fold(
+                &[
+                    ("run_failed", true),
+                    ("agent_settled", false),
+                    ("new_frame", false),
+                    ("agent_settled", false),
+                ],
+                LIMIT
+            ),
+            vec![SettleDecision::HealAndRepush, SettleDecision::Settle]
+        );
+    }
+
+    #[test]
+    fn an_escalated_batch_stays_open_until_a_new_attempt() {
+        // After escalation the failure marks stay, so an unrelated settle cannot
+        // close the batch as "the model was silent".
+        assert_eq!(
+            fold(
+                &[
+                    ("run_failed", true),
+                    ("agent_settled", false),
+                    ("new_frame", false),
+                    ("run_failed", true),
+                    ("agent_settled", false),
+                    ("agent_settled", false),
+                ],
+                LIMIT
+            ),
+            vec![
+                SettleDecision::HealAndRepush,
+                SettleDecision::Escalate,
+                SettleDecision::Escalate
+            ]
+        );
+    }
+
+    #[test]
+    fn frame_sequence_reads_the_attempt_number() {
+        assert_eq!(frame_seq("abc#1"), 1);
+        assert_eq!(frame_seq("abc#12"), 12);
+        assert_eq!(frame_seq("abc"), 0);
     }
 }

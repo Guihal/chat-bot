@@ -83,9 +83,127 @@ export function staleGate() {
   };
 }
 
+/**
+ * Media the OpenAI-shaped gateway refuses inside a tool result.
+ *
+ * The installed runtime serializes a tool result as
+ *   {type:"function_call_output", call_id, output:[{type:"input_image",
+ *    detail:"auto", image_url:"data:<mime>;base64,..."}]}
+ * and that position accepts raster images only. The builtin `read_video` tool
+ * (registered whenever the model declares the `video` modality) puts an mp4
+ * there as `image_url`, the gateway answers 400 `unsupported media type`, and
+ * because the block stays in the transcript EVERY later request fails on the
+ * same history index. Rewriting those parts to text keeps the video modality
+ * useful everywhere the gateway does accept it and cannot wedge the session.
+ */
+const BLOCKED_MEDIA_RE = /^(video|audio)\//i;
+const MEDIA_ERROR_RE =
+  /unsupported media type|image_parse_error|invalid_image|does not represent a valid image/i;
+const MAX_WALK_DEPTH = 32;
+
+function mediaMime(part) {
+  if (!part || typeof part !== "object") return "";
+  const source = part.source && typeof part.source === "object" ? part.source : null;
+  const raw =
+    part.media_type ||
+    part.mediaType ||
+    part.mimeType ||
+    (source && (source.media_type || source.mediaType || source.mimeType)) ||
+    part.image_url ||
+    "";
+  const text = typeof raw === "string" ? raw : "";
+  const dataUrl = /^data:([^;,]+)[;,]/.exec(text);
+  if (dataUrl) return dataUrl[1].trim().toLowerCase();
+  return /^[a-z]+\/[a-z0-9.+-]+$/i.test(text) ? text.trim().toLowerCase() : "";
+}
+
+function blockedPlaceholder(part) {
+  const mime = mediaMime(part) || "media";
+  const text = `[медиа ${mime} опущено: гейтвей принимает здесь только JPEG/PNG/GIF/WebP/ICO]`;
+  // Anthropic-shaped parts carry `{type:"image", source:{media_type}}`; the
+  // OpenAI-shaped ones carry `{type:"input_image"}`. Each family keeps its own
+  // text-part spelling so the payload stays a valid request.
+  const anthropic = part && part.type === "image";
+  return anthropic ? { type: "text", text } : { type: "input_text", text };
+}
+
+function collectsToolResults(node) {
+  if (!node || typeof node !== "object") return false;
+  if (node.type === "function_call_output" || node.type === "tool_result") return true;
+  return node.role === "tool" || node.role === "function";
+}
+
+function rewriteParts(node, inToolResult, depth, stats) {
+  if (depth > MAX_WALK_DEPTH || node === null || typeof node !== "object") return node;
+  if (Array.isArray(node)) {
+    let changed = false;
+    const next = node.map((item) => {
+      const replaced = rewriteParts(item, inToolResult, depth + 1, stats);
+      if (replaced !== item) changed = true;
+      return replaced;
+    });
+    return changed ? next : node;
+  }
+  if (inToolResult && BLOCKED_MEDIA_RE.test(mediaMime(node))) {
+    stats.removed += 1;
+    stats.mimes.add(mediaMime(node));
+    return blockedPlaceholder(node);
+  }
+  const childInTool = inToolResult || collectsToolResults(node);
+  let changed = false;
+  const next = {};
+  for (const [key, value] of Object.entries(node)) {
+    const replaced = rewriteParts(value, childInTool, depth + 1, stats);
+    if (replaced !== value) changed = true;
+    next[key] = replaced;
+  }
+  return changed ? next : node;
+}
+
+/**
+ * Strip video/audio parts that sit inside a tool result, leaving everything
+ * else (in particular user-message media) untouched. Returns the original
+ * payload object when nothing had to change, so an untouched request is sent
+ * byte-identically.
+ */
+export function sanitizePayload(payload) {
+  const stats = { removed: 0, mimes: new Set() };
+  const rewritten = rewriteParts(payload, false, 0, stats);
+  return {
+    changed: rewritten !== payload,
+    payload: rewritten,
+    removed: stats.removed,
+    mimes: [...stats.mimes],
+  };
+}
+
+/**
+ * A run that ended because the provider failed is NOT the model choosing
+ * silence: the batch has to be retried, never closed as `skipped`. Mirrors the
+ * runtime's own terminal predicate: an assistant message with `stopReason:
+ * "error"`, or an abort the provider/system caused (a user abort is not a
+ * failure). Retryable ends (`willRetry`) are excluded by the caller.
+ */
+export function terminalProviderError(ev) {
+  if (!ev || typeof ev !== "object") return "";
+  const messages = Array.isArray(ev.messages) ? ev.messages : [];
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const raw = messages[i];
+    const msg = raw && raw.message && typeof raw.message === "object" ? raw.message : raw;
+    if (!msg || typeof msg !== "object") continue;
+    if (msg.role && msg.role !== "assistant") continue;
+    if (msg.stopReason === "error") return String(msg.errorMessage || "provider error");
+    if (msg.stopReason === "aborted") {
+      const source = msg.abortSource || ev.abortSource;
+      if (source && source !== "user") return `aborted by ${source}`;
+    }
+  }
+  if (ev.aborted && ev.abortSource && ev.abortSource !== "user") return `aborted by ${ev.abortSource}`;
+  return "";
+}
+
 export default function (pi) {
-  const stateDir = env("CHATBOT_STATE_DIR", "./state");
-  const controlSockPath = path.join(stateDir, "control.sock");
+  const stateDir = env("CHATBOT_STATE_DIR", "./state");  const controlSockPath = path.join(stateDir, "control.sock");
   const eventsPath = path.join(stateDir, "events.jsonl");
 
   // Batches admitted in this turn: key, incoming ids and forum topic. The
@@ -485,7 +603,41 @@ export default function (pi) {
     reportDeliveryStates();
   });
 
+  // Last chance to keep an unwedgeable request: the provider payload is built
+  // by now, so a media part the gateway rejects inside a tool result is removed
+  // here instead of failing the turn and poisoning the session for good.
+  pi.on("before_provider_request", (event) => {
+    try {
+      const result = sanitizePayload(event && event.payload);
+      if (result.removed) {
+        emit({ kind: "payload_sanitized", removed: result.removed, mimes: result.mimes });
+      }
+      return result.changed ? result.payload : undefined;
+    } catch (e) {
+      emit({ kind: "payload_sanitize_error", error: String(e).slice(0, 200) });
+      return undefined;
+    }
+  });
+
   pi.on("agent_end", (ev) => {
+    // A run the provider terminated is a failed delivery, not the model picking
+    // silence. `willRetry` means the runtime will re-ask by itself; only the
+    // terminal end carries the decision the daemon needs.
+    try {
+      if (ev && !ev.willRetry) {
+        const error = terminalProviderError(ev);
+        if (error) {
+          emit({
+            kind: "run_failed",
+            error: error.slice(0, 400),
+            media_rejected: MEDIA_ERROR_RE.test(error),
+            abort_source: (ev.abortSource || null) && String(ev.abortSource),
+          });
+        }
+      }
+    } catch {
+      // Observability only; never break the agent loop.
+    }
     if (ev.aborted || ev.deadline) {
       // A retry is a continuation of the same run; only a terminal abort ends it.
       if (!ev.willRetry) stopTyping();
