@@ -787,6 +787,11 @@ async fn control_loop(
             }
         }
         let _ = &state;
+        // No extension means nobody is working: an abrupt disconnect mid-run never
+        // emits the stop hook, so without this the indicator would burn forever.
+        activity()
+            .working
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         dlog("extension disconnected from the control socket; waiting for the next connection");
     }
 }
