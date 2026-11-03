@@ -12,6 +12,10 @@ name = "tg-chat"
 path = "src/bin/tg-chat.rs"
 
 [[bin]]
+name = "botwatch"
+path = "src/bin/botwatch.rs"
+
+[[bin]]
 name = "dbbench"
 path = "src/bin/dbbench.rs"
 
