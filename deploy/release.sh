@@ -49,6 +49,7 @@ done
 
 entries() {
     printf 'bin\t%s\n' 'target/release/chatd'
+    printf 'bin\t%s\n' 'target/release/botwatch'
     printf 'ext\t%s\n' 'chat-ext.mjs'
     printf 'phase\t%s\n' 'muse-spark-phase-strip.ts'
     printf 'prompt\t%s\n' 'system-prompt.md'

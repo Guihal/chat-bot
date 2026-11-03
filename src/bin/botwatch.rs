@@ -206,9 +206,9 @@ fn daemon_log_causes(c: &Cfg, since: chrono::DateTime<chrono::Utc>) -> BTreeMap<
             errors.push(line.trim().chars().take(160).collect());
         }
     }
-    if !alert.is_empty() {
-        out.insert("daemon_alert".to_string(), alert);
-    }
+    // `ALERT ...` lines are already delivered to Telegram by the daemon itself
+    // through CHATBOT_NOTIFY_CMD; forwarding them here would send one alert twice.
+    let _ = alert;
     if !notify_failed.is_empty() {
         out.insert("notify_failed".to_string(), notify_failed);
     }
@@ -382,7 +382,6 @@ fn render(c: &Cfg, facts: &BTreeMap<String, String>, previous: &Value) -> (Vec<S
         match key.as_str() {
             "heal_ok" => lines.push(format!("HEALED: {detail}")),
             "heal_failed" => lines.push(format!("DOWN PERSISTS: {detail}")),
-            "daemon_alert" => lines.push(format!("DAEMON ALERT: {detail}")),
             "notify_failed" => lines.push(format!("NOTIFIER BROKEN: {detail}")),
             "log_errors" => lines.push(format!("DAEMON LOG ERRORS: {detail}")),
             "journal_errors" => lines.push(format!("JOURNAL ERRORS: {detail}")),
@@ -402,6 +401,9 @@ fn render(c: &Cfg, facts: &BTreeMap<String, String>, previous: &Value) -> (Vec<S
             }
             _ => {}
         }
+    }
+    if facts.contains_key("heal_ok") {
+        next.insert("service".to_string(), json!("active"));
     }
     if let Some(prev) = previous.as_object() {
         for key in prev.keys() {
@@ -718,8 +720,8 @@ fn selftest() -> i32 {
     let previous = load_json(&c.baseline);
     let (lines, next) = render(&c, &collect(&c, now), &previous);
     check(
-        "daemon alerts are surfaced",
-        lines.iter().any(|l| l.contains("DAEMON ALERT")),
+        "a daemon alert is not duplicated here",
+        !lines.iter().any(|l| l.contains("DAEMON ALERT")),
         format!("{lines:?}"),
     );
     save_json(&c.baseline, &next);
@@ -853,10 +855,9 @@ fn selftest() -> i32 {
     let previous = load_json(&c.baseline);
     let (lines, _) = render(&c, &collect(&c, now), &previous);
     check(
-        "the recovery is reported once",
-        lines
-            .iter()
-            .any(|l| l.contains("HEALED: unit is active again")),
+        "one outage yields one recovery, not two",
+        !lines.iter().any(|l| l.contains("HEALED"))
+            && !lines.iter().any(|l| l.contains("BOT DOWN")),
         format!("{lines:?}"),
     );
 
