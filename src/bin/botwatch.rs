@@ -286,17 +286,32 @@ fn dialogue_stalled(c: &Cfg, now: chrono::DateTime<chrono::Utc>) -> BTreeMap<Str
         return out;
     };
     let since = (now - chrono::Duration::minutes(c.stall_min)).timestamp();
+    // Without an explicit BOTWATCH_BOT_ID, take the bot's own id from the mirror:
+    // a zero here would count every message as inbound and invent a stall.
+    let bot_id = if c.bot_id != 0 {
+        c.bot_id
+    } else {
+        con.query_row("SELECT v FROM kv WHERE k='self_id'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+    };
+    if bot_id == 0 {
+        return out;
+    }
     let inbound: i64 = con
         .query_row(
             "SELECT COUNT(*) FROM messages WHERE date >= ?1 AND user_id <> ?2",
-            rusqlite::params![since, c.bot_id],
+            rusqlite::params![since, bot_id],
             |row| row.get(0),
         )
         .unwrap_or(0);
     let answers: i64 = con
         .query_row(
             "SELECT COUNT(*) FROM messages WHERE date >= ?1 AND user_id = ?2",
-            rusqlite::params![since, c.bot_id],
+            rusqlite::params![since, bot_id],
             |row| row.get(0),
         )
         .unwrap_or(0);
@@ -476,7 +491,10 @@ fn probe() -> bool {
         let (code, _) = run_capture(&cmd, &[], Duration::from_secs(25));
         return code == 0;
     }
-    let Some(server) = std::env::var("LIVENESS_SERVER").ok().filter(|s| !s.trim().is_empty()) else {
+    let Some(server) = std::env::var("LIVENESS_SERVER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    else {
         eprintln!("LIVENESS_SERVER is not set (e.g. root@host); refusing to guess a target");
         return false;
     };
