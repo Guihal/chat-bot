@@ -475,6 +475,10 @@ async fn admit_loop(
                                             .call(move |con| Ok(ledger::thread_id(con, &sg3)))
                                             .await
                                             .unwrap_or(None);
+                                        activity().thread.store(
+                                            tid.unwrap_or(-1),
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
                                         if out_tx
                                             .send(Out::Push {
                                                 delivery_id: frame_id(&open_sig),
@@ -690,10 +694,6 @@ async fn control_loop(
             tokio::select! {
                 msg = out_rx.recv() => match msg {
                     Some(Out::Push { delivery_id, text, batch_ids, thread_id }) => {
-                        activity().thread.store(
-                            thread_id.unwrap_or(-1),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
                         let frame = json!({"push": {"delivery_id": delivery_id, "text": text, "deliverAs": "steer", "batch_ids": batch_ids, "thread_id": thread_id}});
                         let ok = match serde_json::to_string(&frame) {
                             Ok(s) => wr.write_all(format!("{s}\n").as_bytes()).await.is_ok() && wr.flush().await.is_ok(),
@@ -959,6 +959,9 @@ async fn deliver_sig(
     }
     for cycle in 0..3 {
         let budget = if cycle == 0 { first } else { rest };
+        activity()
+            .thread
+            .store(thread.unwrap_or(-1), std::sync::atomic::Ordering::Relaxed);
         if out_tx
             .send(Out::Push {
                 delivery_id: frame_id(sig),
