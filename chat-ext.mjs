@@ -239,63 +239,6 @@ export default function (pi) {
     return activeBatches[activeBatches.length - 1];
   }
 
-  // Typing ownership: shown only while the agent is actually working, never
-  // blindly during daemon waits. The call is RPC; the daemon owns the token and
-  // the topic parameter. Stopped on every turn/agent/session end.
-  let typingTimer = null;
-  // The run's ticket (batch key + topic). It must OUTLIVE a single turn:
-  // `activeBatches` is cleared on `turn_end`, and a typing call without
-  // batch_key/thread would land in General instead of the user's topic
-  // (send.rs::typing falls back to thread_id=null without a key).
-  let runTicket = null;
-  // A push arms the indicator before the runtime starts a turn. If no turn ever
-  // starts (the session is held, the run was refused, the runtime is parked),
-  // the indicator must stop instead of burning: a lit indicator over a session
-  // that does nothing is a lie the owner already called out.
-  const TYPING_ARM_TIMEOUT_MS = Number(
-    env("CHATBOT_TYPING_ARM_TIMEOUT_MS", "120000"),
-  );
-  let typingArmedAt = 0;
-  let typingSawTurn = false;
-  function startTyping(ticket) {
-    if (ticket) {
-      runTicket = ticket;
-      if (typingSawTurn) {
-        // A steer that lands inside a live run keeps the run alive; reopening a
-        // no-turn window here would black out the indicator mid-generation.
-        typingArmedAt = 0;
-      } else if (!typingArmedAt) {
-        typingArmedAt = Date.now();
-      }
-    }
-    if (typingTimer) return;
-    const tick = () => {
-      if (
-        !typingSawTurn &&
-        typingArmedAt &&
-        Date.now() - typingArmedAt > TYPING_ARM_TIMEOUT_MS
-      ) {
-        stopTyping();
-        return;
-      }
-      const t = runTicket;
-      const args = t
-        ? { batch_key: t.key, thread_id: t.thread ?? null }
-        : {};
-      controlCall("typing", args, 6000).catch(() => {});
-    };
-    tick();
-    typingTimer = setInterval(tick, 4000);
-  }
-  function stopTyping() {
-    if (typingTimer) {
-      clearInterval(typingTimer);
-      typingTimer = null;
-    }
-    runTicket = null;
-    typingArmedAt = 0;
-    typingSawTurn = false;
-  }
   pi.registerTool({
     name: "chat_send",
     label: "Send chat message",
@@ -570,8 +513,6 @@ export default function (pi) {
 
   pi.on("turn_start", (ev) => {
     turnSends = new Map();
-    typingSawTurn = true;
-    startTyping();
     emit({ kind: "turn_start", turnIndex: ev.turnIndex });
     emit({ kind: "agent_activity", phase: "working" });
   });
@@ -598,7 +539,6 @@ export default function (pi) {
   // A run fully settled: the only signal the daemon accepts as "the agent
   // finished with this turn and chose silence".
   pi.on("agent_settled", () => {
-    stopTyping();
     emit({ kind: "agent_settled" });
     reportDeliveryStates();
   });
@@ -640,7 +580,6 @@ export default function (pi) {
     }
     if (ev.aborted || ev.deadline) {
       // A retry is a continuation of the same run; only a terminal abort ends it.
-      if (!ev.willRetry) stopTyping();
       emit({
         kind: "agent_end_aborted",
         aborted: Boolean(ev.aborted),
@@ -671,7 +610,6 @@ export default function (pi) {
     }
   });
   pi.on("session_shutdown", () => {
-    stopTyping();
     for (const child of subagentProcs) {
       try {
         child.kill("SIGKILL");
@@ -943,9 +881,6 @@ export default function (pi) {
       thread: Number.isInteger(push.thread_id) ? push.thread_id : null,
     });
     const kind = admitDelivery(deliveryId, text, push.deliverAs || "steer");
-    if (kind === "started" || kind === "steered" || kind === "queued") {
-      startTyping({ key: batchKey, thread: activeBatches[activeBatches.length - 1].thread });
-    }
     if (!controlSock) return;
     try {
       controlSock.write(

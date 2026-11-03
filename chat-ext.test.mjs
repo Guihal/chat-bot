@@ -265,114 +265,30 @@ function pushFrame(sock, deliveryId) {
   );
 }
 
-test("typing survives turn joints and stops only when the run ends", async (t) => {
+test("the extension reports activity and never drives the indicator", async (t) => {
   const h = await withControlSock(t, "started");
   const sock = await h.waitConnected();
   pushFrame(sock, `${BATCH}#1`);
-  await sleep(1000);
+  await sleep(300);
 
-  const first = h.typingCalls();
-  assert.equal(first.length >= 1, true, "a run lights the indicator before the first turn");
-  assert.equal(first[0].args.thread_id, THREAD, "topic must not be dropped");
-  assert.equal(first[0].args.batch_key, BATCH);
-
-  await h.rt.fire("turn_start", { turnIndex: 1 });
-  await h.rt.fire("turn_end", { turnIndex: 1 });
-  const afterJoint = h.typingCalls().length;
-  await sleep(4600);
-  const afterGap = h.typingCalls().length;
-  assert.equal(
-    afterGap > afterJoint,
-    true,
-    `the turn joint must not silence the indicator (was ${afterJoint}, now ${afterGap})`,
-  );
-  for (const c of h.typingCalls().slice(first.length)) {
-    assert.equal(c.args.thread_id, THREAD, "later ticks keep the run topic");
-  }
-
+  await h.rt.fire("turn_start", { turnIndex: 0 });
+  await h.rt.fire("turn_end", { turnIndex: 0 });
   await h.rt.fire("agent_settled", {});
-  await sleep(1000);
-  const afterSettle = h.typingCalls().length;
-  await sleep(5200);
-  assert.equal(
-    h.typingCalls().length,
-    afterSettle,
-    "nothing is sent after the run settled",
-  );
-});
 
-test("an already admitted re-push does not light the indicator", async (t) => {
-  const h = await withControlSock(t, "already_admitted");
-  const sock = await h.waitConnected();
-  pushFrame(sock, `${BATCH}#2`);
-  await sleep(4600);
-  assert.equal(
-    h.typingCalls().length,
-    0,
-    "a lost-answer re-push proves no run started, so no indicator",
-  );
-});
+  // Long enough for several of the old ticks: the daemon owns the indicator now.
+  await sleep(2500);
+  assert.equal(h.typingCalls().length, 0, "the extension never calls the typing op");
 
-test("a retrying agent_end keeps the indicator, a terminal one stops it", async (t) => {
-  const h = await withControlSock(t, "started");
-  const sock = await h.waitConnected();
-  pushFrame(sock, `${BATCH}#3`);
-  await sleep(1000);
-  const lit = h.typingCalls().length;
-  assert.equal(lit >= 1, true, "the run starts the indicator");
-
-  await h.rt.fire("agent_end", { aborted: true, willRetry: true, abortSource: "budget" });
-  await sleep(4600);
-  assert.equal(
-    h.typingCalls().length > lit,
-    true,
-    "a retry is a continuation of the same run, so the indicator keeps ticking",
-  );
-
-  await h.rt.fire("agent_end", { aborted: true, willRetry: false, abortSource: "user" });
-  await sleep(1000);
-  const stopped = h.typingCalls().length;
-  await sleep(5200);
-  assert.equal(h.typingCalls().length, stopped, "a terminal abort ends the run");
-});
-
-test("a push that never becomes a turn stops the indicator", async (t) => {
-  process.env.CHATBOT_TYPING_ARM_TIMEOUT_MS = "900";
-  t.after(() => {
-    delete process.env.CHATBOT_TYPING_ARM_TIMEOUT_MS;
-  });
-  const h = await withControlSock(t, "started");
-  const sock = await h.waitConnected();
-  pushFrame(sock, `${BATCH}#4`);
-  await sleep(700);
-  const lit = h.typingCalls().length;
-  assert.equal(lit >= 1, true, "the push arms the indicator");
-  await sleep(5200);
-  assert.equal(
-    h.typingCalls().length,
-    lit,
-    "with no turn_start the indicator stops instead of burning",
-  );
-});
-
-test("a steer inside a live run never reopens the no-turn window", async (t) => {
-  process.env.CHATBOT_TYPING_ARM_TIMEOUT_MS = "900";
-  t.after(() => {
-    delete process.env.CHATBOT_TYPING_ARM_TIMEOUT_MS;
-  });
-  const h = await withControlSock(t, "steered");
-  const sock = await h.waitConnected();
-  pushFrame(sock, `${BATCH}#5`);
-  await sleep(500);
-  await h.rt.fire("turn_start", { turnIndex: 1 });
-  await sleep(700);
-  const beforeSteer = h.typingCalls().length;
-  pushFrame(sock, `${BATCH}#6`);
-  await sleep(5200);
-  assert.equal(
-    h.typingCalls().length > beforeSteer,
-    true,
-    "a steer during a run must not silence the indicator",
+  const events = fs
+    .readFileSync(path.join(process.env.CHATBOT_STATE_DIR, "events.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+    .filter((ev) => ev.kind === "agent_activity");
+  assert.deepEqual(
+    events.map((ev) => ev.phase),
+    ["working", "stopped"],
+    "the two owner hooks publish exactly the state the daemon polls",
   );
 });
 

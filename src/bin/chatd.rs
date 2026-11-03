@@ -690,6 +690,10 @@ async fn control_loop(
             tokio::select! {
                 msg = out_rx.recv() => match msg {
                     Some(Out::Push { delivery_id, text, batch_ids, thread_id }) => {
+                        activity().thread.store(
+                            thread_id.unwrap_or(-1),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         let frame = json!({"push": {"delivery_id": delivery_id, "text": text, "deliverAs": "steer", "batch_ids": batch_ids, "thread_id": thread_id}});
                         let ok = match serde_json::to_string(&frame) {
                             Ok(s) => wr.write_all(format!("{s}\n").as_bytes()).await.is_ok() && wr.flush().await.is_ok(),
@@ -1284,6 +1288,78 @@ fn frame_seq(id: &str) -> u64 {
 
 /// Track unit: owns the events cursor, mirrors receipts, records delivery
 /// proofs, retires batches and asks the admit unit to recover stalled ones.
+// ---- typing ownership (daemon side) ----
+//
+// The extension only reports whether the agent is working; while that state is
+// true the daemon itself pings Telegram once per second, and it stops as soon as
+// the state goes false. `thread` is the topic of the last pushed batch, so the
+// indicator lands in the same topic as the answer (not in General).
+struct Activity {
+    working: std::sync::atomic::AtomicBool,
+    thread: std::sync::atomic::AtomicI64,
+}
+
+fn activity() -> &'static Activity {
+    static A: std::sync::OnceLock<Activity> = std::sync::OnceLock::new();
+    A.get_or_init(|| Activity {
+        working: std::sync::atomic::AtomicBool::new(false),
+        thread: std::sync::atomic::AtomicI64::new(-1),
+    })
+}
+
+/// Which events move the working/not-working state. Exactly the two owner hooks
+/// (agent start -> true, step end -> false) plus the run ends, nothing else.
+fn activity_state_for(kind: &str, phase: Option<bool>) -> Option<bool> {
+    match kind {
+        "agent_activity" => phase,
+        "turn_start" => Some(true),
+        "turn_end" | "agent_end_aborted" | "agent_settled" => Some(false),
+        _ => None,
+    }
+}
+
+async fn typing_loop(db: Db) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut lit = false;
+    let mut warned = false;
+    loop {
+        tick.tick().await;
+        let working = activity()
+            .working
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !working {
+            if lit {
+                dlog("typing off");
+                lit = false;
+            }
+            warned = false;
+            continue;
+        }
+        let thread = activity().thread.load(std::sync::atomic::Ordering::Relaxed);
+        let args = if thread > 0 {
+            json!({ "thread_id": thread })
+        } else {
+            json!({})
+        };
+        match chat_bot::send::typing(&db, &args).await {
+            Ok(_) => {
+                if !lit {
+                    dlog(&format!("typing on (thread={thread})"));
+                    lit = true;
+                }
+                warned = false;
+            }
+            Err(e) => {
+                if !warned {
+                    dlog(&format!("typing failed: {e:#}"));
+                    warned = true;
+                }
+            }
+        }
+    }
+}
+
 async fn track_loop(
     db: Db,
     mut admitted_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
@@ -1347,6 +1423,11 @@ async fn track_loop(
                 let mut _receipts = 0usize;
                 for ev in &events {
                     let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(next) = activity_state_for(kind, activity_phase(ev)) {
+                        activity()
+                            .working
+                            .store(next, std::sync::atomic::Ordering::Relaxed);
+                    }
                     match kind {
                         "chat_send_result" | "chat_send_replay" => {
                             _receipts += 1;
@@ -1801,6 +1882,7 @@ async fn cmd_run() -> Result<()> {
         system_path,
     ));
     tokio::task::spawn_local(track_loop(db.clone(), admitted_rx, inboxed_rx, recover_tx));
+    tokio::task::spawn_local(typing_loop(db.clone()));
 
     // One cleanup pass at startup, then resume every unfinished download.
     // Both run before polling so a pending row from the previous process is
@@ -2230,5 +2312,37 @@ mod settle_tests {
         assert_eq!(frame_seq("abc#1"), 1);
         assert_eq!(frame_seq("abc#12"), 12);
         assert_eq!(frame_seq("abc"), 0);
+    }
+}
+
+#[cfg(test)]
+mod typing_tests {
+    use super::activity_state_for;
+
+    #[test]
+    fn the_two_hooks_decide_the_indicator() {
+        assert_eq!(activity_state_for("agent_activity", Some(true)), Some(true));
+        assert_eq!(
+            activity_state_for("agent_activity", Some(false)),
+            Some(false)
+        );
+        assert_eq!(activity_state_for("turn_start", None), Some(true));
+        assert_eq!(activity_state_for("turn_end", None), Some(false));
+        assert_eq!(activity_state_for("agent_settled", None), Some(false));
+        assert_eq!(activity_state_for("agent_end_aborted", None), Some(false));
+    }
+
+    #[test]
+    fn unrelated_events_never_move_the_state() {
+        for kind in [
+            "chat_send_result",
+            "delivery_state",
+            "admitted",
+            "run_failed",
+        ] {
+            assert_eq!(activity_state_for(kind, None), None, "{kind}");
+        }
+        // An activity event without a phase says nothing about working/stopped.
+        assert_eq!(activity_state_for("agent_activity", None), None);
     }
 }
