@@ -169,6 +169,22 @@ pub fn poll_ok_at() -> Option<i64> {
     }
 }
 
+/// Whether the long poll is stale, and what to tell the owner about it. Pure and
+/// unit-tested: the alert must agree with `derive_verdict` at the boundary
+/// (exactly at the threshold is still healthy, one second past is not).
+pub fn poll_stale_decision(now: i64, last_ok: Option<i64>, stale_secs: i64) -> (bool, String) {
+    match last_ok {
+        Some(ts) => {
+            let age = now.saturating_sub(ts);
+            (
+                age > stale_secs,
+                format!("last successful getUpdates {age}s ago (threshold {stale_secs}s)"),
+            )
+        }
+        None => (true, "no successful getUpdates yet".to_string()),
+    }
+}
+
 pub fn record_message_id(id: i64) {
     if id > 0 {
         LAST_MESSAGE_ID.fetch_max(id, Ordering::Relaxed);
@@ -739,16 +755,7 @@ pub async fn health_tick(
     // watchdog verdict already applies (seconds!), so both read the same truth.
     if alerts {
         let stale = stale_threshold_secs() as i64;
-        let (active, detail) = match poll_ok_at() {
-            Some(ts) => {
-                let age = now_secs().saturating_sub(ts);
-                (
-                    age > stale,
-                    format!("last successful getUpdates {age}s ago (threshold {stale}s)"),
-                )
-            }
-            None => (true, "no successful getUpdates yet".to_string()),
-        };
+        let (active, detail) = poll_stale_decision(now_secs(), poll_ok_at(), stale);
         alert_transition("poll_stale", active, &detail);
     }
     // Close TTL-owned causes that stopped happening and retry notifier lines

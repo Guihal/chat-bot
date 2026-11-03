@@ -273,3 +273,64 @@ fn an_event_kind_is_delivered_every_time() {
 
     assert_eq!(got.len(), 2, "events are not states: {got:?}");
 }
+
+#[test]
+fn the_poll_threshold_turns_over_exactly_past_it() {
+    let stale = 90;
+    let now = 1_000_000;
+    assert!(
+        !ops::poll_stale_decision(now, Some(now - stale), stale).0,
+        "exactly at the threshold is still healthy"
+    );
+    assert!(
+        ops::poll_stale_decision(now, Some(now - stale - 1), stale).0,
+        "one second past the threshold is stale"
+    );
+    assert!(
+        ops::poll_stale_decision(now, Some(now - 5), stale).0 == false,
+        "a fresh poll is healthy"
+    );
+    let (no_data, detail) = ops::poll_stale_decision(now, None, stale);
+    assert!(no_data, "no successful poll yet is stale by definition");
+    assert!(detail.contains("no successful getUpdates"), "{detail}");
+    let (_, fresh_detail) = ops::poll_stale_decision(now, Some(now - 301), stale);
+    assert!(
+        fresh_detail.contains("301s"),
+        "the age is in the text: {fresh_detail}"
+    );
+}
+
+#[test]
+fn the_two_new_persistent_causes_report_once_and_recover_once() {
+    let _guard = env_guard();
+    let dir = temp_state("causes");
+    let script = stub_notifier(&dir, 0);
+    std::env::set_var("CHATBOT_NOTIFY_CMD", &script);
+    let state = dir.display().to_string();
+
+    for kind in ["session_held", "poll_stale"] {
+        ops::alert_transition_to(&state, kind, true, "entered");
+        ops::alert_transition_to(&state, kind, true, "still there");
+    }
+    let entered = wait_calls(&dir, 2);
+    assert_eq!(entered.len(), 2, "one line per cause: {entered:?}");
+    assert!(
+        entered.iter().any(|l| l.contains("session_held"))
+            && entered.iter().any(|l| l.contains("poll_stale")),
+        "both causes are announced: {entered:?}"
+    );
+
+    for kind in ["session_held", "poll_stale"] {
+        ops::alert_transition_to(&state, kind, false, "");
+        ops::alert_transition_to(&state, kind, false, "");
+    }
+    let recovered = wait_calls(&dir, 4);
+    std::env::remove_var("CHATBOT_NOTIFY_CMD");
+    assert_eq!(recovered.len(), 4, "one recovery per cause: {recovered:?}");
+    let tail = &recovered[2..];
+    assert!(
+        tail.iter().any(|l| l.contains("session_held:recovered"))
+            && tail.iter().any(|l| l.contains("poll_stale:recovered")),
+        "the notifier threads race, so compare as a set: {recovered:?}"
+    );
+}
