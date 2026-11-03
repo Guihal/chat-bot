@@ -428,6 +428,14 @@ async fn admit_loop(
                                     turn_recently_open(),
                                     ticks_since_heal,
                                 ) {
+                                    // Confirmed hold (two strikes and a heal allowed):
+                                    // this is the state in which the bot accepts deliveries
+                                    // and runs nothing, so the owner must hear about it once.
+                                    ops::alert_transition(
+                                        "session_held",
+                                        true,
+                                        &format!("session {uid} stayed in interrupted-run; healing"),
+                                    );
                                     dlog(&format!(
                                         "session {uid} is mute on interrupted-run; restarting the host generation"
                                     ));
@@ -486,6 +494,9 @@ async fn admit_loop(
                                 }
                             } else {
                                 held_strikes = 0;
+                                // The session is healthy again: close the held
+                                // state once (a transient hold never armed it).
+                                ops::alert_transition("session_held", false, "");
                             }
                         }
                     }
@@ -1299,8 +1310,7 @@ async fn track_loop(
     // re-applies the settle — but only for batches whose run actually settled
     // cleanly. A failed run leaves no entry here, which is what keeps it from
     // being closed as "the model was silent".
-    let mut settled_sigs: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
+    let mut settled_sigs: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     // A terminal provider failure belongs to the ATTEMPT that produced it.
     // `run_failed` arrives from the extension on `agent_end`, which the runtime
     // emits BEFORE `agent_settled`: without these marks the batch would be
@@ -1310,8 +1320,7 @@ async fn track_loop(
     let mut terminal_failed: HashSet<String> = HashSet::new();
     let mut healed: HashSet<String> = HashSet::new();
     let mut tries: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let mut seen_frames: std::collections::HashMap<String, u64> =
-        std::collections::HashMap::new();
+    let mut seen_frames: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     // A run is in flight from its turn_start until it ends or settles. While
     // it is, no recovery may touch the session: the extension emits no events
     // during a long model step, so silence there is normal.
@@ -1378,7 +1387,11 @@ async fn track_loop(
                                 .to_string();
                             dlog(&format!(
                                 "run failed ({}): {}",
-                                if media { "gateway rejected media" } else { "provider error" },
+                                if media {
+                                    "gateway rejected media"
+                                } else {
+                                    "provider error"
+                                },
                                 error
                             ));
                             for sig in inflight.iter() {
@@ -1597,6 +1610,10 @@ async fn track_loop(
                             "delivered"
                         };
                         retired.push((view.batch_key.clone(), outcome.to_string()));
+                        // The batch is closing on its own merits, so an earlier
+                        // "could not deliver" state for it is over: one recovered
+                        // line, then silence.
+                        ops::alert_transition(&format!("run_failed:{}", view.batch_key), false, "");
                         continue;
                     }
                     let sig = view.batch_key.clone();
@@ -2107,7 +2124,10 @@ mod settle_tests {
 
     #[test]
     fn silent_run_closes_as_before() {
-        assert_eq!(fold(&[("agent_settled", false)], LIMIT), vec![SettleDecision::Settle]);
+        assert_eq!(
+            fold(&[("agent_settled", false)], LIMIT),
+            vec![SettleDecision::Settle]
+        );
     }
 
     #[test]

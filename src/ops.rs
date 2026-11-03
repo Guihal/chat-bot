@@ -158,6 +158,17 @@ pub fn mark_poll_ok() {
     POLL_OK_AT.store(now_secs(), Ordering::Relaxed);
 }
 
+/// Last successful long poll (unix seconds), `None` before the first one.
+/// The staleness authority is `stale_threshold_secs()` — SECONDS, the same unit
+/// `derive_verdict` uses, so the alert and the operator-facing verdict cannot
+/// disagree.
+pub fn poll_ok_at() -> Option<i64> {
+    match POLL_OK_AT.load(Ordering::Relaxed) {
+        0 => None,
+        v => Some(v),
+    }
+}
+
 pub fn record_message_id(id: i64) {
     if id > 0 {
         LAST_MESSAGE_ID.fetch_max(id, Ordering::Relaxed);
@@ -360,8 +371,65 @@ pub fn verdict_for(
 
 // ---------- alerts ----------
 
+/// A Telegram message is one line: collapse whitespace, drop JSON bodies (the
+/// reader needs the fact, not the payload) and cut on a word boundary.
+const ALERT_NOTIFY_MAX: usize = 200;
+/// A bare cause (`db_failure` and friends) is suppressed while it keeps firing
+/// and is CLOSED by expiry — that is what gives it a recovery line without
+/// hooks in db.rs/ledger.rs. Transition causes (`alert_transition`) are never
+/// TTL-closed: their owner is the false edge.
+const ALERT_ACTIVE_TTL_SECS: i64 = 900;
+/// How long one notifier call may take before it is killed and counted failed.
+const NOTIFY_TIMEOUT_SECS: u64 = 10;
+/// A failed notifier is retried by the next sweep, but not forever.
+const NOTIFY_MAX_TRIES: u32 = 5;
+/// Kinds that are EVENTS, not states: each occurrence is its own news and is
+/// never suppressed. `send_unknown` fires per send, so TTL gifts nothing there.
+const ALERT_EVENT_KINDS: &[&str] = &["send_unknown"];
+
 fn alert_line(kind: &str, detail: &str) -> String {
     format!("{ALERT_PREFIX} {kind}: {detail}")
+}
+
+pub fn alert_notify_text(kind: &str, detail: &str) -> String {
+    let mut collapsed = String::with_capacity(detail.len());
+    let mut in_braces = false;
+    for ch in detail.chars() {
+        match ch {
+            '{' => {
+                in_braces = true;
+                collapsed.push('{');
+            }
+            '}' if in_braces => {
+                in_braces = false;
+                collapsed.push('}');
+            }
+            _ if in_braces => {}
+            '\n' | '\r' | '\t' => collapsed.push(' '),
+            _ => collapsed.push(ch),
+        }
+    }
+    let squeezed = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
+    let body = if squeezed.chars().count() > ALERT_NOTIFY_MAX {
+        let mut out = String::new();
+        for word in squeezed.split(' ') {
+            if out.chars().count() + word.chars().count() + 1 > ALERT_NOTIFY_MAX {
+                break;
+            }
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(word);
+        }
+        if out.is_empty() {
+            squeezed.chars().take(ALERT_NOTIFY_MAX).collect()
+        } else {
+            format!("{out}…")
+        }
+    } else {
+        squeezed
+    };
+    alert_line(kind, &body)
 }
 
 fn gate() -> &'static Mutex<HashMap<String, bool>> {
@@ -369,11 +437,137 @@ fn gate() -> &'static Mutex<HashMap<String, bool>> {
     GATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Emit one alert line through the daemon log and, if configured, the existing
-/// external notifier. The repository has no notifier of its own, so the
-/// deployed `tg-notify` (or any equivalent) is wired with `CHATBOT_NOTIFY_CMD`
-/// and receives the full alert line as its single argument. A failed notifier
-/// never hides the log line.
+fn notify_state_path(state: &str) -> std::path::PathBuf {
+    std::path::Path::new(state).join("notify-state.json")
+}
+
+/// Suppression marks that must survive a restart (`Restart=always` would
+/// otherwise re-send the same line every 15 s during a crash loop) plus the
+/// notifier lines that failed to go out.
+#[derive(Default)]
+struct NotifyState {
+    /// cause key -> last time it was seen (unix seconds)
+    seen: HashMap<String, i64>,
+    /// cause key -> line still undelivered, with its attempt count
+    pending: HashMap<String, (String, u32)>,
+}
+
+fn load_notify_state(state: &str) -> NotifyState {
+    let path = notify_state_path(state);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return NotifyState::default();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return NotifyState::default();
+    };
+    let mut out = NotifyState::default();
+    if let Some(map) = value.get("seen").and_then(|v| v.as_object()) {
+        for (k, v) in map {
+            if let Some(ts) = v.as_i64() {
+                out.seen.insert(k.clone(), ts);
+            }
+        }
+    }
+    if let Some(map) = value.get("pending").and_then(|v| v.as_object()) {
+        for (k, v) in map {
+            let line = v.get("line").and_then(|x| x.as_str()).unwrap_or("");
+            let tries = v.get("tries").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            if !line.is_empty() {
+                out.pending.insert(k.clone(), (line.to_string(), tries));
+            }
+        }
+    }
+    out
+}
+
+fn save_notify_state(state: &str, st: &NotifyState) {
+    let mut seen = serde_json::Map::new();
+    for (k, v) in &st.seen {
+        seen.insert(k.clone(), serde_json::json!(v));
+    }
+    let mut pending = serde_json::Map::new();
+    for (k, (line, tries)) in &st.pending {
+        pending.insert(k.clone(), serde_json::json!({"line": line, "tries": tries}));
+    }
+    let body = serde_json::json!({"seen": seen, "pending": pending}).to_string();
+    let path = notify_state_path(state);
+    let tmp = path.with_extension("json.tmp");
+    // Best effort: an unwritable state dir must not stop the alert itself.
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Run the notifier with a deadline and report HOW it ended. Today the code
+/// spawns and forgets with stdio to /dev/null, so `rc!=0` is invisible.
+fn run_notifier(cmd: &str, line: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(cmd)
+        .arg(line)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn: {e}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(NOTIFY_TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("rc={}", status.code().unwrap_or(-1)))
+                }
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("timeout".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("wait: {e}")),
+        }
+    }
+}
+
+fn notify_line(state: &str, key: &str, line: &str) {
+    let Ok(cmd) = std::env::var("CHATBOT_NOTIFY_CMD") else {
+        return;
+    };
+    if cmd.trim().is_empty() {
+        return;
+    }
+    match run_notifier(&cmd, line) {
+        Ok(()) => {
+            // The retry (or the first attempt) went out: the waiting line is done.
+            let mut st = load_notify_state(state);
+            if st.pending.remove(key).is_some() {
+                save_notify_state(state, &st);
+            }
+        }
+        Err(err) => {
+            crate::dlog_at(state, &format!("notify_failed: {key} {err}"));
+            let mut st = load_notify_state(state);
+            let tries = st.pending.get(key).map(|(_, t)| *t).unwrap_or(0) + 1;
+            if tries >= NOTIFY_MAX_TRIES {
+                crate::dlog_at(
+                    state,
+                    &format!("notify_failed: {key} giving up after {tries} attempts"),
+                );
+                st.pending.remove(key);
+            } else {
+                st.pending
+                    .insert(key.to_string(), (line.to_string(), tries));
+            }
+            save_notify_state(state, &st);
+        }
+    }
+}
+
+/// Emit one alert line through the daemon log and, if configured, the external
+/// notifier (`CHATBOT_NOTIFY_CMD`, receiving ONE line). A failed notifier never
+/// hides the log line and is retried by the next sweep.
 pub fn alert(kind: &str, detail: &str) {
     alert_to(&crate::state_dir(), kind, detail);
 }
@@ -381,29 +575,107 @@ pub fn alert(kind: &str, detail: &str) {
 pub fn alert_to(state: &str, kind: &str, detail: &str) {
     let line = alert_line(kind, detail);
     crate::dlog_at(state, &line);
-    if let Ok(cmd) = std::env::var("CHATBOT_NOTIFY_CMD") {
-        if !cmd.trim().is_empty() {
-            let _ = std::process::Command::new(cmd)
-                .arg(&line)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+    let now = now_secs();
+    let mut st = load_notify_state(state);
+    let seen = st.seen.get(kind).copied().unwrap_or(0);
+    let is_event = ALERT_EVENT_KINDS.contains(&kind);
+    // The cause is already live and has already been delivered: log only.
+    // The expiry sweep is what eventually closes it and sends `recovered`.
+    if !is_event && seen > 0 && now.saturating_sub(seen) < ALERT_ACTIVE_TTL_SECS {
+        st.seen.insert(kind.to_string(), now);
+        save_notify_state(state, &st);
+        return;
+    }
+    st.seen.insert(kind.to_string(), now);
+    save_notify_state(state, &st);
+    let notify = alert_notify_text(kind, detail);
+    let state_owned = state.to_string();
+    let kind_owned = kind.to_string();
+    // The notifier runs in its own thread: waiting inside the caller would
+    // stall a health tick on a slow HTTP client.
+    std::thread::spawn(move || notify_line(&state_owned, &kind_owned, &notify));
+}
+
+/// Persistent conditions (socket gone, disk below reserve, session mismatch,
+/// held session, stale poll) alert once per transition: the escalation is owned
+/// by the false→true edge and the recovery line by the true→false edge.
+/// A TTL sweep never closes these — that would claim "recovered" while the
+/// fault is still there, because a persistent cause does not re-alert.
+pub fn alert_transition(kind: &str, active: bool, detail: &str) {
+    alert_transition_to(&crate::state_dir(), kind, active, detail);
+}
+
+/// State-scoped form, so the contract can be exercised without racing the
+/// process-wide `CHATBOT_STATE_DIR`.
+pub fn alert_transition_to(state: &str, kind: &str, active: bool, detail: &str) {
+    let was_active = {
+        let mut g = gate().lock().unwrap_or_else(|e| e.into_inner());
+        let was = g.get(kind).copied().unwrap_or(false);
+        if active {
+            g.insert(kind.to_string(), true);
+        } else {
+            g.remove(kind);
         }
+        was
+    };
+    if active {
+        if !was_active {
+            alert_to(state, kind, detail);
+        }
+    } else if was_active {
+        // Closing the cause also clears its suppression mark, so a NEW outage
+        // of the same kind alerts immediately instead of waiting out the TTL.
+        let mut st = load_notify_state(state);
+        st.seen.remove(kind);
+        save_notify_state(state, &st);
+        let recovered = format!("{kind}:recovered");
+        crate::dlog_at(state, &alert_line(&recovered, "back to normal"));
+        let notify = alert_notify_text(&recovered, "back to normal");
+        let key = recovered.clone();
+        let state_owned = state.to_string();
+        std::thread::spawn(move || notify_line(&state_owned, &key, &notify));
     }
 }
 
-/// Persistent conditions (socket gone, disk below reserve, session mismatch)
-/// alert once per transition instead of once per tick; recovery re-arms them.
-pub fn alert_transition(kind: &str, active: bool, detail: &str) {
-    let mut g = gate().lock().unwrap_or_else(|e| e.into_inner());
-    if active {
-        if !g.get(kind).copied().unwrap_or(false) {
-            g.insert(kind.to_string(), true);
-            drop(g);
-            alert(kind, detail);
-        }
-    } else {
-        g.remove(kind);
+/// One alert tick: close TTL-owned causes that stopped happening (emitting the
+/// recovery line once) and retry notifier lines that failed. Transition causes
+/// are skipped by construction — their owner is the false edge.
+pub fn sweep_alerts(state: &str) {
+    let now = now_secs();
+    let active_transitions: Vec<String> = {
+        let g = gate().lock().unwrap_or_else(|e| e.into_inner());
+        g.iter()
+            .filter(|(_, v)| **v)
+            .map(|(k, _)| k.clone())
+            .collect()
+    };
+    let mut st = load_notify_state(state);
+    let expired: Vec<String> = st
+        .seen
+        .iter()
+        .filter(|(k, ts)| {
+            now.saturating_sub(**ts) >= ALERT_ACTIVE_TTL_SECS && !active_transitions.contains(k)
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in expired {
+        st.seen.remove(&key);
+        let kind = format!("{key}:recovered");
+        let detail = format!("no recurrence within {ALERT_ACTIVE_TTL_SECS}s");
+        crate::dlog_at(state, &alert_line(&kind, &detail));
+        let notify = alert_notify_text(&kind, &detail);
+        let state_owned = state.to_string();
+        std::thread::spawn(move || notify_line(&state_owned, &kind, &notify));
+    }
+    let retries: Vec<(String, String)> = st
+        .pending
+        .iter()
+        .map(|(k, (line, _))| (k.clone(), line.clone()))
+        .collect();
+    save_notify_state(state, &st);
+    for (key, line) in retries {
+        let state_owned = state.to_string();
+        std::thread::spawn(move || notify_line(&state_owned, &key, &line));
     }
 }
 
@@ -461,6 +733,27 @@ pub async fn health_tick(
             );
         }
     }
+
+    // A live process that stopped polling is mute without looking broken: the
+    // unit is active, the socket is there, nothing runs. The rule is the one the
+    // watchdog verdict already applies (seconds!), so both read the same truth.
+    if alerts {
+        let stale = stale_threshold_secs() as i64;
+        let (active, detail) = match poll_ok_at() {
+            Some(ts) => {
+                let age = now_secs().saturating_sub(ts);
+                (
+                    age > stale,
+                    format!("last successful getUpdates {age}s ago (threshold {stale}s)"),
+                )
+            }
+            None => (true, "no successful getUpdates yet".to_string()),
+        };
+        alert_transition("poll_stale", active, &detail);
+    }
+    // Close TTL-owned causes that stopped happening and retry notifier lines
+    // that failed to leave the box. Transition causes are skipped by design.
+    sweep_alerts(state);
 
     let depth = media_tx.max_capacity().saturating_sub(media_tx.capacity());
     let facts = collect_health(state, sock, depth, sessions_named);
