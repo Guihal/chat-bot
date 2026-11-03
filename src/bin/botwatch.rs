@@ -47,7 +47,7 @@ fn cfg() -> Cfg {
         ),
         window_min: env_or("BOTWATCH_SINCE_MIN", "120").parse().unwrap_or(120),
         stall_min: env_or("BOTWATCH_STALL_MIN", "20").parse().unwrap_or(20),
-        bot_id: env_or("BOTWATCH_BOT_ID", "9287666466").parse().unwrap_or(0),
+        bot_id: env_or("BOTWATCH_BOT_ID", "0").parse().unwrap_or(0),
         unit: env_or("BOTWATCH_UNIT", "omo-chat"),
         unit_cmd: std::env::var("BOTWATCH_UNIT_CMD").ok(),
         journal_cmd: std::env::var("BOTWATCH_JOURNAL_CMD").ok(),
@@ -476,7 +476,10 @@ fn probe() -> bool {
         let (code, _) = run_capture(&cmd, &[], Duration::from_secs(25));
         return code == 0;
     }
-    let server = env_or("LIVENESS_SERVER", "root@89.169.34.100");
+    let Some(server) = std::env::var("LIVENESS_SERVER").ok().filter(|s| !s.trim().is_empty()) else {
+        eprintln!("LIVENESS_SERVER is not set (e.g. root@host); refusing to guess a target");
+        return false;
+    };
     let (code, _) = run_capture(
         "ssh",
         &[
@@ -499,7 +502,7 @@ fn liveness() -> i32 {
         &format!("{}/.local/state/omo-chat-liveness.json", home_dir()),
     );
     let confirm: i64 = env_or("LIVENESS_CONFIRM", "2").parse().unwrap_or(2);
-    let server = env_or("LIVENESS_SERVER", "root@89.169.34.100");
+    let server = env_or("LIVENESS_SERVER", "host");
     let is_up = probe();
     let mut state = load_json(&state_path);
     let mut delivered = true;
@@ -636,6 +639,7 @@ fn selftest() -> i32 {
     std::env::set_var("BOTWATCH_JOURNAL_CMD", journal_stub.display().to_string());
 
     let mut c = cfg();
+    c.bot_id = 9137;
     c.unit_cmd = Some(unit_stub.display().to_string());
     c.journal_cmd = Some(journal_stub.display().to_string());
 
@@ -819,7 +823,7 @@ fn selftest() -> i32 {
     if let Ok(con) = rusqlite::Connection::open(&c.mirror) {
         let _ = con.execute(
             "INSERT INTO messages VALUES (4, ?1, ?2)",
-            rusqlite::params![9287666466i64, now.timestamp()],
+            rusqlite::params![c.bot_id, now.timestamp()],
         );
     }
     let previous = load_json(&c.baseline);

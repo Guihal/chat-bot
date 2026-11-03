@@ -142,7 +142,7 @@ fn missing_empty_or_nonnumeric_chat_id_refuses_before_migrating() {
 fn valid_chat_id_migrates_and_keeps_every_row() {
     let (dir, state, token) = fixture("valid");
     let before_rows = rows(&state);
-    let out = run_sync(&state, &token, Some("-1004493415890"));
+    let out = run_sync(&state, &token, Some("-1001234567890"));
     // The network call after migration fails (dead API base); the migration
     // itself is what this asserts.
     assert!(
@@ -158,7 +158,7 @@ fn valid_chat_id_migrates_and_keeps_every_row() {
     let con = Connection::open(state.join("history.db")).unwrap();
     let wrong: i64 = con
         .query_row(
-            "SELECT COUNT(*) FROM messages WHERE chat_id IS NOT -1004493415890",
+            "SELECT COUNT(*) FROM messages WHERE chat_id IS NOT -1001234567890",
             [],
             |r| r.get(0),
         )

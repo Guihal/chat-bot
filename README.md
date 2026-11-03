@@ -277,8 +277,9 @@ TG_NOTIFY_ENV=/root/.config/tg-notify.env /root/bin/tg-notify 'ALERT test: wirin
 `ХОСТ НЕДОСТУПЕН` / `ХОСТ СНОВА НА СВЯЗИ`. Недоставленная строка остаётся в состоянии
 и повторяется следующим прогоном — потерять тревогу из-за сбоя нотифаера нельзя.
 
-Все внешние зависимости подменяемы переменными (`BOTWATCH_UNIT_CMD`, `BOTWATCH_JOURNAL_CMD`,
-`LIVENESS_PROBE_CMD`), поэтому `botwatch --selftest` гоняет весь контракт на временных
+Для режима `liveness` обязателен `LIVENESS_SERVER` (например `root@your-host`) — адрес
+намеренно не зашит в код. Все внешние зависимости подменяемы переменными
+(`BOTWATCH_UNIT_CMD`, `BOTWATCH_JOURNAL_CMD`, `LIVENESS_PROBE_CMD`), поэтому `botwatch --selftest` гоняет весь контракт на временных
 файлах и стабах: без root, без целевого хоста и без настоящего нотифаера.
 
 ## Проверки
