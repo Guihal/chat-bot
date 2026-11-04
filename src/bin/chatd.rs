@@ -1321,9 +1321,11 @@ fn activity_state_for(kind: &str, phase: Option<bool>) -> Option<bool> {
     match kind {
         "agent_activity" => phase,
         "turn_start" => Some(true),
-        // Only the END OF THE RUN clears the indicator: a turn boundary is a seam
-        // inside the same work, and clearing there made the status blink.
-        "agent_end_aborted" | "agent_settled" => Some(false),
+        // Only the END OF THE RUN clears the indicator. `agent_end_aborted` is NOT
+        // that end: the runtime emits it for a RETRYABLE abort too (willRetry),
+        // where the run keeps working through the retry backoff — treating it as a
+        // stop made the indicator vanish exactly in the middle of the work.
+        "agent_settled" => Some(false),
         _ => None,
     }
 }
@@ -2401,7 +2403,7 @@ mod typing_tests {
         assert_eq!(activity_state_for("turn_start", None), Some(true));
         assert_eq!(activity_state_for("turn_end", None), None);
         assert_eq!(activity_state_for("agent_settled", None), Some(false));
-        assert_eq!(activity_state_for("agent_end_aborted", None), Some(false));
+        assert_eq!(activity_state_for("agent_end_aborted", None), None);
     }
 
     #[test]
