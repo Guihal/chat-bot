@@ -2004,6 +2004,14 @@ async fn ingest_loop(
         };
         let mut envelopes = vec![];
         let mut through = offset;
+        // A consumed update that we do not store must never be invisible: without
+        // these two lines a foreign-chat message or an unsupported update kind is
+        // eaten silently and the bot simply looks dead. Bounded to one line a
+        // minute per cause so a busy chat cannot flood the log.
+        let mut noted_kind: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+        let mut noted_chat: std::collections::HashMap<i64, std::time::Instant> =
+            std::collections::HashMap::new();
         for u in updates.as_array().cloned().unwrap_or_default() {
             let uid = u.get("update_id").and_then(|v| v.as_i64()).unwrap_or(0);
             through = through.max(uid + 1);
@@ -2012,7 +2020,21 @@ async fn ingest_loop(
             let msg = raw_msg.clone().or(chan_post.clone());
             let mut msg = match msg {
                 Some(m) => m,
-                None => continue,
+                None => {
+                    let kind = u
+                        .as_object()
+                        .and_then(|o| o.keys().find(|k| k.as_str() != "update_id").cloned())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let fresh = noted_kind
+                        .get(&kind)
+                        .map(|at| at.elapsed().as_secs() >= 60)
+                        .unwrap_or(true);
+                    if fresh {
+                        noted_kind.insert(kind.clone(), std::time::Instant::now());
+                        dlog(&format!("update {uid} ignored: unsupported kind {kind}"));
+                    }
+                    continue;
+                }
             };
             if let Some(id) = msg.get("message_id").and_then(|v| v.as_i64()) {
                 ops::record_message_id(id);
@@ -2024,7 +2046,23 @@ async fn ingest_loop(
             let strict = raw_msg.is_some();
             match envelope_from_message(&msg, uid, strict, chat) {
                 Ok(Some(env)) => envelopes.push(env),
-                Ok(None) => {}
+                Ok(None) => {
+                    let cid = msg
+                        .get("chat")
+                        .and_then(|c| c.get("id"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let fresh = noted_chat
+                        .get(&cid)
+                        .map(|at| at.elapsed().as_secs() >= 60)
+                        .unwrap_or(true);
+                    if fresh {
+                        noted_chat.insert(cid, std::time::Instant::now());
+                        dlog(&format!(
+                            "update {uid} dropped: chat {cid} is not the served chat {chat}"
+                        ));
+                    }
+                }
                 Err(e) => dlog(&format!("prepare message failed: {e:#}")),
             }
         }
