@@ -1763,7 +1763,10 @@ async fn track_loop(
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Activity must reach the typing indicator on the same beat as the turn:
+        // a 2 s poll put the first ping at the tail of a 3 s run, which reads as
+        // "the indicator does not work".
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
