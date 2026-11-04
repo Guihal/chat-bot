@@ -1321,16 +1321,25 @@ fn activity_state_for(kind: &str, phase: Option<bool>) -> Option<bool> {
     match kind {
         "agent_activity" => phase,
         "turn_start" => Some(true),
-        "turn_end" | "agent_end_aborted" | "agent_settled" => Some(false),
+        // Only the END OF THE RUN clears the indicator: a turn boundary is a seam
+        // inside the same work, and clearing there made the status blink.
+        "agent_end_aborted" | "agent_settled" => Some(false),
         _ => None,
     }
 }
 
+/// Pings Telegram while the agent works. The tick is fast so the FIRST ping lands
+/// on the same beat as the turn (owner: the indicator must be visible for the
+/// whole run, and a 1 s tick made it appear only at the tail of short runs);
+/// after that the cadence is one send per second, which is what Telegram wants.
 async fn typing_loop(db: Db) {
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    const TICK_MS: u64 = 200;
+    const RESEND_MS: u128 = 1000;
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(TICK_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut lit = false;
     let mut warned = false;
+    let mut last_sent: Option<std::time::Instant> = None;
     loop {
         tick.tick().await;
         let working = activity()
@@ -1342,8 +1351,16 @@ async fn typing_loop(db: Db) {
                 lit = false;
             }
             warned = false;
+            last_sent = None;
             continue;
         }
+        let due = last_sent
+            .map(|at| at.elapsed().as_millis() >= RESEND_MS)
+            .unwrap_or(true);
+        if !due {
+            continue;
+        }
+        last_sent = Some(std::time::Instant::now());
         let thread = activity().thread.load(std::sync::atomic::Ordering::Relaxed);
         let args = if thread > 0 {
             json!({ "thread_id": thread })
@@ -2382,7 +2399,7 @@ mod typing_tests {
             Some(false)
         );
         assert_eq!(activity_state_for("turn_start", None), Some(true));
-        assert_eq!(activity_state_for("turn_end", None), Some(false));
+        assert_eq!(activity_state_for("turn_end", None), None);
         assert_eq!(activity_state_for("agent_settled", None), Some(false));
         assert_eq!(activity_state_for("agent_end_aborted", None), Some(false));
     }

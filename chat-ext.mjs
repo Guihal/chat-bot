@@ -533,13 +533,14 @@ export default function (pi) {
     });
     activeDeliveries = [];
     activeBatches = [];
-    emit({ kind: "agent_activity", phase: "stopped" });
   });
 
   // A run fully settled: the only signal the daemon accepts as "the agent
   // finished with this turn and chose silence".
   pi.on("agent_settled", () => {
     emit({ kind: "agent_settled" });
+    // The run is over: this is the "agent stopped" hook the daemon polls for.
+    emit({ kind: "agent_activity", phase: "stopped" });
     reportDeliveryStates();
   });
 
@@ -587,7 +588,9 @@ export default function (pi) {
         deadline: ev.deadline || null,
         willRetry: Boolean(ev.willRetry),
       });
-      emit({ kind: "agent_activity", phase: "stopped" });
+      // Only a terminal end means "the agent stopped"; a retry is the same run
+      // still working, and the indicator must keep polling through it.
+      if (!ev.willRetry) emit({ kind: "agent_activity", phase: "stopped" });
     }
   });
 
