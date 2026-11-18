@@ -28,6 +28,7 @@ import {
   resolveKnowledgeDir,
   rulesBlock,
   rulesIds,
+  scrubOldBrevity,
 } from "./md-inject.ts";
 
 const BASE = "БАЗОВЫЙ ПРОМПТ ПЕРСОНЫ";
@@ -354,6 +355,15 @@ test("the knowledge dir is the absolute env value first, cwd only as fallback", 
   assert.equal(resolveKnowledgeDir({ env: {}, cwd: "/session" }), "/session/knowledge");
   assert.equal(resolveKnowledgeDir({ env: { CHATBOT_CWD: "/moved" } }), "/moved/knowledge");
   assert.equal(resolveKnowledgeDir({ env: {} }), null);
+});
+
+test("stale base-prompt brevity caps are scrubbed before composition", () => {
+  const stale =
+    "База около 40 знаков. Длинный разбор только по прямой просьбе. Одна короткая фраза 20–40 знаков.";
+  const cleaned = scrubOldBrevity(stale);
+  assert.equal(cleaned.includes("около 40 знаков"), false);
+  assert.equal(cleaned.includes("только по прямой просьбе"), false);
+  assert.equal(cleaned.includes("20–40 знаков"), false);
 });
 
 test("a missing directory is reported, never silently treated as empty knowledge", () => {
