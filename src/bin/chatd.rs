@@ -623,6 +623,28 @@ async fn knowledge_wait(sid: &str, sock: &str) -> Result<Value> {
     .await
 }
 
+async fn knowledge_messages(sid: &str, sock: &str) -> Result<Vec<Value>> {
+    let data = omo_on(
+        &["read", sid, "--tail", "10", "--messages"],
+        Duration::from_secs(60),
+        sock,
+    )
+    .await?;
+    data.get("messages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .ok_or_else(|| anyhow!("session read returned no messages"))
+}
+
+fn knowledge_answer(msgs: &[Value]) -> (usize, Option<String>) {
+    let web_calls = msgs
+        .iter()
+        .filter_map(|m| m.get("content"))
+        .map(chat_bot::knowledge::web_tool_calls)
+        .sum();
+    (web_calls, last_assistant_text(msgs))
+}
+
 async fn knowledge_turn(
     sid: &str,
     sock: &str,
@@ -631,23 +653,32 @@ async fn knowledge_turn(
     knowledge_wait(sid, sock).await?;
     omo_on(&["prompt", sid, prompt], Duration::from_secs(120), sock).await?;
     knowledge_wait(sid, sock).await?;
-    let data = omo_on(
-        &["read", sid, "--tail", "10", "--messages"],
-        Duration::from_secs(60),
-        sock,
-    )
-    .await?;
-    let msgs = data
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("session read returned no messages"))?;
-    let web_calls = msgs
-        .iter()
-        .filter_map(|m| m.get("content"))
-        .map(chat_bot::knowledge::web_tool_calls)
-        .sum();
-    let text = last_assistant_text(msgs)
-        .ok_or_else(|| anyhow!("session produced no assistant message"))?;
+    let msgs = knowledge_messages(sid, sock).await?;
+    let (mut web_calls, mut text) = knowledge_answer(&msgs);
+
+    // A provider can stop right after a tool result with an empty assistant
+    // message (`content: []`, stopReason stop). That is not an answer and must
+    // not abort an hourly job before its document write: ask once for the
+    // required JSON in the same session instead of starting over.
+    if text.is_none() {
+        omo_on(
+            &[
+                "prompt",
+                sid,
+                "Ты не вернул ответ. Верни ТОЛЬКО JSON по схеме из системного промпта и ничего больше. Не вызывай инструменты.",
+            ],
+            Duration::from_secs(120),
+            sock,
+        )
+        .await?;
+        knowledge_wait(sid, sock).await?;
+        let msgs = knowledge_messages(sid, sock).await?;
+        let (more_calls, more_text) = knowledge_answer(&msgs);
+        web_calls += more_calls;
+        text = more_text;
+    }
+
+    let text = text.ok_or_else(|| anyhow!("session produced no assistant message after retry"))?;
     Ok((web_calls, chat_bot::knowledge::parse_model_json(&text)?))
 }
 
