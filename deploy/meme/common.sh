@@ -1,6 +1,18 @@
 #!/bin/sh
 set -eu
 
+CALLER_MEME_ENABLED=${MEME_ENABLED:-}
+MEME_ENV_FILE=${MEME_ENV_FILE:-/etc/omo-chat/meme.env}
+if [ -f "$MEME_ENV_FILE" ]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$MEME_ENV_FILE"
+  set +a
+fi
+if [ -n "$CALLER_MEME_ENABLED" ]; then
+  export MEME_ENABLED="$CALLER_MEME_ENABLED"
+fi
+
 MEME_ROOT=${MEME_ROOT:-/opt/omo-chat/data/memes}
 MEME_LOG_DIR=${MEME_LOG_DIR:-$MEME_ROOT/logs}
 MEME_ENABLED=${MEME_ENABLED:-true}

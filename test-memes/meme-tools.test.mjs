@@ -24,6 +24,7 @@ process.env.MEME_MAX_PUBLISH_PER_DAY = "3";
 let server;
 let port = 0;
 let lastMultipart = Buffer.alloc(0);
+let sendCount = 0;
 
 beforeAll(async () => {
 	server = http.createServer((req, res) => {
@@ -62,6 +63,7 @@ beforeAll(async () => {
 				return;
 			}
 			if (url.includes("/sendPhoto") || url.includes("/sendVideo") || url.includes("/sendAnimation")) {
+				sendCount += 1;
 				lastMultipart = body;
 				sendJson({ ok: true, result: { message_id: 123 } });
 				return;
@@ -231,4 +233,125 @@ test("bot api base must stay loopback when set", () => {
 	  } finally {
 	    process.env.MEME_BOT_API_BASE = previous || "";
 	  }
+});
+
+function uniquePng(tag) {
+	return Buffer.concat([fs.readFileSync(path.join(fixtures, "cat-quartz.png")), Buffer.from(tag)]);
+}
+
+function saveUnique(source, postId, tag) {
+	return storage.saveCandidate({
+		source,
+		post_id: postId,
+		text: "тест",
+		why_funny: "тестовая причина",
+		media: { buffer: uniquePng(tag), mime: "image/png", kind: "photo" },
+	});
+}
+
+function candidateJson(id) {
+	return path.join(common.CANDIDATES_DIR, `${id}.json`);
+}
+
+test("cross-source repost with the same sha256 is rejected", () => {
+	const first = saveUnique("second", "910", "cross-source");
+	expect(first.status).toBe("saved");
+	const second = saveUnique("second", "911", "cross-source");
+	expect(second.status).toBe("duplicate");
+});
+
+test("media above its kind cap is rejected at save time", () => {
+	const header = fs.readFileSync(path.join(fixtures, "cat-quartz.png")).subarray(0, 8);
+	const oversized = Buffer.concat([header, Buffer.alloc(10 * 1024 * 1024 + 1)]);
+	expect(() =>
+		storage.saveCandidate({
+			source: "second",
+			post_id: "912",
+			text: "x",
+			why_funny: "y",
+			media: { buffer: oversized, mime: "image/png", kind: "photo" },
+		}),
+	).toThrow(/size cap/);
+});
+
+test("token file with group or other permissions is refused", () => {
+	const badToken = path.join(root, "bad-token");
+	fs.writeFileSync(badToken, "123456:BADTOKEN\n", { mode: 0o644 });
+	fs.chmodSync(badToken, 0o644);
+	const previous = process.env.MEME_BOT_TOKEN_FILE;
+	try {
+		process.env.MEME_BOT_TOKEN_FILE = badToken;
+		expect(() => botapi.sendMedia(storage.readCandidate("catmodernews__101"))).toThrow(/owner-only|permission/);
+	} finally {
+		process.env.MEME_BOT_TOKEN_FILE = previous || tokenPath;
+	}
+});
+
+for (const [label, mutate] of [
+	["traversal", (row) => ({ ...row, media: { ...row.media, path: "/etc/passwd" } })],
+	["symlink", (row) => row],
+]) {
+	test(`publish rejects ${label} media paths`, async () => {
+		const id = `second__${label === "traversal" ? "913" : "914"}`;
+		expect(saveUnique("second", id.split("__")[1], label).status).toBe("saved");
+		const file = candidateJson(id);
+		const row = JSON.parse(fs.readFileSync(file, "utf8"));
+		if (label === "symlink") {
+			fs.rmSync(row.media.path);
+			fs.symlinkSync("/etc/passwd", row.media.path);
+		}
+		fs.writeFileSync(file, JSON.stringify(mutate(row)));
+		const result = await toolsOf(publisherModule.default)
+			.get("meme_publish")
+			.execute(`neg-${label}`, { candidate_id: id });
+		expect(result.isError).toBe(true);
+	});
+}
+
+test("stale publishing claim is failed instead of re-sent", () => {
+	const id = "second__915";
+	expect(saveUnique("second", "915", "stale").status).toBe("saved");
+	const file = candidateJson(id);
+	const row = JSON.parse(fs.readFileSync(file, "utf8"));
+	row.status = "publishing";
+	row.claimed_at = new Date(Date.now() - 31 * 60_000).toISOString();
+	fs.writeFileSync(file, JSON.stringify(row));
+	expect(() => storage.claimCandidate(id)).toThrow(/stale/);
+});
+
+test("concurrent publishers send exactly once", async () => {
+	const id = "second__916";
+	expect(saveUnique("second", "916", "concurrent").status).toBe("saved");
+	const publish = toolsOf(publisherModule.default).get("meme_publish");
+	const before = sendCount;
+	const results = await Promise.allSettled([
+		publish.execute("c1", { candidate_id: id }),
+		publish.execute("c2", { candidate_id: id }),
+	]);
+	const succeeded = results.filter((r) => r.status === "fulfilled" && !r.value.isError).length;
+	expect(succeeded).toBe(1);
+	expect(sendCount - before).toBe(1);
+});
+
+test("prune removes media but keeps the permanent ledger entry", () => {
+	const id = "second__917";
+	expect(saveUnique("second", "917", "prune-ledger").status).toBe("saved");
+	const previousBytes = process.env.MEME_PRUNE_MAX_BYTES;
+	const previousEntries = process.env.MEME_PRUNE_MAX_ENTRIES;
+	try {
+		process.env.MEME_PRUNE_MAX_BYTES = "1";
+		process.env.MEME_PRUNE_MAX_ENTRIES = "1";
+		storage.prune();
+	} finally {
+		process.env.MEME_PRUNE_MAX_BYTES = previousBytes || String(200 * 1024 * 1024);
+		process.env.MEME_PRUNE_MAX_ENTRIES = previousEntries || "500";
+	}
+	expect(fs.existsSync(candidateJson(id))).toBe(false);
+	expect(common.ledgerHas({ id })).toBe(true);
+});
+
+test("alerts are rate limited once per day and kind", () => {
+	const kind = `negative-${Date.now()}`;
+	expect(common.alertOnce(kind, "first" )).toBe(true);
+	expect(common.alertOnce(kind, "second" )).toBe(false);
 });

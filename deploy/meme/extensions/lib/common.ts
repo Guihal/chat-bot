@@ -229,6 +229,7 @@ export function alertOnce(kind: string, message: string): boolean {
 			stdio: "ignore",
 			detached: true,
 		});
+		child.on("error", () => {});
 		child.unref();
 		return true;
 	} catch {

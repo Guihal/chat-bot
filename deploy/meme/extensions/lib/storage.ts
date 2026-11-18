@@ -12,6 +12,7 @@ import {
 	isCandidateId,
 	ledgerHas,
 	ledgerPublished,
+	mediaLimit,
 	nowIso,
 	readJson,
 	sha256Bytes,
@@ -68,6 +69,9 @@ export function saveCandidate(input: SaveInput): SaveResult {
 	const mime = sniffMime(input.media.buffer);
 	if (!mime || mime !== input.media.mime) throw new Error("media MIME does not match its bytes");
 	if (!mimeAllowed(input.media.kind, mime)) throw new Error("media kind does not match its MIME");
+	if (input.media.buffer.length > mediaLimit(input.media.kind)) {
+		throw new Error("media exceeds its size cap");
+	}
 	const sha256 = sha256Bytes(input.media.buffer);
 	if (ledgerHas({ sha256 })) return { status: "duplicate" };
 
@@ -184,6 +188,24 @@ function dailyPublishedCount(): number {
 
 export function claimCandidate(id: string): Candidate {
 	const row = readCandidate(id);
+	if (row.status === "publishing") {
+		const claimedAt = Date.parse(String(row.claimed_at || ""));
+		if (!Number.isFinite(claimedAt) || Date.now() - claimedAt > 30 * 60_000) {
+			const failed: Candidate = { ...row, status: "failed", error: "stale publishing claim" };
+			writeJsonAtomic(candidatePath(id), failed);
+			appendLedger({
+				id,
+				source: row.source,
+				source_post_id: row.source_post_id,
+				sha256: row.media.sha256,
+				status: "failed",
+				published_at: null,
+				first_seen: row.discovered_at,
+			});
+			throw new Error("stale publishing claim");
+		}
+		throw new Error("candidate is not available (publishing)");
+	}
 	if (row.status !== "candidate") throw new Error(`candidate is not available (${row.status})`);
 	if (ledgerPublished({ id }) || ledgerPublished({ sha256: row.media.sha256 })) {
 		 throw new Error("candidate is already known in the permanent dedupe ledger");
@@ -243,10 +265,12 @@ export function prune(): void {
 		 } catch {}
 	  }
 	let entries = rows.length;
-	if (totalBytes <= 200 * 1024 * 1024 && entries <= 500) return;
+	const maxBytes = Number(env("MEME_PRUNE_MAX_BYTES", String(200 * 1024 * 1024))) || 200 * 1024 * 1024;
+	const maxEntries = Number(env("MEME_PRUNE_MAX_ENTRIES", "500")) || 500;
+	if (totalBytes <= maxBytes && entries <= maxEntries) return;
 	const ordered = [...rows].sort((a, b) => String(a.discovered_at).localeCompare(String(b.discovered_at)));
 	for (const row of ordered) {
-		 if (totalBytes <= 200 * 1024 * 1024 && entries <= 500) break;
+		 if (totalBytes <= maxBytes && entries <= maxEntries) break;
 		 if (!["published", "failed", "candidate"].includes(row.status)) continue;
 		 let size = 0;
 		 try {

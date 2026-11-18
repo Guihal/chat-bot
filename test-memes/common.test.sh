@@ -49,4 +49,16 @@ run_case "active knowledge/meme job aborts" 75 \
 run_case "missing omo binary aborts" 127 \
   MEME_ENABLED=true OMO_BIN=/nonexistent
 
+ENV_FILE="$ROOT/meme.env"
+printf 'MEME_ENABLED=true\n' >"$ENV_FILE"
+for runner in discovery-run.sh publisher-run.sh; do
+  output=$(MEME_ENV_FILE="$ENV_FILE" MEME_ENABLED=false MEME_ROOT="$MEME_ROOT" \
+    sh "$COMMON_DIR/$runner" 2>&1)
+  if [ "$output" != "NO_NEW" ]; then
+    printf 'FAIL %s ignored caller kill switch: %s\n' "$runner" "$output" >&2
+    exit 1
+  fi
+  printf 'PASS %s honors caller kill switch over meme.env\n' "$runner"
+done
+
 printf 'COMMON_TESTS_OK\n'

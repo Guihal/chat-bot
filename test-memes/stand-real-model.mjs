@@ -135,7 +135,7 @@ function startServer() {
 					const name = url.slice(3);
 					const file =
 						name === "catmodernews"
-							? path.join(fixtures, "preview-catmodernews-one.html")
+							? path.join(fixtures, "preview-catmodernews-video.html")
 							: name === "second"
 								? path.join(fixtures, "preview-second.html")
 								: "";
@@ -219,10 +219,11 @@ async function main() {
 	console.log(`CANDIDATES_AFTER_DISCOVERY ${first.map((row) => `${row.id}:${row.status}`).join(",")}`);
 	assert(first.length >= 1, `discovery saved no candidates\n${discovery.out.slice(-3000)}`);
 	const candidate = first[0];
+	assert(candidate.media.kind === "video", `expected a video candidate, got ${candidate.media.kind}`);
 	assert(!/42|круг/i.test(candidate.text), `fixture post text must not contain the image marker`);
 	assert(
 		 /42|круг/i.test(candidate.why_funny),
-		 `why_funny does not name the image-only marker: ${candidate.why_funny}`,
+		 `why_funny does not name the frame-only marker: ${candidate.why_funny}`,
 	  );
 	assert(state.sends.length === 0, `discovery sent ${state.sends.length} channel messages`);
 	const countBefore = first.length;
@@ -248,11 +249,12 @@ async function main() {
 	  );
 	assert(state.sends.length === sendsBefore + 1, `publisher made ${state.sends.length - sendsBefore} sends`);
 	const bodyText = state.lastMultipart.toString("utf8");
-	const png = fs.readFileSync(path.join(fixtures, "cat-quartz.png"));
+	const mp4 = fs.readFileSync(path.join(fixtures, "video-frame-42.mp4"));
+	assert(state.sends.at(-1)?.method === "sendVideo", `publisher used ${state.sends.at(-1)?.method}, not sendVideo`);
 	assert(bodyText.includes("-1004421941006"), `multipart does not target the fixed channel`);
 	assert(bodyText.includes('name="caption"'), `multipart has no caption`);
 	assert(bodyText.includes("источник:"), `caption has no source attribution`);
-	assert(state.lastMultipart.includes(png), `multipart does not contain the saved PNG bytes`);
+	assert(state.lastMultipart.includes(mp4), `multipart does not contain the saved MP4 bytes`);
 	const published = readCandidates().find((row) => row.id === candidate.id);
 	assert(published?.status === "published", `candidate was not marked published`);
 
