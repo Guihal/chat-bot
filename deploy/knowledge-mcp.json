@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest", "--isolated"],
+      "exposure": "search"
+    },
+    "web-inspector": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-web-inspector",
+        "--no-save-session",
+        "--cdp-port",
+        "0"
+      ],
+      "exposure": "search"
+    },
+    "browser-inspector": {
+      "command": "npx",
+      "args": ["-y", "browser-inspector-mcp"],
+      "exposure": "search"
+    }
+  }
+}

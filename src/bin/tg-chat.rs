@@ -73,37 +73,12 @@ fn tool_history(args: &Value) -> String {
         Ok(c) => c,
         Err(e) => return json!({"error": e.to_string()}).to_string(),
     };
-    let mut q = "SELECT message_id, username, first_name, text, reply_to, media_path FROM messages"
-        .to_string();
-    let mut params: Vec<Value> = vec![];
-    if let Some(b) = args.get("before").and_then(|v| v.as_i64()) {
-        q.push_str(" WHERE update_id < ?");
-        params.push(json!(b));
-    }
+    let before = args.get("before").and_then(|v| v.as_i64());
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
-    q.push_str(" ORDER BY date DESC, message_id DESC LIMIT ?");
-    params.push(json!(limit));
-    let mut stmt = match con.prepare(&q) {
-        Ok(s) => s,
+    let rows = match chat_bot::store::history(&con, before, limit) {
+        Ok(rows) => rows,
         Err(e) => return json!({"error": e.to_string()}).to_string(),
     };
-    let p: Vec<Box<dyn rusqlite::ToSql>> = params
-        .iter()
-        .map(|v| Box::new(v.as_i64().unwrap_or(0)) as Box<dyn rusqlite::ToSql>)
-        .collect();
-    let refs: Vec<&dyn rusqlite::ToSql> = p.iter().map(|b| b.as_ref()).collect();
-    let rows: Vec<Value> = stmt
-        .query_map(refs.as_slice(), |r| {
-            Ok(json!({
-                "message_id": r.get::<_, Option<i64>>(0)?,
-                "user": r.get::<_, Option<String>>(1)?.or(r.get::<_, Option<String>>(2)?),
-                "text": r.get::<_, Option<String>>(3)?,
-                "reply_to": r.get::<_, Option<i64>>(4)?,
-                "media": r.get::<_, Option<String>>(5)?,
-            }))
-        })
-        .map(|it| it.flatten().collect())
-        .unwrap_or_default();
     let mut rows = rows;
     rows.reverse();
     serde_json::to_string(&rows).unwrap_or_default()
@@ -117,21 +92,10 @@ fn tool_search(args: &Value) -> String {
     };
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
-    let sql = "SELECT m.message_id, m.username, m.text FROM messages_fts f JOIN messages m ON m.id = f.rowid WHERE messages_fts MATCH ? LIMIT ?";
-    let run = |q: &str| -> Result<Vec<Value>> {
-        let mut stmt = con.prepare(sql)?;
-        let rows: Vec<Value> = stmt
-            .query_map(rusqlite::params![q, limit], |r| {
-                Ok(json!({"message_id": r.get::<_, Option<i64>>(0)?, "user": r.get::<_, Option<String>>(1)?, "text": r.get::<_, Option<String>>(2)?.unwrap_or_default()}))
-            })?
-            .flatten()
-            .collect();
-        Ok(rows)
-    };
-    let rows = run(query).unwrap_or_default();
+    let rows = chat_bot::store::fts_search(&con, query, limit).unwrap_or_default();
     let rows = if rows.is_empty() {
         let phrase = format!("\"{}\"", query.replace('"', "\"\""));
-        run(&phrase).unwrap_or_default()
+        chat_bot::store::fts_search(&con, &phrase, limit).unwrap_or_default()
     } else {
         rows
     };
@@ -203,27 +167,8 @@ fn tool_chatter_brief(args: &Value) -> String {
     } else {
         format!("@{name}")
     };
-    let row: (i64, Option<i64>, Option<i64>) = con
-        .query_row(
-            "SELECT COUNT(*), MIN(date), MAX(date) FROM messages WHERE username = ? COLLATE NOCASE OR first_name = ? COLLATE NOCASE OR ('@' || username) = ? COLLATE NOCASE",
-            rusqlite::params![name, name, at],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .unwrap_or((0, None, None));
-    let mut stmt = con
-        .prepare("SELECT text FROM messages WHERE (username = ? COLLATE NOCASE OR first_name = ? COLLATE NOCASE) AND text <> '' ORDER BY update_id DESC LIMIT 3")
-        .unwrap();
-    let samples: Vec<String> = stmt
-        .query_map(rusqlite::params![name, name], |r| {
-            r.get::<_, Option<String>>(0)
-        })
-        .map(|it| {
-            it.flatten()
-                .flatten()
-                .map(|s| s.chars().take(200).collect())
-                .collect()
-        })
-        .unwrap_or_default();
+    let row = chat_bot::store::chatter_bounds(&con, &name, &at);
+    let samples = chat_bot::store::chatter_samples(&con, &name);
     let mut lines = vec![format!("@{name} — {} messages in mirror", row.0)];
     if let Some((f, text)) = load_portrait(&name) {
         lines.push(format!("portrait ({f}):"));
@@ -261,36 +206,9 @@ fn tool_chat_stats() -> String {
         Ok(c) => c,
         Err(e) => return json!({"error": e.to_string()}).to_string(),
     };
-    let myself: i64 = kv_get(&con, "self_id", "0").parse().unwrap_or(0);
-    let excl = format!("WHERE user_id IS NULL OR user_id != {myself}");
-    let total: i64 = con
-        .query_row(&format!("SELECT COUNT(*) FROM messages {excl}"), [], |r| {
-            r.get(0)
-        })
-        .unwrap_or(0);
-    let media: i64 = con
-        .query_row(&format!("SELECT COUNT(*) FROM messages WHERE media_path <> '' AND (user_id IS NULL OR user_id != {myself})"), [], |r| r.get(0))
-        .unwrap_or(0);
-    let bounds: (Option<i64>, Option<i64>) = con
-        .query_row(
-            &format!("SELECT MIN(date), MAX(date) FROM messages {excl}"),
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap_or((None, None));
-    let mut stmt = con.prepare(&format!("SELECT COALESCE(NULLIF(username, ''), first_name, CAST(user_id AS TEXT)), COUNT(*) FROM messages {excl} GROUP BY 1 ORDER BY 2 DESC LIMIT 10")).unwrap();
-    let top: Vec<(Option<String>, i64)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .map(|it| it.flatten().collect())
-        .unwrap_or_default();
-    let days_rows: Vec<Option<i64>> = {
-        let mut s = con.prepare(&format!("SELECT date FROM messages WHERE date > 0 AND (user_id IS NULL OR user_id != {myself})")).unwrap();
-        s.query_map([], |r| r.get(0))
-            .map(|it| it.flatten().collect())
-            .unwrap_or_default()
-    };
+    let stats = chat_bot::store::chat_stats(&con);
     let mut days: std::collections::HashMap<String, i64> = Default::default();
-    for ts in days_rows.into_iter().flatten() {
+    for ts in stats.dates {
         let d = chrono::DateTime::from_timestamp(ts, 0)
             .map(|t| t.format("%Y-%m-%d").to_string())
             .unwrap_or_default();
@@ -308,11 +226,11 @@ fn tool_chat_stats() -> String {
         .map(|(d, c)| json!({"day": d, "messages": c}))
         .collect();
     json!({
-        "total_messages": total,
-        "media_messages": media,
-        "first_date": bounds.0,
-        "last_date": bounds.1,
-        "top_chatters": top.iter().map(|(u, c)| json!({"user": u, "messages": c})).collect::<Vec<_>>(),
+        "total_messages": stats.total,
+        "media_messages": stats.media,
+        "first_date": stats.first_date,
+        "last_date": stats.last_date,
+        "top_chatters": stats.top.iter().map(|(u, c)| json!({"user": u, "messages": c})).collect::<Vec<_>>(),
         "activity_last_14_days": recent,
     })
     .to_string()

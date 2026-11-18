@@ -291,30 +291,12 @@ fn dialogue_stalled(c: &Cfg, now: chrono::DateTime<chrono::Utc>) -> BTreeMap<Str
     let bot_id = if c.bot_id != 0 {
         c.bot_id
     } else {
-        con.query_row("SELECT v FROM kv WHERE k='self_id'", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(0)
+        chat_bot::store::bot_self_id(&con).unwrap_or(0)
     };
     if bot_id == 0 {
         return out;
     }
-    let inbound: i64 = con
-        .query_row(
-            "SELECT COUNT(*) FROM messages WHERE date >= ?1 AND user_id <> ?2",
-            rusqlite::params![since, bot_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let answers: i64 = con
-        .query_row(
-            "SELECT COUNT(*) FROM messages WHERE date >= ?1 AND user_id = ?2",
-            rusqlite::params![since, bot_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let (inbound, answers) = chat_bot::store::stall_counts(&con, since, bot_id);
     if inbound >= 3 && answers == 0 {
         out.insert("stalled".to_string(), format!("{inbound} incoming"));
     }
@@ -817,6 +799,7 @@ fn selftest() -> i32 {
     );
     save_json(&c.baseline, &next);
 
+    // boundary-skip:begin the `botwatch --selftest` fixture database is test data in product code
     if let Ok(con) = rusqlite::Connection::open(&c.mirror) {
         let _ = con.execute(
             "CREATE TABLE messages (message_id INTEGER PRIMARY KEY, user_id INTEGER, date INTEGER)",
@@ -853,6 +836,7 @@ fn selftest() -> i32 {
     );
     save_json(&c.baseline, &next);
 
+    // boundary-skip:end
     let later = now + chrono::Duration::minutes(c.window_min + 5);
     let previous = load_json(&c.baseline);
     let (lines, _) = render(&c, &collect(&c, later), &previous);

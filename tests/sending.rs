@@ -4,7 +4,10 @@
 //! a fake Bot API and inspects the journal tables afterwards. Environment
 //! variables are process-global, so the tests serialise on one mutex.
 use chat_bot::db::Db;
+use chat_bot::store::Store;
 use chat_bot::ledger;
+use chat_bot::ledger::SendOutcome;
+use chat_bot::store::{BeginSend, PartMeta};
 use chat_bot::media::{cleanup_media, MediaBudget};
 use chat_bot::*;
 use serde_json::{json, Value};
@@ -20,6 +23,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 struct FakeApi {
     base: String,
     methods: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<Value>>>,
     _seq: Arc<Mutex<i64>>,
 }
 
@@ -27,22 +31,30 @@ fn start_fake_api() -> FakeApi {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake api");
     let addr = listener.local_addr().unwrap();
     let methods = Arc::new(Mutex::new(Vec::<String>::new()));
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
     let seq = Arc::new(Mutex::new(1000i64));
     let m = methods.clone();
+    let rq = requests.clone();
     let s = seq.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            serve(stream, m.clone(), s.clone());
+            serve(stream, m.clone(), rq.clone(), s.clone());
         }
     });
     FakeApi {
         base: format!("http://{addr}"),
         methods,
+        requests,
         _seq: seq,
     }
 }
 
-fn serve(mut stream: TcpStream, methods: Arc<Mutex<Vec<String>>>, seq: Arc<Mutex<i64>>) {
+fn serve(
+    mut stream: TcpStream,
+    methods: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<Value>>>,
+    seq: Arc<Mutex<i64>>,
+) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
@@ -74,6 +86,7 @@ fn serve(mut stream: TcpStream, methods: Arc<Mutex<Vec<String>>>, seq: Arc<Mutex
         let mut n = seq.lock().unwrap();
         *n += 1;
         let request: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+        requests.lock().unwrap().push(request.clone());
         let requested = |field: &str| {
             request
                 .get(field)
@@ -116,6 +129,7 @@ struct Fixture {
     _guard: std::sync::MutexGuard<'static, ()>,
     state: String,
     db: Db,
+    store: Store,
     api: FakeApi,
     dir: PathBuf,
 }
@@ -141,6 +155,7 @@ async fn fixture(tag: &str) -> Fixture {
     std::env::set_var("CHATBOT_STATE_DIR", &dir);
     let state = dir.join("state").to_string_lossy().to_string();
     let db = Db::open(&state).unwrap();
+    let store = Store::open(&state).unwrap();
     db.call(|con| {
         kv_set(con, "chat_id", "-100")?;
         kv_set(con, "self_id", "550001")?;
@@ -157,6 +172,7 @@ async fn fixture(tag: &str) -> Fixture {
         _guard: guard,
         state,
         db,
+        store,
         api,
         dir,
     }
@@ -189,7 +205,7 @@ async fn answer_state(f: &Fixture) -> (String, Option<String>, i64) {
 async fn answer_without_quote_closes_the_batch() {
     let f = fixture("quote").await;
     let raw = chat_bot::send::chat_send(
-        &f.db,
+        &f.store,
         &json!({"batch_key": "sig-1", "text": "ответ без цитаты"}),
     )
     .await
@@ -218,17 +234,127 @@ async fn answer_without_quote_closes_the_batch() {
     assert!(mirror.2 > 0);
 }
 
+/// Owner's contract (2026-11-08): the extension carries no batch ticket at all.
+/// An unaddressed send belongs to the batch that is still waiting.
+#[tokio::test(flavor = "current_thread")]
+async fn a_send_without_a_ticket_answers_the_waiting_batch() {
+    let f = fixture("no-ticket").await;
+    let raw = chat_bot::send::chat_send(&f.store, &json!({"text": "ответ без билета"}))
+        .await
+        .unwrap();
+    assert!(raw.contains("ответ без билета"), "{raw}");
+    let v = view(&f, "sig-1").await;
+    assert_eq!(v.state, "closed", "the waiting batch owns the answer");
+    assert_eq!(v.outcome.as_deref(), Some("delivered"));
+    assert_eq!(v.sent, 1);
+}
+
+/// Two batches can be open at once (a steer accepted mid-turn, a post and its
+/// discussion copy). A late answer to the earlier message must follow its own
+/// message id, not "whatever opened last" — the wrong pick silently drops
+/// `reply_to` and leaves the real message unanswered.
+/// A batch whose automated retries were exhausted stays open on purpose, but it
+/// must never take someone else's answer: the reply would land in a stale forum
+/// topic while the real message went unanswered.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stalled_batch_does_not_take_the_answer() {
+    let f = fixture("stalled").await;
+    f.db.write(|tx| tx.seal_batch("sig-2", -100, Some(78), &[201], &[201]))
+        .await
+        .unwrap();
+    chat_bot::store::kv_set(&f.store, "batch_stalled:sig-2", "1")
+        .await
+        .unwrap();
+    let raw = chat_bot::send::chat_send(&f.store, &json!({"text": "ответ в живую пачку"}))
+        .await
+        .unwrap();
+    assert!(raw.contains("ответ в живую пачку"), "{raw}");
+    assert_eq!(
+        view(&f, "sig-1").await.state,
+        "closed",
+        "the answer belongs to the batch that is not stalled"
+    );
+    assert_ne!(
+        view(&f, "sig-2").await.state,
+        "closed",
+        "a stalled batch must stay untouched"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_late_answer_follows_its_own_message_id() {
+    let f = fixture("two-open").await;
+    f.db.write(|tx| tx.seal_batch("sig-2", -100, Some(78), &[201], &[201]))
+        .await
+        .unwrap();
+    let raw = chat_bot::send::chat_send(
+        &f.store,
+        &json!({"text": "ответ на первое", "reply_to": 101}),
+    )
+    .await
+    .unwrap();
+    assert!(raw.contains("ответ на первое"), "{raw}");
+    let first = view(&f, "sig-1").await;
+    assert_eq!(first.state, "closed", "the addressed batch took the answer");
+    assert_eq!(first.outcome.as_deref(), Some("delivered"));
+    let second = view(&f, "sig-2").await;
+    assert_ne!(second.state, "closed", "the other batch stayed waiting");
+}
+
+/// Tolerance, not an instruction. The owner removed the gate that refused a
+/// reply target outside the batch, so the daemon must keep any target as given —
+/// including one from the history or the GIF catalog. Whether the assistant
+/// quotes at all is a prompt rule (owner: it does not), which is why this test
+/// proves only that nothing is refused.
+#[tokio::test(flavor = "current_thread")]
+async fn an_out_of_batch_reply_is_accepted_but_not_encouraged() {
+    let f = fixture("free-reply").await;
+    let raw = chat_bot::send::chat_send(
+        &f.store,
+        &json!({"text": "ответ в историю", "reply_to": 999_001}),
+    )
+    .await
+    .unwrap();
+    assert!(raw.contains("ответ в историю"), "{raw}");
+    let mirror: Option<i64> = f
+        .db
+        .call(|con| {
+            Ok(con.query_row(
+                "SELECT reply_to FROM messages WHERE username='smokebot'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(mirror, Some(999_001), "the quote must not be restricted");
+    // An id that does not exist in the answering chat is exactly what a linked
+    // channel post looks like. Without this flag Telegram fails the whole call
+    // and the answer is lost, so the flag is part of the contract.
+    let sent = f.api.requests.lock().unwrap();
+    assert_eq!(
+        sent.last().and_then(|r| r.get("reply_to_message_id")).and_then(|v| v.as_i64()),
+        Some(999_001),
+        "the quote reaches the Bot API as given"
+    );
+    assert_eq!(
+        sent.last().and_then(|r| r.get("allow_sending_without_reply")).and_then(|v| v.as_bool()),
+        Some(true),
+        "a dead reply target must not cost the message"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn second_answer_is_refused_and_same_fingerprint_replays() {
     let f = fixture("replay").await;
     let args = json!({"batch_key": "sig-1", "text": "первый"});
-    let first = chat_bot::send::chat_send(&f.db, &args).await.unwrap();
+    let first = chat_bot::send::chat_send(&f.store, &args).await.unwrap();
     assert_eq!(calls(&f), vec!["sendMessage".to_string()]);
-    let again = chat_bot::send::chat_send(&f.db, &args).await.unwrap();
+    let again = chat_bot::send::chat_send(&f.store, &args).await.unwrap();
     assert_eq!(again, first, "replay was not byte-identical");
     assert_eq!(calls(&f).len(), 1, "replay reached the Bot API again");
     let refused = chat_bot::send::chat_send(
-        &f.db,
+        &f.store,
         &json!({"batch_key": "sig-1", "text": "второй другой"}),
     )
     .await
@@ -252,7 +378,7 @@ async fn crash_between_sending_and_reply_becomes_unknown_without_resend() {
     })
     .await
     .unwrap();
-    let repaired = chat_bot::send::repair_sending(&f.db).await.unwrap();
+    let repaired = chat_bot::send::repair_sending(&f.store).await.unwrap();
     assert_eq!(repaired, 1);
     let v = view(&f, "sig-1").await;
     assert_eq!(v.state, "closed");
@@ -270,7 +396,7 @@ async fn crash_between_sending_and_reply_becomes_unknown_without_resend() {
         .unwrap();
     assert_eq!(incidents, 1, "startup repair must emit exactly one alert");
     let err =
-        chat_bot::send::chat_send(&f.db, &json!({"batch_key": "sig-1", "text": "в процессе"}))
+        chat_bot::send::chat_send(&f.store, &json!({"batch_key": "sig-1", "text": "в процессе"}))
             .await
             .unwrap_err()
             .to_string();
@@ -282,7 +408,7 @@ async fn crash_between_sending_and_reply_becomes_unknown_without_resend() {
 async fn sticker_plus_text_is_two_bot_api_calls() {
     let f = fixture("sticker").await;
     let raw = chat_bot::send::chat_send(
-        &f.db,
+        &f.store,
         &json!({
             "batch_key": "sig-1",
             "text": "подпись отдельным сообщением",
@@ -324,7 +450,7 @@ async fn sticker_plus_text_is_two_bot_api_calls() {
 async fn own_sent_gif_and_sticker_mirror_the_receipt_and_feed_the_catalogue() {
     let f = fixture("ownmedia").await;
     let raw = chat_bot::send::chat_send(
-        &f.db,
+        &f.store,
         &json!({"batch_key": "sig-1", "text": "гиф", "gif_file_id": "gif-src"}),
     )
     .await
@@ -366,7 +492,10 @@ async fn own_sent_gif_and_sticker_mirror_the_receipt_and_feed_the_catalogue() {
         "own sent gif lost a receipt field in the mirror"
     );
     let page =
-        f.db.call(|con| chat_bot::catalog::page(con, 0, 10))
+        f.db.call(|con| {
+              let (rows, total) = chat_bot::store::catalog_page(con, 0, 10)?;
+              Ok(chat_bot::catalog::page_of(rows, 0, total))
+          })
             .await
             .unwrap();
     assert!(
@@ -378,7 +507,7 @@ async fn own_sent_gif_and_sticker_mirror_the_receipt_and_feed_the_catalogue() {
         .await
         .unwrap();
     let raw = chat_bot::send::chat_send(
-        &f.db,
+        &f.store,
         &json!({"batch_key": "sig-2", "sticker_file_id": "stick-src"}),
     )
     .await
@@ -406,7 +535,10 @@ async fn own_sent_gif_and_sticker_mirror_the_receipt_and_feed_the_catalogue() {
         )
     );
     let page =
-        f.db.call(|con| chat_bot::catalog::page(con, 0, 10))
+        f.db.call(|con| {
+              let (rows, total) = chat_bot::store::catalog_page(con, 0, 10)?;
+              Ok(chat_bot::catalog::page_of(rows, 0, total))
+          })
             .await
             .unwrap();
     assert!(
@@ -427,9 +559,9 @@ async fn retention_removes_only_past_horizon_and_keeps_parents_and_catalogues() 
     f.db.call(move |con| {
         let insert = |mid: i64, date: i64, text: &str, reply: Option<i64>, kind: &str, fid: &str, uid: &str| {
             con.execute(
-                "INSERT INTO messages(chat_id,update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind,media_state)
-                 VALUES(-100,0,?,?,556,'u','U',?,?,'',?,?,?,?)",
-                rusqlite::params![mid, date, text, reply, fid, uid, kind, if kind == "animation" { "ready" } else { "absent" }],
+                "INSERT INTO messages(chat_id,update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind,media_state,media_size)
+                 VALUES(-100,0,?,?,556,'u','U',?,?,'',?,?,?,?,?)",
+                rusqlite::params![mid, date, text, reply, fid, uid, kind, if kind == "animation" { "ready" } else { "absent" }, if kind == "animation" { 100i64 } else { 0i64 }],
             )?;
             Ok::<(), anyhow::Error>(())
         };
@@ -452,19 +584,16 @@ async fn retention_removes_only_past_horizon_and_keeps_parents_and_catalogues() 
         reserve: chat_bot::media::FREE_RESERVE_BYTES,
     };
     let state = f.state.clone();
-    let report =
-        f.db.call(move |con| {
-            cleanup_media(
-                con,
-                &state,
-                &budget,
-                SystemTime::now(),
-                Duration::ZERO,
-                chat_bot::media::ROW_RETENTION_DAYS,
-            )
-        })
-        .await
-        .unwrap();
+    let report = cleanup_media(
+        &f.store,
+        &state,
+        &budget,
+        SystemTime::now(),
+        Duration::ZERO,
+        chat_bot::media::ROW_RETENTION_DAYS,
+    )
+    .await
+    .unwrap();
     assert!(report.rows_removed >= 3, "{report:?}");
     let exists = |mid: i64| {
         let con = rusqlite::Connection::open(Path::new(&f.state).join("history.db")).unwrap();
@@ -511,7 +640,7 @@ async fn intent_only_crash_closes_the_batch_with_a_declared_outcome() {
     assert_eq!(before.pending_sends, 1);
     assert_eq!(before.sent, 0);
 
-    let repaired = chat_bot::send::repair_sending(&f.db).await.unwrap();
+    let repaired = chat_bot::send::repair_sending(&f.store).await.unwrap();
     assert_eq!(repaired, 1, "intent-only crash was not recovered");
     let v = view(&f, "sig-1").await;
     assert_eq!(v.state, "closed", "intent-only batch never closed");
@@ -530,7 +659,7 @@ async fn intent_only_crash_closes_the_batch_with_a_declared_outcome() {
         .unwrap();
     assert_eq!(incidents, 1, "recovery must declare one incident");
     let err =
-        chat_bot::send::chat_send(&f.db, &json!({"batch_key": "sig-1", "text": "в процессе"}))
+        chat_bot::send::chat_send(&f.store, &json!({"batch_key": "sig-1", "text": "в процессе"}))
             .await
             .unwrap_err()
             .to_string();
@@ -553,7 +682,7 @@ async fn compact_after_no_quote_does_not_repush_the_closed_batch() {
     .await
     .unwrap();
     chat_bot::send::chat_send(
-        &f.db,
+        &f.store,
         &json!({"batch_key": "sig-1", "text": "ответ без цитаты"}),
     )
     .await
@@ -572,13 +701,75 @@ async fn compact_after_no_quote_does_not_repush_the_closed_batch() {
         .iter()
         .any(|e| e.get("kind").and_then(|x| x.as_str()) == Some("compacted")));
     let state = f.state.clone();
-    let text =
-        f.db.call(move |con| chat_bot::push_pending(&state, con, "sig-1"))
-            .await
-            .unwrap();
+    let text = chat_bot::push_pending(&f.store, &state, "sig-1").await.unwrap();
     assert!(
         text.is_none(),
         "closed batch was regenerated after compact: {text:?}"
     );
     assert_eq!(calls(&f), vec!["sendMessage".to_string()]);
+}
+
+
+/// The Unknown arm of `finish_send` keeps today's rollout: the actor returns a
+/// typed error, the whole write rolls back (sends stays `sending`, no incident,
+/// batch not closed), and the caller — never the actor — fires the alarm.
+#[tokio::test(flavor = "current_thread")]
+async fn unknown_send_rolls_back_and_carries_the_alarm_detail() {
+    let f = fixture("unknown-arm").await;
+    let parts = vec![PartMeta {
+        kind: "text".into(),
+        text: "ответ".into(),
+        file_id: String::new(),
+        file_unique_id: String::new(),
+        media_path: String::new(),
+    }];
+    let begin = chat_bot::store::open_answer_with_sends_of(
+        &f.store,
+        "sig-1".into(),
+        "fp-u".into(),
+        -100,
+        Some(77),
+        None,
+        parts,
+    )
+    .await
+    .unwrap();
+    let intent = match begin {
+        BeginSend::Opened(intents) => intents[0].clone(),
+        BeginSend::Replay { .. } => panic!("a fresh answer must be opened"),
+    };
+    chat_bot::store::start_send_of(&f.store, intent.clone())
+        .await
+        .unwrap();
+    let err = chat_bot::store::finish_send_of(
+        &f.store,
+        intent,
+        SendOutcome::Unknown("boom".into()),
+        None,
+    )
+    .await
+    .expect_err("the unknown arm must roll back");
+    assert_eq!(
+        chat_bot::store::send_unknown_detail(&err).as_deref(),
+        Some("send answer:1:part:0: boom")
+    );
+
+    let (send_state, incidents, batch_state, answer_state): (String, i64, String, String) = f
+        .db
+        .call(|con| {
+            Ok((
+                con.query_row("SELECT state FROM sends LIMIT 1", [], |r| r.get(0))?,
+                con.query_row("SELECT COUNT(*) FROM incidents", [], |r| r.get(0))?,
+                con.query_row("SELECT state FROM batches WHERE batch_key='sig-1'", [], |r| {
+                    r.get(0)
+                })?,
+                con.query_row("SELECT state FROM answers LIMIT 1", [], |r| r.get(0))?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(send_state, "sending", "a rolled-back send changed state");
+    assert_eq!(incidents, 0, "a rolled-back send wrote an incident");
+    assert_ne!(batch_state, "closed", "a rolled-back send closed the batch");
+    assert_eq!(answer_state, "open", "a rolled-back send closed the answer");
 }

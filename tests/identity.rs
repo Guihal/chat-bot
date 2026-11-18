@@ -64,7 +64,7 @@ async fn identical_content_persists_and_same_id_is_one_row() {
         .unwrap()
         .unwrap();
     let stored = db
-        .call(move |con| store_prepared(con, &prep, ""))
+        .call(move |con| chat_bot::store::stored_row(con, &prep))
         .await
         .unwrap();
     assert_eq!(stored.applied.inserted, 1, "legacy path dropped by content");

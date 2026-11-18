@@ -10,17 +10,17 @@
 //! only. A file_id or an extension cannot tell a GIF from an MP4: Telegram
 //! serves `.mp4` for both, so looking at bytes would mislabel videos as GIFs.
 
-use crate::db::Db;
+use crate::store::Store;
 use crate::{api, api_base, token};
 use anyhow::{anyhow, Result};
-use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::ffi::CString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::Stdio;
+use std::time::{Duration, SystemTime};
+use tokio::io::AsyncWriteExt;
 
 /// DESIGN §8: `media/` ceiling and the free-space reserve that text may not
 /// eat into. Below `REFUSE_FREE_BYTES` only text is accepted.
@@ -36,12 +36,24 @@ pub const FETCH_DEADLINE: Duration = Duration::from_secs(120);
 pub const MEDIA_QUEUE_CAP: usize = 64;
 /// An unreferenced file must be at least this old before it is an orphan.
 pub const ORPHAN_GRACE: Duration = Duration::from_secs(3600);
+/// A file younger than this survives one wipe pass: the model may still be
+/// reading a file delivered moments ago, and a download may still be landing.
+pub const MEDIA_GRACE: Duration = Duration::from_secs(600);
+/// A batch waits at most this long for its own media before it is handed to
+/// the model. Longer than any healthy fetch, shorter than a chat pause.
+pub const MEDIA_WAIT_SEC: u64 = 8;
 /// Rows older than this are removed by the cleanup pass (after their reply
 /// targets stop referencing them and after one row per catalogue key is kept).
 /// DESIGN §8 forbids a zero default: the disk fills under history, so the
 /// shipped horizon is 30 days. `CHATBOT_ROW_RETENTION_DAYS=0` remains an
 /// explicit operator override, never the default.
 pub const ROW_RETENTION_DAYS: i64 = 30;
+/// A photo larger than this is resized before its path reaches the model.
+/// The built-in `read` tool returns an image as base64 in the transcript: an
+/// original chat photo produced a 3.36 MB toolResult and corrupted a long
+/// live session. The bound is on the stored bytes, not on prose in the prompt.
+pub const PHOTO_CONTEXT_LIMIT: u64 = 256 * 1024;
+const PHOTO_MAX_EDGE: u16 = 1024;
 
 /// The single media state of a message. `Descriptor` means "we know the kind
 /// and file_id, but this kind is marker-only and is never downloaded".
@@ -182,10 +194,15 @@ pub fn media_kind_of(msg: &Value) -> Option<(MediaKind, Value)> {
     None
 }
 
-/// A GIF candidate is a READY animation. The catalog must not offer a video,
-/// a document carrying video MIME, a sticker, or a row still downloading.
+/// A GIF candidate is an animation the catalogue can offer. The video itself
+/// is NEVER fetched (a video in the context is a frame), so the record depends
+/// on the identifiers and a known size, not on local bytes.
 pub fn is_gif_candidate(state: MediaState, kind: &str, file_id: &str) -> bool {
-    state == MediaState::Ready && kind == "animation" && !file_id.is_empty()
+    matches!(
+        state,
+        MediaState::Ready | MediaState::Descriptor | MediaState::Evicted
+    ) && kind == "animation"
+        && !file_id.is_empty()
 }
 
 /// One durable download request. `row_id` is the surrogate message id, which
@@ -313,7 +330,9 @@ impl MediaSource for TelegramSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchOutcome {
-    /// Budget said no: nothing was fetched, the row stays pending.
+    /// Budget said no: nothing was fetched. The row stays `pending`, and
+    /// maintenance re-queues it on every pass until `MEDIA_GRACE` runs out;
+    /// after that `cleanup_media` stops retrying it (see its doc).
     Deferred,
     Finalized {
         path: String,
@@ -323,11 +342,81 @@ pub enum FetchOutcome {
     Skipped,
 }
 
+/// (max edge, ffmpeg `-q:v`) rungs, largest/fastest first. A noisy raster whose
+/// first resize still exceeds the bound is stepped down through this fixed,
+/// bounded ladder instead of being stored unbounded.
+pub const PHOTO_BOUND_RUNGS: [(u16, u8); 7] = [
+    (PHOTO_MAX_EDGE, 5),
+    (768, 7),
+    (512, 9),
+    (384, 12),
+    (256, 16),
+    (128, 22),
+    (64, 31),
+];
+
+/// Resize one raster photo through ffmpeg's pipe interface. A rung is accepted
+/// only when it produced a real image that is both smaller than the input and
+/// inside `PHOTO_CONTEXT_LIMIT`. `Ok(None)` means no rung fit: the caller must
+/// fail closed and never store the original bytes as a model-readable blob.
+async fn bounded_photo_bytes(bytes: Vec<u8>) -> Result<Option<Vec<u8>>> {
+    for (edge, qv) in PHOTO_BOUND_RUNGS {
+        let scale = format!("scale='min({edge},iw)':-2");
+        let q = qv.to_string();
+        let mut child = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "image2pipe",
+                "-i",
+                "-",
+                "-vf",
+                &scale,
+                "-q:v",
+                &q,
+                "-frames:v",
+                "1",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "mjpeg",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            if stdin.write_all(&bytes).await.is_err() {
+                continue;
+            }
+            drop(stdin);
+        }
+        let out = match tokio::time::timeout(FETCH_DEADLINE, child.wait_with_output()).await {
+            Ok(Ok(out)) => out,
+            // A rung that fails or times out is skipped, never fatal: the next
+            // (smaller) rung may still produce a bounded, decodable image.
+            _ => continue,
+        };
+        let bounded = out.stdout;
+        if out.status.success()
+            && !bounded.is_empty()
+            && (bounded.len() as u64) <= PHOTO_CONTEXT_LIMIT
+            && bounded.len() < bytes.len()
+        {
+            return Ok(Some(bounded));
+        }
+    }
+    Ok(None)
+}
+
 /// Fetch one job and finalize its blob. The budget is checked BEFORE the
 /// network call and again on the real byte count; a refusal never writes a
 /// file and never changes the row.
 pub async fn fetch_job<S: MediaSource>(
-    db: &Db,
+    store: &Store,
     state: &str,
     job: &MediaJob,
     budget: &MediaBudget,
@@ -346,6 +435,36 @@ pub async fn fetch_job<S: MediaSource>(
     }
     let dir = media_dir(state);
     std::fs::create_dir_all(&dir)?;
+    let mut fetched = fetched;
+    let mut resized = false;
+    if job.kind == "photo" && size > PHOTO_CONTEXT_LIMIT {
+        match bounded_photo_bytes(std::mem::take(&mut fetched.bytes)).await {
+            Ok(Some(bytes)) => {
+                fetched.bytes = bytes;
+                resized = true;
+            }
+            Ok(None) => {
+                // No rung produced a decodable image inside the bound. Fail
+                // closed: never finalize an oversized blob that would reach
+                // the model through the read tool as a huge base64 result.
+                // Leave the row pending so maintenance retries its budget;
+                // the oversized bytes are dropped here, never written.
+                crate::dlog(&format!(
+                    "media row {} photo exceeded {PHOTO_CONTEXT_LIMIT} bytes and no resize rung fit; refusing blob",
+                    job.row_id
+                ));
+                return Ok(FetchOutcome::Deferred);
+            }
+            Err(e) => {
+                crate::dlog(&format!(
+                    "media row {} photo bound failed: {e:#}; refusing blob",
+                    job.row_id
+                ));
+                return Ok(FetchOutcome::Deferred);
+            }
+        }
+    }
+    let size = fetched.bytes.len() as u64;
     let safe: String = Path::new(&fetched.name)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -359,6 +478,15 @@ pub async fn fetch_job<S: MediaSource>(
             }
         })
         .collect();
+    let safe = if resized {
+        Path::new(&safe)
+            .with_extension("jpg")
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("{}.jpg", job.row_id))
+    } else {
+        safe
+    };
     let name = format!("{}_{}", job.row_id, safe);
     let final_path = dir.join(&name);
     let part_path = dir.join(format!(".part-{}", name));
@@ -368,9 +496,7 @@ pub async fn fetch_job<S: MediaSource>(
     let row_id = job.row_id;
     let kind = job.kind.clone();
     let stored = path.clone();
-    let finalized = db
-        .write(move |tx| tx.finalize_blob(row_id, &stored, &kind, size))
-        .await?;
+    let finalized = crate::store::finalize_blob_of(store, row_id, stored, kind, size).await?;
     if !finalized {
         let _ = std::fs::remove_file(&path);
         return Ok(FetchOutcome::Skipped);
@@ -378,75 +504,119 @@ pub async fn fetch_job<S: MediaSource>(
     Ok(FetchOutcome::Finalized { path, size })
 }
 
-/// Unfinished downloads found in the database. Startup (and the maintenance
-/// pass) enqueues these; a full queue simply leaves the rest pending.
-pub fn resume_pending(con: &Connection, limit: usize) -> Result<Vec<MediaJob>> {
-    let mut stmt = con.prepare(
-        "SELECT id, file_id, media_kind, COALESCE(media_size,0)
-           FROM messages
-          WHERE media_state='pending' AND file_id IS NOT NULL AND file_id <> ''
-          ORDER BY id LIMIT ?",
-    )?;
-    let rows = stmt.query_map([limit as i64], |r| {
-        Ok(MediaJob {
-            row_id: r.get(0)?,
-            file_id: r.get(1)?,
-            kind: r.get(2)?,
-            expected_size: r.get::<_, i64>(3)?.max(0) as u64,
+/// One durable frame request for a video-like row. The frame is not a blob:
+/// it is finalized through `thumb_state`, so the mp4 row can stay `descriptor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThumbJob {
+    pub row_id: i64,
+    pub file_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThumbOutcome {
+    Deferred,
+    Finalized { path: String, size: u64 },
+    Skipped,
+}
+
+/// Fetch one frame and finalize it. Frames are small, but the same budget and
+/// the same deadline apply, so a full disk cannot be made worse by them.
+pub async fn fetch_thumb<S: MediaSource>(
+    store: &Store,
+    state: &str,
+    job: &ThumbJob,
+    budget: &MediaBudget,
+    source: &S,
+) -> Result<ThumbOutcome> {
+    if budget.refuses_all() {
+        return Ok(ThumbOutcome::Deferred);
+    }
+    let fetched = match tokio::time::timeout(FETCH_DEADLINE, source.fetch(&job.file_id)).await {
+        Ok(r) => r?,
+        Err(_) => return Err(anyhow!("thumb fetch timed out after {FETCH_DEADLINE:?}")),
+    };
+    let size = fetched.bytes.len() as u64;
+    if !budget.can_admit(size) {
+        return Ok(ThumbOutcome::Deferred);
+    }
+    let dir = media_dir(state);
+    std::fs::create_dir_all(&dir)?;
+    let safe: String = Path::new(&fetched.name)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "frame.jpg".to_string())
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
         })
-    })?;
-    Ok(rows.flatten().collect())
+        .collect();
+    let name = format!("{}_thumb_{}", job.row_id, safe);
+    let final_path = dir.join(&name);
+    let part_path = dir.join(format!(".part-{}", name));
+    std::fs::write(&part_path, &fetched.bytes)?;
+    std::fs::rename(&part_path, &final_path)?;
+    let path = final_path.to_string_lossy().to_string();
+    let row_id = job.row_id;
+    let stored = path.clone();
+    let finalized = crate::store::finalize_thumb_of(store, row_id, stored, size).await?;
+    if !finalized {
+        let _ = std::fs::remove_file(&path);
+        return Ok(ThumbOutcome::Skipped);
+    }
+    Ok(ThumbOutcome::Finalized { path, size })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CleanupReport {
-    pub orphans_removed: usize,
     pub blobs_evicted: usize,
     pub rows_removed: usize,
+    /// `pending` rows nobody was waiting for any more, moved to the kind's
+    /// resting state: `descriptor` for the video-like kinds (their bytes were
+    /// never meant to exist) and `evicted` for the downloadable ones (a photo
+    /// or a document that never arrived has nothing to point at).
+    pub pending_pruned: usize,
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// One cleanup pass, fixed victim order:
-///   1. orphans older than `grace` (files no row or blob references),
-///   2. blobs outside the media budget (oldest first; their rows become
-///      `Evicted` in the same transaction, so no live row references the file
-///      when it is deleted),
-///   3. old rows (never a row another row still replies to).
-///
-/// A file referenced by a live row is never deleted: step 1 checks the
-/// reference set, step 2 clears the references before unlinking, and step 3
-/// leaves a file alone while another row still points at it.
-pub fn cleanup_media(
-    con: &Connection,
+/// One cleanup pass. The media directory is wiped to zero, not trimmed to the
+/// cap: trimming stops exactly at the ceiling, which leaves `can_admit` false
+/// for anything at all. Two clauses guard admission, and each has a measured
+/// outage behind it: `media_used + size <= MEDIA_CAP_BYTES` (trim-to-cap) and
+/// `free >= size + FREE_RESERVE_BYTES` (host space). On 2026-11-06/07 photos
+/// stopped arriving because of the SECOND one - free was 165-172 MB, all of it
+/// outside this directory, while media/ was already empty - so a cleanup that
+/// only trims the catalogue cannot rescue that case, and this doc must not
+/// point the next reader at the cap alone. Order:
+///   1. the data layer reads candidates (open batch, keep paths, old pending
+///      rows, retention rows) in one actor job, with no file IO;
+///   2. media chooses age victims by mtime/grace on this thread;
+///   3. ONE write clears every reference and deletes the rows, returning the
+///      paths to unlink; the unlink happens AFTER the commit, so no committed
+///      row ever points at a missing file and an unreferenced file is simply a
+///      victim on the next pass.
+pub async fn cleanup_media(
+    store: &Store,
     state: &str,
-    budget: &MediaBudget,
+    _budget: &MediaBudget,
     now: SystemTime,
     grace: Duration,
     retention_days: i64,
 ) -> Result<CleanupReport> {
-    let tx = con.unchecked_transaction()?;
+    let cand = crate::store::cleanup_candidates_of(store, now, grace, retention_days).await?;
     let dir = media_dir(state);
     let mut report = CleanupReport::default();
 
-    let mut referenced: HashSet<String> = HashSet::new();
-    {
-        let mut stmt =
-            tx.prepare("SELECT path FROM blobs WHERE path IS NOT NULL AND path <> ''")?;
-        for p in stmt.query_map([], |r| r.get::<_, String>(0))?.flatten() {
-            referenced.insert(p);
-        }
-        let mut stmt = tx.prepare(
-            "SELECT media_path FROM messages WHERE media_path IS NOT NULL AND media_path <> ''",
-        )?;
-        for p in stmt.query_map([], |r| r.get::<_, String>(0))?.flatten() {
-            referenced.insert(p);
-        }
-    }
-
-    // 1. Orphans after grace.
+    // A row of a batch still being collected or answered may be read by the
+    // model at any moment, so its file is never a victim. Everything else is,
+    // once `grace` has passed.
+    let mut victims: Vec<(String, u64)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let path = e.path();
@@ -454,114 +624,51 @@ pub fn cleanup_media(
                 continue;
             }
             let key = path.to_string_lossy().to_string();
-            if referenced.contains(&key) {
+            if cand.keep_paths.contains(&key) {
                 continue;
             }
-            let old = file_mtime(&path)
+            let fresh = file_mtime(&path)
                 .and_then(|m| now.duration_since(m).ok())
-                .map(|d| d >= grace)
-                .unwrap_or(true);
-            if old && std::fs::remove_file(&path).is_ok() {
-                report.orphans_removed += 1;
+                .map(|d| d < grace)
+                .unwrap_or(false);
+            if fresh {
+                continue;
             }
+            let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+            victims.push((key, size));
         }
     }
 
-    // 2. Blobs outside the budget. `dir_usage` is measured after step 1, so
-    // freed orphan bytes count toward the budget immediately.
-    let mut total = dir_usage(&dir);
-    if total > budget.media_cap {
-        let blobs: Vec<(i64, String, Option<i64>)> = {
-            let mut stmt =
-                tx.prepare("SELECT id, path, size FROM blobs ORDER BY created_at ASC, id ASC")?;
-            let mut out = Vec::new();
-            for row in stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))? {
-                out.push(row?);
-            }
-            out
-        };
-        for (id, path, size) in blobs {
-            if total <= budget.media_cap {
-                break;
-            }
-            let sz = size
-                .map(|s| s.max(0) as u64)
-                .or_else(|| std::fs::metadata(&path).ok().map(|m| m.len()))
-                .unwrap_or(0);
-            // Clear every reference first: after this UPDATE no live row
-            // points at the file, so unlinking cannot break one.
-            tx.execute(
-                "UPDATE messages SET media_state='evicted', blob_id=NULL, media_path=''
-                  WHERE blob_id=? OR media_path=?",
-                params![id, path],
-            )?;
-            tx.execute("DELETE FROM blobs WHERE id=?", [id])?;
-            let _ = std::fs::remove_file(&path);
-            total = total.saturating_sub(sz);
+    // A `pending` row of an open batch is never pruned: the batch waits for it.
+    // Outside the open batch a pending row is only a retry slot: maintenance
+    // re-queues it every pass and the same budget refusal answers it. Past the
+    // grace below that would repeat forever against an unchanged disk, so the
+    // row is moved to its resting state (`apply_cleanup` picks it by kind) and
+    // the batch marker stays honest - `[photo]` with no path to read.
+    let pending_ids: Vec<i64> = cand
+        .pending
+        .iter()
+        .filter(|(_, mid, _)| {
+            !mid.map(|m| cand.open_message_ids.contains(&m))
+                .unwrap_or(false)
+        })
+        .map(|(id, _, _)| *id)
+        .collect();
+
+    let applied = crate::store::apply_cleanup_of(
+        store,
+        victims.clone(),
+        pending_ids,
+        cand.retention_ids,
+    )
+    .await?;
+    report.rows_removed = applied.rows_removed;
+    report.pending_pruned = applied.pending_pruned;
+    for path in &applied.unlink {
+        if std::fs::remove_file(path).is_ok() && victims.iter().any(|(v, _)| v == path) {
             report.blobs_evicted += 1;
         }
     }
-
-    // 3. Old rows. A row that another row replies to stays alive (closure of
-    // `reply_to` by message_id and chat, not by surrogate id), and a pending
-    // download is never a victim. One row per catalogue key is kept so the GIF
-    // registry never loses its only representative of a file.
-    if retention_days > 0 {
-        let now_s = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-        let cutoff = now_s.saturating_sub(retention_days.saturating_mul(86_400));
-        let ids: Vec<i64> = {
-            let mut stmt = tx.prepare(
-                "WITH keepers AS (
-                   SELECT id FROM (
-                     SELECT id, ROW_NUMBER() OVER (
-                       PARTITION BY COALESCE(NULLIF(file_unique_id,''), file_id)
-                       ORDER BY date DESC, message_id DESC) AS rn
-                     FROM messages
-                     WHERE media_kind='animation' AND media_state='ready'
-                       AND file_id IS NOT NULL AND file_id <> ''
-                   ) WHERE rn = 1
-                 )
-                 SELECT m.id FROM messages m
-                  WHERE m.date < ? AND m.media_state <> 'pending'
-                    AND NOT EXISTS (
-                      SELECT 1 FROM messages c
-                       WHERE c.reply_to = m.message_id AND c.chat_id = m.chat_id
-                    )
-                    AND m.id NOT IN (SELECT id FROM keepers)",
-            )?;
-            let mut out = Vec::new();
-            for row in stmt.query_map([cutoff], |r| r.get(0))? {
-                out.push(row?);
-            }
-            out
-        };
-        for id in ids {
-            let linked: Option<(Option<i64>, Option<String>)> = tx
-                .query_row(
-                    "SELECT blob_id, media_path FROM messages WHERE id=?",
-                    [id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            tx.execute("DELETE FROM messages WHERE id=?", [id])?;
-            report.rows_removed += 1;
-            if let Some((blob_id, Some(path))) = linked {
-                let shared: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM messages WHERE blob_id=? OR media_path=?",
-                    params![blob_id, path],
-                    |r| r.get(0),
-                )?;
-                if shared == 0 {
-                    if let Some(blob_id) = blob_id {
-                        tx.execute("DELETE FROM blobs WHERE id=?", [blob_id])?;
-                    }
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-    }
-
-    tx.commit()?;
     Ok(report)
 }
 
@@ -572,10 +679,17 @@ pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::WriteTxn;
+    use crate::db::{Db, WriteTxn};
+    use rusqlite::params;
+    use crate::store::Store;
     use crate::{db, envelope_from_message, kv_get, Envelope, MessageKey};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    fn catalog_page(con: &rusqlite::Connection, offset: i64, limit: i64) -> crate::catalog::GifPage {
+        let (rows, total) = crate::store::catalog_page(con, offset, limit).unwrap();
+        crate::catalog::page_of(rows, offset, total)
+    }
 
     fn temp_state(tag: &str) -> String {
         let dir = std::env::temp_dir().join(format!("chat-media-{tag}-{}", std::process::id()));
@@ -698,7 +812,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.applied.inserted, 3);
+        // A video and an animation never download their bytes (only a frame is
+        // fetched, and only for the video-like kinds); the document still does.
         for (ins, (kind, _, size)) in page.inserted.iter().zip(kinds.iter()) {
+            if kind == "video" || kind == "animation" {
+                continue;
+            }
             let path = media_dir(&state)
                 .join(format!("{}.bin", ins.row_id))
                 .to_string_lossy()
@@ -715,7 +834,7 @@ mod tests {
             assert!(ok, "row {row} did not finalize");
         }
         let gifs = db
-            .call(|con| crate::catalog::page(con, 0, 20))
+            .call(|con| Ok(catalog_page(con, 0, 20)))
             .await
             .unwrap();
         assert_eq!(
@@ -724,7 +843,7 @@ mod tests {
             "only the animation is a GIF: {gifs:?}"
         );
         assert_eq!(gifs.records[0].file_id(), "anim");
-        assert!(is_gif_candidate(MediaState::Ready, "animation", "anim"));
+        assert!(is_gif_candidate(MediaState::Descriptor, "animation", "anim"));
         assert!(!is_gif_candidate(MediaState::Ready, "video", "vid"));
         assert!(!is_gif_candidate(MediaState::Ready, "document", "doc"));
         assert!(!is_gif_candidate(MediaState::Pending, "animation", "anim"));
@@ -756,6 +875,7 @@ mod tests {
         let state = temp_state("budget");
         std::env::set_var("CHATBOT_CHAT_ID", "-100");
         let db = Db::open(&state).unwrap();
+        let store = Store::open(&state).unwrap();
         let env = env_of(&photo_update(-100, 50, "big", 1000), 1, -100);
         assert_eq!(env.media_state, MediaState::Pending);
         let page = db
@@ -781,7 +901,7 @@ mod tests {
             media_cap: MEDIA_CAP_BYTES,
             reserve: FREE_RESERVE_BYTES,
         };
-        let out = fetch_job(&db, &state, &job, &exhausted, &fake)
+        let out = fetch_job(&store, &state, &job, &exhausted, &fake)
             .await
             .unwrap();
         assert_eq!(out, FetchOutcome::Deferred);
@@ -810,7 +930,7 @@ mod tests {
 
         // Resume pass: the unfinished download is found again.
         let resumed = db
-            .call(|con| resume_pending(con, MEDIA_QUEUE_CAP))
+            .call(|con| crate::store::pending_jobs(con, MEDIA_QUEUE_CAP))
             .await
             .unwrap();
         assert_eq!(resumed.len(), 1);
@@ -822,7 +942,7 @@ mod tests {
             media_cap: MEDIA_CAP_BYTES,
             reserve: FREE_RESERVE_BYTES,
         };
-        let out = fetch_job(&db, &state, &resumed[0], &ample, &fake)
+        let out = fetch_job(&store, &state, &resumed[0], &ample, &fake)
             .await
             .unwrap();
         match out {
@@ -848,9 +968,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// Required check 7: orphans go, every file referenced by a live row stays.
-    #[test]
-    fn cleanup_removes_orphans_and_keeps_live_files() {
+    /// The wipe is the point: a file whose row was already delivered goes, and
+    /// the row keeps its size while becoming `evicted`. An unreferenced file goes
+    /// in the same pass.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_wipes_delivered_files_and_orphans() {
         let state = temp_state("clean");
         std::env::set_var("CHATBOT_CHAT_ID", "-100");
         let mut con = db(&state).unwrap();
@@ -884,13 +1006,89 @@ mod tests {
         };
         // A future `now` makes both files older than a zero grace period.
         let now = SystemTime::now() + Duration::from_secs(60);
-        let report = cleanup_media(&con, &state, &budget, now, Duration::ZERO, 100_000).unwrap();
-        assert_eq!(report.orphans_removed, 1);
-        assert!(!orphan.exists(), "orphan survived cleanup");
-        assert!(
-            live.exists(),
-            "cleanup deleted a file referenced by a live row"
+        let store = Store::open(&state).unwrap();
+        let report = cleanup_media(&store, &state, &budget, now, Duration::ZERO, 100_000)
+            .await
+            .unwrap();
+        assert_eq!(report.blobs_evicted, 2, "both files must be wiped");
+        assert!(!orphan.exists(), "unreferenced file survived the wipe");
+        assert!(!live.exists(), "a delivered row kept its bytes");
+        let (st, size, mp): (String, i64, String) = con
+            .query_row(
+                "SELECT media_state, COALESCE(media_size,0), COALESCE(media_path,'')
+                   FROM messages WHERE id=?",
+                [row_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (st.as_str(), size, mp.as_str()),
+            ("evicted", 128, ""),
+            "the row lost its size or kept a dead path"
         );
+        let blobs: i64 = con
+            .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blobs, 0, "a wiped blob is still registered");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A batch that is still being answered owns its files, and a file younger
+    /// than `grace` is not a victim: the model may be reading it right now.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_keeps_the_open_batch_and_fresh_files() {
+        let state = temp_state("openbatch");
+        std::env::set_var("CHATBOT_CHAT_ID", "-100");
+        let mut con = db(&state).unwrap();
+        let dir = media_dir(&state);
+        std::fs::create_dir_all(&dir).unwrap();
+        let in_batch = dir.join("in_batch.jpg");
+        let fresh = dir.join("fresh.jpg");
+        std::fs::write(&in_batch, vec![2u8; 1024]).unwrap();
+        std::fs::write(&fresh, vec![3u8; 512]).unwrap();
+
+        let env = env_of(&photo_update(-100, 61, "b", 1024), 1, -100);
+        let page = {
+            let mut tx = WriteTxn::new(&mut con).unwrap();
+            let p = tx.commit_page(vec![env], 2).unwrap();
+            tx.commit().unwrap();
+            p
+        };
+        let row_id = page.inserted[0].row_id;
+        {
+            let mut tx = WriteTxn::new(&mut con).unwrap();
+            let p = in_batch.to_string_lossy().to_string();
+            assert!(tx.finalize_blob(row_id, &p, "photo", 1024).unwrap());
+            tx.commit().unwrap();
+        }
+        con.execute(
+            "INSERT INTO batches(batch_key,chat_id,state,sealed_at,updated_at,message_ids)
+             VALUES('b1',-100,'open',0,0,'[61]')",
+            [],
+        )
+        .unwrap();
+
+        let budget = MediaBudget {
+            free: 10 * 1024 * 1024 * 1024,
+            media_used: 1536,
+            media_cap: MEDIA_CAP_BYTES,
+            reserve: FREE_RESERVE_BYTES,
+        };
+        // The batch file is old; the other file was written just now.
+        let store = Store::open(&state).unwrap();
+        let report = cleanup_media(
+            &store,
+            &state,
+            &budget,
+            SystemTime::now(),
+            MEDIA_GRACE,
+            100_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.blobs_evicted, 0);
+        assert!(in_batch.exists(), "a file of an open batch was wiped");
+        assert!(fresh.exists(), "a file inside grace was wiped");
         let st: String = con
             .query_row(
                 "SELECT media_state FROM messages WHERE id=?",
@@ -899,10 +1097,181 @@ mod tests {
             )
             .unwrap();
         assert_eq!(st, "ready");
-        let blobs: i64 = con
-            .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// An obsolete `pending` row must not re-download what the wipe removed, and
+    /// must not sit in front of fresh media. A row of an open batch stays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn obsolete_pending_rows_are_pruned() {
+        let state = temp_state("prune");
+        std::env::set_var("CHATBOT_CHAT_ID", "-100");
+        let mut con = db(&state).unwrap();
+        let photo = env_of(&photo_update(-100, 70, "p", 100), 1, -100);
+        let stale = env_of(&photo_update(-100, 71, "q", 200), 2, -100);
+        let page = {
+            let mut tx = WriteTxn::new(&mut con).unwrap();
+            let p = tx.commit_page(vec![photo, stale], 3).unwrap();
+            tx.commit().unwrap();
+            p
+        };
+        assert_eq!(page.inserted.len(), 2);
+        // 70 is still being answered, 71 is nobody's business any more.
+        con.execute(
+            "INSERT INTO batches(batch_key,chat_id,state,sealed_at,updated_at,message_ids)
+             VALUES('b1',-100,'open',0,0,'[70]')",
+            [],
+        )
+        .unwrap();
+        let budget = MediaBudget {
+            free: 10 * 1024 * 1024 * 1024,
+            media_used: 0,
+            media_cap: MEDIA_CAP_BYTES,
+            reserve: FREE_RESERVE_BYTES,
+        };
+        // A future `now` puts both rows outside grace, so only the batch rule can
+        // keep the live one.
+        let store = Store::open(&state).unwrap();
+        let report = cleanup_media(
+            &store,
+            &state,
+            &budget,
+            SystemTime::now() + Duration::from_secs(3600),
+            MEDIA_GRACE,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.pending_pruned, 1);
+        let live: String = con
+            .query_row("SELECT media_state FROM messages WHERE message_id=70", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(blobs, 1);
+        let stale_state: (String, String) = con
+            .query_row(
+                "SELECT media_state, media_path FROM messages WHERE message_id=71",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(live, "pending", "an open batch lost its download right");
+        assert_eq!(stale_state.0, "evicted", "a stale row kept downloading");
+        let jobs = crate::store::pending_jobs(&con, MEDIA_QUEUE_CAP).unwrap();
+        assert_eq!(jobs.len(), 1, "the stale row would be fetched again");
+        assert_eq!(jobs[0].row_id, page.inserted[0].row_id);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The catalogue is keyed on identifiers and a known size, never on bytes:
+    /// after a full wipe `gif_list` must still offer the animations.
+    #[tokio::test(flavor = "current_thread")]
+    async fn catalogue_survives_a_full_wipe() {
+        let state = temp_state("catalog-wipe");
+        std::env::set_var("CHATBOT_CHAT_ID", "-100");
+        let con = db(&state).unwrap();
+        let dir = media_dir(&state);
+        std::fs::create_dir_all(&dir).unwrap();
+        let gif = dir.join("old.gif");
+        std::fs::write(&gif, vec![5u8; 2048]).unwrap();
+        con.execute(
+            "INSERT INTO messages(chat_id,update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id,file_unique_id,media_kind,media_state,media_size)
+             VALUES(-100,1,80,1800000000,7,'u','U','гифка',NULL,?,?,?,'animation','ready',2048)",
+            params![gif.to_string_lossy(), "g80", "g80-u"],
+        )
+        .unwrap();
+        let budget = MediaBudget {
+            free: 10 * 1024 * 1024 * 1024,
+            media_used: 2048,
+            media_cap: MEDIA_CAP_BYTES,
+            reserve: FREE_RESERVE_BYTES,
+        };
+        let before = catalog_page(&con, 0, 5);
+        assert_eq!(before.records.len(), 1, "fixture is not in the catalogue");
+        let now = SystemTime::now() + Duration::from_secs(3600);
+        let store = Store::open(&state).unwrap();
+        cleanup_media(&store, &state, &budget, now, MEDIA_GRACE, 0)
+            .await
+            .unwrap();
+        assert!(!gif.exists());
+        let after = catalog_page(&con, 0, 5);
+        assert_eq!(
+            after.records.len(),
+            1,
+            "the wipe emptied the GIF catalogue"
+        );
+        assert_eq!(after.records[0].file_id(), "g80");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The frame has its own state: the mp4 row stays a descriptor while the
+    /// frame becomes readable.
+    #[tokio::test(flavor = "current_thread")]
+    async fn thumb_fetch_finalizes_only_a_pending_frame() {
+        let state = temp_state("thumb");
+        std::env::set_var("CHATBOT_CHAT_ID", "-100");
+        let db = Db::open(&state).unwrap();
+        let store = Store::open(&state).unwrap();
+        let env = env_of(
+            &json!({
+                "chat": {"id": -100},
+                "message_id": 90,
+                "date": chrono::Utc::now().timestamp(),
+                "from": {"id": 7, "username": "u", "first_name": "U"},
+                "video": {"file_id": "v90", "file_unique_id": "v90-u", "file_size": 5000,
+                          "thumbnail": {"file_id": "t90", "file_unique_id": "t90-u", "file_size": 800}}
+            }),
+            1,
+            -100,
+        );
+        assert_eq!(env.media_state, MediaState::Descriptor);
+        assert_eq!(env.thumb_state, MediaState::Pending);
+        let page = db.write(move |tx| tx.commit_page(vec![env], 2)).await.unwrap();
+        let row_id = page.inserted[0].row_id;
+        let job = ThumbJob {
+            row_id,
+            file_id: "t90".into(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fake = FakeSource {
+            calls: calls.clone(),
+            bytes: vec![9u8; 800],
+        };
+        let budget = MediaBudget {
+            free: 10 * 1024 * 1024 * 1024,
+            media_used: 0,
+            media_cap: MEDIA_CAP_BYTES,
+            reserve: FREE_RESERVE_BYTES,
+        };
+        let out = fetch_thumb(&store, &state, &job, &budget, &fake).await.unwrap();
+        let path = match out {
+            ThumbOutcome::Finalized { path, size } => {
+                assert_eq!(size, 800);
+                path
+            }
+            other => panic!("expected Finalized, got {other:?}"),
+        };
+        assert!(Path::new(&path).exists(), "the frame is missing on disk");
+        let (st, size): (String, i64) = {
+            let s = state.clone();
+            let _ = s;
+            db.call(move |con| {
+                Ok(con.query_row(
+                    "SELECT thumb_state, COALESCE(media_size,0) FROM messages WHERE id=?",
+                    [row_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(st, "ready");
+        assert!(size > 0, "the catalogue lost the size of a frame-only row");
+        let again = fetch_thumb(&store, &state, &job, &budget, &fake).await.unwrap();
+        assert_eq!(again, ThumbOutcome::Skipped, "a frame was finalized twice");
+        let pending = db
+            .call(|con| crate::store::pending_thumbs(con, MEDIA_QUEUE_CAP))
+            .await
+            .unwrap();
+        assert!(pending.is_empty());
         let _ = std::fs::remove_dir_all(&state);
     }
 
@@ -1015,5 +1384,83 @@ mod tests {
             message: crate::MessageId(5),
         };
         assert_eq!(k.message.0, 5);
+    }
+
+    /// The live regression: a 1600x1600 noise PNG whose FIRST resize (edge
+    /// 1024, `-q:v 5`) is ~447 KiB, well above `PHOTO_CONTEXT_LIMIT`. The
+    /// bounded ladder must step down until the stored bytes are inside the
+    /// bound, and the result must still be a decodable raster.
+    #[tokio::test(flavor = "current_thread")]
+    async fn noisy_photo_first_resize_above_bound_is_stepped_under_it() {
+        let staged = std::process::Command::new("ffmpeg")
+            .args([
+                "-v", "error",
+                "-f", "lavfi",
+                "-i", "nullsrc=s=1600x1600,geq=r='random(1)*255':g='random(2)*255':b='random(3)*255'",
+                "-frames:v", "1",
+                "-f", "image2pipe",
+                "-vcodec", "png",
+                "-",
+            ])
+            .output()
+            .expect("ffmpeg to stage noise");
+        assert!(staged.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&staged.stderr));
+        let source = staged.stdout;
+        assert!(
+            (source.len() as u64) > PHOTO_CONTEXT_LIMIT,
+            "fixture must itself be oversized"
+        );
+
+        // Prove the first rung alone would breach the bound, so this test
+        // genuinely exercises the stepping rather than passing on rung one.
+        // Prove the first rung alone would breach the bound via a file input,
+        // independent of the async ladder.
+        let dir = temp_state("bound-first-rung");
+        let in_path = std::path::Path::new(&dir).join("noise.png");
+        std::fs::write(&in_path, &source).unwrap();
+        let first = std::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-v", "error", "-i", in_path.to_str().unwrap(),
+                "-vf", "scale='min(1024,iw)':-2", "-q:v", "5",
+                "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-",
+            ])
+            .output()
+            .expect("ffmpeg first rung");
+        assert!(first.status.success(), "first rung failed");
+        assert!(
+            (first.stdout.len() as u64) > PHOTO_CONTEXT_LIMIT,
+            "first rung {} B must exceed the {PHOTO_CONTEXT_LIMIT} B bound",
+            first.stdout.len()
+        );
+
+        let bounded = bounded_photo_bytes(source)
+            .await
+            .expect("ladder ok")
+            .expect("a bounded rung must fit");
+        assert!(
+            (bounded.len() as u64) <= PHOTO_CONTEXT_LIMIT,
+            "stored {} B exceeds bound",
+            bounded.len()
+        );
+        // Decodable raster, not an arbitrary truncated byte string.
+        let decode = std::process::Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "image2pipe", "-i", "-",
+                "-frames:v", "1", "-f", "null", "-",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("ffmpeg decode");
+        let mut child = decode;
+        use std::io::Write;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&bounded).unwrap();
+            drop(stdin);
+        }
+        let out = child.wait_with_output().expect("decode wait");
+        assert!(out.status.success(), "bounded bytes are not a decodable image");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

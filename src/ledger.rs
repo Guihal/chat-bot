@@ -144,6 +144,11 @@ impl BatchView {
     /// a journal row, so quoting nothing closes the batch just like quoting the
     /// incoming message would.
     pub fn close_reason(&self) -> Option<&'static str> {
+        // Terminal by outcome: the age guard closed this batch because every
+        // row was older than the send budget. No send, no settle — retired.
+        if self.outcome.as_deref() == Some("skip_by_time") {
+            return Some("skip_by_time");
+        }
         if self.sent > 0 && self.pending_sends == 0 {
             return Some("answered");
         }
@@ -187,6 +192,46 @@ fn parse_ids(raw: Option<String>) -> Vec<i64> {
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
         .collect()
+}
+
+/// A send whose outcome is unknown. It is an error so the actor's transaction
+/// ROLLS BACK exactly like before (sends/incidents/batches writes of that arm
+/// never committed); the alarm is fired by the caller after the rollback, not
+/// from inside the actor job.
+#[derive(Debug, Clone)]
+pub struct SendUnknown {
+    pub detail: String,
+    pub error: String,
+}
+
+impl std::fmt::Display for SendUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "send_unknown: {}", self.error)
+    }
+}
+
+impl std::error::Error for SendUnknown {}
+
+/// Request body of one send part, shaped here rather than in the store: the
+/// ledger owns the send request format.
+pub fn send_request(
+    chat: i64,
+    text: &str,
+    reply_to: Option<i64>,
+    file_id: &str,
+    file_unique_id: &str,
+    media_path: &str,
+    thread: Option<i64>,
+) -> Value {
+    json!({
+        "chat_id": chat,
+        "text": text,
+        "reply_to": reply_to,
+        "file_id": file_id,
+        "file_unique_id": file_unique_id,
+        "media_path": media_path,
+        "thread_id": thread,
+    })
 }
 
 impl<'c> WriteTxn<'c> {
@@ -486,10 +531,7 @@ impl<'c> WriteTxn<'c> {
                 Ok(receipt.clone())
             }
             SendOutcome::Unknown(error) => {
-                crate::ops::alert(
-                    "send_unknown",
-                    &format!("send {}: {error}", intent.send_key),
-                );
+                let detail = format!("send {}: {error}", intent.send_key);
                 let body = json!({"error": error, "state": "unknown"}).to_string();
                 tx.execute(
                     "UPDATE sends SET state='unknown', receipt=?, updated_at=? WHERE id=? AND state='sending'",
@@ -506,7 +548,10 @@ impl<'c> WriteTxn<'c> {
                     "UPDATE batches SET state='closed', outcome='delivered_unknown', updated_at=? WHERE id=?",
                     rusqlite::params![ts, batch.0],
                 )?;
-                Err(anyhow!("send_unknown: {}", error))
+                Err(anyhow::Error::new(SendUnknown {
+                    detail,
+                    error: error.clone(),
+                }))
             }
         }
     }
@@ -736,6 +781,49 @@ pub fn open_batches(con: &Connection) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Open batch whose incoming ids contain `message_id`. A reply to a specific
+/// message binds the answer to THAT batch, never to whatever was pushed last:
+/// two batches can be open at once (a steer accepted mid-turn, a channel post
+/// and its discussion copy), and answering the wrong one silently drops
+/// `reply_to` and leaves the real message unanswered.
+pub fn open_batch_of_message(con: &Connection, message_id: i64) -> Result<Option<String>> {
+    let mut stmt = con.prepare(
+        "SELECT batch_key, message_ids FROM batches
+          WHERE state <> 'closed' ORDER BY sealed_at ASC, id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let key: String = r.get(0)?;
+        let raw: Option<String> = r.get(1)?;
+        if parse_ids(raw).contains(&message_id) {
+            return Ok(Some(key));
+        }
+    }
+    Ok(None)
+}
+
+/// The batch an unaddressed send belongs to: the newest open batch with no
+/// answer. Newest is what the run is serving — the daemon seals and pushes a
+/// batch within the same flush, so the latest sealed batch is the one the model
+/// was handed, while an old one is history the model is long past. Batches whose
+/// automated retries were exhausted are skipped: they stay open on purpose (a
+/// new frame may retry them), and charging a fresh answer to one of them would
+/// send it into a stale forum topic and leave the real message unanswered.
+pub fn latest_open_unanswered(con: &Connection) -> Result<Option<String>> {
+    let mut stmt = con.prepare(
+        "SELECT b.batch_key FROM batches b
+          WHERE b.state <> 'closed'
+            AND NOT EXISTS (SELECT 1 FROM answers a WHERE a.batch_id = b.id)
+            AND NOT EXISTS (SELECT 1 FROM answer_batches ab WHERE ab.batch_id = b.id)
+            AND NOT EXISTS (
+              SELECT 1 FROM kv WHERE kv.k = 'batch_stalled:' || b.batch_key AND kv.v <> ''
+            )
+          ORDER BY b.sealed_at DESC, b.id DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query([])?;
+    Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
+}
+
 pub fn message_ids(con: &Connection, key: &str) -> Result<Vec<i64>> {
     let raw: Option<String> = con
         .query_row(
@@ -781,6 +869,37 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn skip_by_time_outcome_is_a_terminal_close_reason() {
+        let state = temp_state("skipbytime");
+        std::env::set_var("CHATBOT_CHAT_ID", "-100");
+        let db = crate::db::Db::open(&state).unwrap();
+        db.call_blocking(|con| {
+            crate::kv_set(con, "chat_id", "-100")?;
+            Ok(())
+        })
+        .unwrap();
+        db.write(|tx| {
+            tx.seal_batch("sig-old", -100, Some(77), &[11, 12], &[])?;
+            tx.mark_pushed("sig-old")
+        })
+        .await
+        .unwrap();
+        db.write(|tx| {
+            crate::ledger::close_batch(tx.handle(), "sig-old", "skip_by_time")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let view = db
+            .call(move |con| crate::ledger::view(con, "sig-old"))
+            .await
+            .unwrap()
+            .expect("batch row");
+        assert_eq!(view.close_reason(), Some("skip_by_time"));
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[tokio::test(flavor = "current_thread")]

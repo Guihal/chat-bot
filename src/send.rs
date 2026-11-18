@@ -6,8 +6,8 @@
 //! Intent -> Sending, then exactly one HTTP call, then Sending -> Sent with the
 //! receipt and the mirror row in the same transaction. A crash before the answer
 //! leaves Sending, which startup turns into Unknown without a resend.
-use crate::db::Db;
-use crate::ledger::{self, OpenAnswer, Receipt, SendOutcome};
+use crate::store::{BeginSend, PartMeta, Store};
+use crate::ledger::{Receipt, SendOutcome};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -66,6 +66,96 @@ fn parse_request(args: &Value) -> Result<Request> {
     })
 }
 
+fn is_foreign_script(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff |
+        0xac00..=0xd7af | 0xf900..=0xfaff
+    )
+}
+
+/// Telegram-facing text must be Russian. The model proved it will still leak
+/// CJK/Hangul/Kana and English words, so the daemon strips those at the single
+/// outbound owner instead of trusting the prompt. URLs and @mentions are kept
+/// verbatim: they are addresses, not prose.
+fn strip_foreign_words(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        let c = text[i..].chars().next().expect("in-bounds char");
+        if c.is_whitespace() {
+            out.push(c);
+            i += c.len_utf8();
+            continue;
+        }
+        let start = i;
+        while i < text.len() {
+            let ch = text[i..].chars().next().expect("in-bounds char");
+            if ch.is_whitespace() {
+                break;
+            }
+            i += ch.len_utf8();
+        }
+        let token = &text[start..i];
+        if token.contains("http://") || token.contains("https://") || token.contains('@') {
+            out.push_str(token);
+            continue;
+        }
+        for ch in token.chars() {
+            if !ch.is_ascii_alphabetic() && !is_foreign_script(ch) {
+                out.push(ch);
+            }
+        }
+    }
+    if out.chars().any(|c| c.is_alphanumeric()) {
+        out
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::strip_foreign_words;
+
+    #[test]
+    fn strips_foreign_scripts_and_latin_words() {
+        assert_eq!(
+            strip_foreign_words("на связи, ну分包 он жеrance"),
+            "на связи, ну он же"
+        );
+        assert_eq!(strip_foreign_words("Вот он,黑рус будущего"), "Вот он,рус будущего");
+    }
+
+    #[test]
+    fn keeps_urls_and_mentions_and_russian_text() {
+        assert_eq!(strip_foreign_words("смотри https://example.com/a"), "смотри https://example.com/a");
+        assert_eq!(strip_foreign_words("спроси @insaf"), "спроси @insaf");
+        assert_eq!(strip_foreign_words("нормальный русский текст"), "нормальный русский текст");
+    }
+
+    #[test]
+    fn preserves_wrapped_urls_and_newlines() {
+        assert_eq!(
+            strip_foreign_words("вот «https://example.com/news» почитай"),
+            "вот «https://example.com/news» почитай"
+        );
+        assert_eq!(
+            strip_foreign_words("(https://example.com/news)"),
+            "(https://example.com/news)"
+        );
+        assert_eq!(
+            strip_foreign_words("Первая...\nВторая..."),
+            "Первая...\nВторая..."
+        );
+    }
+
+    #[test]
+    fn rejects_all_foreign_after_stripping() {
+        assert_eq!(strip_foreign_words("Yes!"), "");
+        assert_eq!(strip_foreign_words("hello world"), "");
+    }
+}
+
 fn media_targets(r: &Request) -> usize {
     [&r.gif_file_id, &r.sticker_file_id, &r.media_path]
         .iter()
@@ -93,14 +183,6 @@ fn file_kind(path: &str) -> (String, &'static str, &'static str) {
     }
 }
 
-fn lookup_unique_id(con: &rusqlite::Connection, file_id: &str) -> String {
-    con.query_row(
-        "SELECT COALESCE(file_unique_id,'') FROM messages WHERE file_id=? AND COALESCE(file_unique_id,'')<>'' LIMIT 1",
-        [file_id],
-        |r| r.get(0),
-    )
-    .unwrap_or_default()
-}
 
 /// A sticker plus text is TWO messages: sendSticker takes no caption, so the
 /// text becomes its own send in the same answer. Every other shape is one
@@ -232,6 +314,14 @@ async fn send_one(request: &Value, kind: &str) -> Result<Receipt> {
     let mut params = json!({"chat_id": chat_id});
     if let Some(r) = reply_to {
         params["reply_to_message_id"] = json!(r);
+        // Replies are unrestricted (owner, 2026-11-08), so a target may be an id
+        // that does not exist in this chat — a linked channel post, a deleted
+        // message. Without this flag Telegram fails the WHOLE call with 400
+        // "message to be replied not found", and the batch's single answer slot
+        // is already open, so the retry is refused by `answer_exists`: the
+        // incoming message would go unanswered. The flag keeps the quote when
+        // it is valid and delivers the message anyway when it is not.
+        params["allow_sending_without_reply"] = json!(true);
     }
     let result = match kind {
         "sticker" => {
@@ -327,88 +417,95 @@ async fn send_one(request: &Value, kind: &str) -> Result<Receipt> {
 
 /// `open_answer` mints the id; the same fingerprint replays the stored response
 /// byte for byte, a different one is refused with `answer_exists`.
-pub async fn chat_send(db: &Db, args: &Value) -> Result<String> {
-    let batch_key = args
+pub async fn chat_send(store: &Store, args: &Value) -> Result<String> {
+    // Owner's contract (2026-11-08): a send never depends on the extension
+    // holding a batch ticket. The DAEMON resolves which batch the answer
+    // belongs to, and "whatever was pushed last" is not it: a steer accepted
+    // mid-turn opens a second batch, so a late answer to an earlier message has
+    // to follow its own message_id, and an unaddressed send belongs to the
+    // oldest batch still waiting for an answer.
+    let mut batch_key = args
         .get("batch_key")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if batch_key.is_empty() {
-        return Err(anyhow!(
-            "no active batch: chat_send arrived outside a pushed batch"
-        ));
-    }
     let mut req = parse_request(args)?;
     if req.text == "[skip]" {
         return Ok("silence acknowledged, nothing sent".to_string());
     }
+    if !req.text.is_empty() {
+        let clean = strip_foreign_words(&req.text);
+        if clean.is_empty() {
+            return Err(anyhow!(
+                "ответ содержит только иностранные символы; перепиши по-русски"
+            ));
+        }
+        req.text = clean;
+    }
+    if batch_key.is_empty() {
+        if let Some(id) = req.reply_to {
+            batch_key = crate::store::open_batch_of_message(store, id)
+                .await?
+                .unwrap_or_default();
+        }
+    }
+    if batch_key.is_empty() {
+        batch_key = crate::store::latest_open_unanswered(store)
+            .await?
+            .unwrap_or_default();
+    }
+    if batch_key.is_empty() {
+        return Err(anyhow!(
+            "no open batch to attribute this send: nothing is waiting for an answer"
+        ));
+    }
 
-    // Read the batch snapshot (`reply_to` is decoration: an id outside the batch
-    // is dropped, and its absence never keeps the batch open).
-    let bk = batch_key.clone();
-    let (view, chat) = db
-        .call(move |con| {
-            let view = ledger::view(con, &bk)?;
-            let chat: i64 = crate::kv_get(con, "chat_id", "0").parse().unwrap_or(0);
-            Ok((view, chat))
-        })
-        .await?;
-    let view = view.ok_or_else(|| anyhow!("unknown batch: {batch_key}"))?;
+    // Read the batch snapshot. `reply_to` is NOT restricted to it: the owner's
+    // contract (2026-11-08) is that a reply may quote any message the bot can
+    // see, including history from earlier turns and the gif catalogue.
+    let (view, chat) = crate::store::batch_snapshot_of(store, batch_key.clone())
+        .await?
+        .ok_or_else(|| anyhow!("unknown batch: {batch_key}"))?;
     let lookup_id = req_sticker_or_gif(&req);
     let unique = if lookup_id.is_empty() {
         String::new()
     } else {
-        db.call(move |con| Ok(lookup_unique_id(con, &lookup_id)))
+        crate::store::unique_id_for_of(store, lookup_id.clone())
             .await
             .unwrap_or_default()
     };
-    let mut note: Option<String> = None;
-    if let Some(q) = req.reply_to {
-        if !view.message_ids.contains(&q) {
-            note = Some(format!(
-                "sent without quote: reply_to {q} is not in this batch (valid: {:?})",
-                view.message_ids
-            ));
-            req.reply_to = None;
-        }
-    }
+    let note: Option<String> = None;
     let parts = build_parts(&req, &unique)?;
     let fp = fingerprint(&req);
     let thread = view.thread_id;
 
-    let begin = {
-        let bk = batch_key.clone();
-        let parts = parts.clone();
-        let thread = thread;
-        db.write(move |tx| match tx.open_answer(&bk, &fp)? {
-            OpenAnswer::Replay { answer, response } => Ok((answer, None, response)),
-            OpenAnswer::Opened(answer) => {
-                let mut intents = Vec::new();
-                for (i, part) in parts.iter().enumerate() {
-                    let request = json!({
-                        "chat_id": chat,
-                        "text": part.text,
-                        "reply_to": req.reply_to,
-                        "file_id": part.file_id,
-                        "file_unique_id": part.file_unique_id,
-                        "media_path": part.media_path,
-                        "thread_id": thread,
-                    });
-                    intents.push(tx.begin_send(answer, i, &part.kind, &request)?);
-                }
-                Ok((answer, Some(intents), None))
-            }
+    let parts_meta: Vec<PartMeta> = parts
+        .iter()
+        .map(|part| PartMeta {
+            kind: part.kind.clone(),
+            text: part.text.clone(),
+            file_id: part.file_id.clone(),
+            file_unique_id: part.file_unique_id.clone(),
+            media_path: part.media_path.clone(),
         })
-        .await?
-    };
-    let (_answer, intents, replay) = begin;
-    match (intents, replay) {
-        (Some(intents), _) => {
+        .collect();
+    let begin = crate::store::open_answer_with_sends_of(
+        store,
+        batch_key.clone(),
+        fp.clone(),
+        chat,
+        thread,
+        req.reply_to,
+        parts_meta,
+    )
+    .await?;
+    match begin {
+        BeginSend::Opened(intents) => {
             let total = intents.len();
             let mut receipts: Vec<Receipt> = Vec::new();
             for (i, intent) in intents.iter().enumerate() {
                 let it = intent.clone();
-                db.write(move |tx| tx.start_send(&it)).await?;
+                crate::store::start_send_of(store, it).await?;
                 match send_one(&intent.request, &intent.kind).await {
                     Ok(receipt) => {
                         receipts.push(receipt.clone());
@@ -418,31 +515,50 @@ pub async fn chat_send(db: &Db, args: &Value) -> Result<String> {
                             None
                         };
                         let it = intent.clone();
-                        db.write(move |tx| {
-                            tx.finish_send(&it, &SendOutcome::Sent(receipt), complete.as_deref())
-                                .map(|_| ())
-                        })
-                        .await?;
+                        if let Err(e) = crate::store::finish_send_of(
+                            store,
+                            it,
+                            SendOutcome::Sent(receipt),
+                            complete,
+                        )
+                        .await
+                        {
+                            alert_if_unknown(&e);
+                            return Err(anyhow!("Bot API send failed: {e}; recorded Unknown, not resent"));
+                        }
                     }
                     Err(e) => {
                         let msg = e.to_string();
                         let it = intent.clone();
-                        let _ = db
-                            .write(move |tx| {
-                                tx.finish_send(&it, &SendOutcome::Unknown(msg), None)
-                                    .map(|_| ())
-                            })
-                            .await;
+                        if let Err(e2) = crate::store::finish_send_of(
+                            store,
+                            it,
+                            SendOutcome::Unknown(msg),
+                            None,
+                        )
+                        .await
+                        {
+                            alert_if_unknown(&e2);
+                        }
                         return Err(anyhow!("Bot API send failed: {e}; recorded Unknown, not resent"));
                     }
                 }
             }
             Ok(response_text(&receipts, note.as_deref()))
         }
-        (None, Some(response)) => Ok(response),
-        (None, None) => Err(anyhow!(
+        BeginSend::Replay { response: Some(response) } => Ok(response),
+        BeginSend::Replay { response: None } => Err(anyhow!(
             "answer_exists: this batch already has an answer whose send did not reach a receipt (state Unknown); refusing a second message"
         )),
+    }
+}
+
+/// Fire the one alarm this path owes: only a typed Unknown send surfaces here
+/// (the actor never alerts; it cannot). A Sent-path database error is not an
+/// unknown send and stays a plain Err.
+fn alert_if_unknown(err: &anyhow::Error) {
+    if let Some(detail) = crate::store::send_unknown_detail(err) {
+        crate::ops::alert("send_unknown", &detail);
     }
 }
 
@@ -455,16 +571,13 @@ fn req_sticker_or_gif(r: &Request) -> String {
 }
 
 /// `typing` is RPC too: the daemon owns the token and the topic parameter.
-pub async fn typing(db: &Db, args: &Value) -> Result<String> {
-    let chat: i64 = db
-        .call(|con| Ok(crate::kv_get(con, "chat_id", "0").parse().unwrap_or(0)))
-        .await?;
+pub async fn typing(store: &Store, args: &Value) -> Result<String> {
+    let chat: i64 = crate::store::chat_id(store).await?;
     let mut thread = args.get("thread_id").and_then(|v| v.as_i64());
     if thread.is_none() {
         if let Some(bk) = args.get("batch_key").and_then(|v| v.as_str()) {
             let bk = bk.to_string();
-            thread = db
-                .call(move |con| Ok(ledger::thread_id(con, &bk)))
+            thread = crate::store::thread_of_batch(store, bk)
                 .await
                 .unwrap_or(None);
         }
@@ -480,6 +593,6 @@ pub async fn typing(db: &Db, args: &Value) -> Result<String> {
 
 /// Startup repair: anything left Sending becomes Unknown in ONE transaction,
 /// with ONE incident and no HTTP call (therefore no second message).
-pub async fn repair_sending(db: &Db) -> Result<usize> {
-    db.write(|tx| ledger::resolve_sending(tx.handle())).await
+pub async fn repair_sending(store: &Store) -> Result<usize> {
+    crate::store::resolve_sending_of(store).await
 }

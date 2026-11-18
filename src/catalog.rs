@@ -11,7 +11,6 @@
 //! non-ready media state, a zero size). An empty caption and "no signal when
 //! this GIF fits" are valid, distinct states, not errors.
 use anyhow::{anyhow, Result};
-use rusqlite::Connection;
 use serde_json::Value;
 
 /// Prompt projection cap (DESIGN §5/§6).
@@ -96,8 +95,12 @@ impl GifRecord {
         if MediaKind::parse(src.media_kind) != MediaKind::Animation {
             return Err(anyhow!("not an animation: {}", src.media_kind));
         }
-        if src.media_state != "ready" {
-            return Err(anyhow!("media is not ready: {}", src.media_state));
+        // An animation is a catalogue entry when its identifiers are real and
+        // its size is known. Local bytes are NOT part of the contract: the wipe
+        // removes the file and keeps the row as `evicted`, while sending works
+        // by `file_id`.
+        if !matches!(src.media_state, "ready" | "descriptor" | "evicted") {
+            return Err(anyhow!("media is not listed: {}", src.media_state));
         }
         if src.file_id.trim().is_empty() {
             return Err(anyhow!("empty file_id"));
@@ -159,47 +162,6 @@ pub struct GifPage {
     pub total: i64,
 }
 
-/// Deduplicated animations, newest first. `media_size` is the Telegram size;
-/// when the mirror never learned it, the blob size stands in. A row without a
-/// known size is not a catalogue entry (constructor contract), so the filter
-/// and the total stay consistent.
-pub const GIF_PAGE_SQL: &str = "WITH grouped AS (
-           SELECT file_unique_id AS dedup_key,
-                  file_id, file_unique_id, text, date, message_id, reply_to,
-                  media_kind, media_state,
-                  COALESCE(media_size,
-                           (SELECT size FROM blobs WHERE blobs.id = messages.blob_id),
-                           0) AS size,
-                  ROW_NUMBER() OVER (
-                    PARTITION BY file_unique_id
-                    ORDER BY date DESC, message_id DESC) AS rn
-           FROM messages
-           WHERE media_kind='animation' AND media_state='ready'
-             AND file_id IS NOT NULL AND file_id <> ''
-             AND file_unique_id IS NOT NULL AND file_unique_id <> ''
-             AND COALESCE(media_size,
-                          (SELECT size FROM blobs WHERE blobs.id = messages.blob_id),
-                          0) > 0
-         ),
-         page AS (
-           SELECT file_id, file_unique_id, text, size, media_kind, media_state,
-                  date, message_id, reply_to, COUNT(*) OVER () AS total
-           FROM grouped WHERE rn = 1
-           ORDER BY date DESC, message_id DESC LIMIT ? OFFSET ?
-         )
-         SELECT file_id, file_unique_id, text, size, media_kind, media_state, total,
-                COALESCE(
-                  (SELECT NULLIF(TRIM(substr(m2.text,1,120)),'')
-                     FROM messages m2 WHERE m2.message_id = page.reply_to LIMIT 1),
-                  (SELECT NULLIF(TRIM(substr(m3.text,1,120)),'')
-                     FROM messages m3
-                    WHERE (m3.date, m3.message_id) < (page.date, page.message_id)
-                      AND m3.text IS NOT NULL AND TRIM(m3.text) <> ''
-                    ORDER BY m3.date DESC, m3.message_id DESC LIMIT 1),
-                  ''
-                ) AS context
-         FROM page ORDER BY date DESC, message_id DESC";
-
 /// Parse the `gif_list` bounds. Never clamps: a negative offset or a limit
 /// outside `1..=LIST_PAGE_MAX` is an explicit `bad offset` / `bad limit`.
 pub fn parse_page_args(args: &Value) -> Result<(i64, i64)> {
@@ -233,85 +195,38 @@ pub fn parse_page_args(args: &Value) -> Result<(i64, i64)> {
     Ok((offset, limit))
 }
 
-/// One page of the source. Callers pass bounds already validated by
-/// `parse_page_args` (or a compile-time cap such as `PROMPT_MAX`).
-pub fn page(con: &Connection, offset: i64, limit: i64) -> Result<GifPage> {
-    debug_assert!((0..=LIST_PAGE_MAX).contains(&limit));
-    debug_assert!(offset >= 0);
-    let mut stmt = con.prepare_cached(GIF_PAGE_SQL)?;
-    let rows: Vec<(
-        String,
-        Option<String>,
-        Option<String>,
-        i64,
-        Option<String>,
-        Option<String>,
-        i64,
-        Option<String>,
-    )> = stmt
-        .query_map(rusqlite::params![limit, offset], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-            ))
-        })?
-        .flatten()
-        .collect();
-    // `COUNT(*) OVER ()` is evaluated before LIMIT/OFFSET, so a non-empty page
-    // carries the true total. An empty page carries no row at all, hence the
-    // scalar fallback over the SAME statement: an offset past the end must not
-    // be reported as "the catalogue is empty".
-    let total = match rows.first() {
-        Some(r) => r.6,
-        None => total(con)?,
-    };
+/// Plain row of one catalogue page as the data layer returns it.
+#[derive(Debug, Clone, Default)]
+pub struct GifRow {
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub text: Option<String>,
+    pub size: i64,
+    pub media_kind: Option<String>,
+    pub media_state: Option<String>,
+    pub context: Option<String>,
+}
+
+/// Build the typed records from one data-layer page. A row that cannot pass
+/// the constructor is dropped, never rendered as an invented GIF.
+pub fn records_from(rows: Vec<GifRow>) -> Vec<GifRecord> {
     let mut records = Vec::new();
-    for (file_id, unique, text, size, kind, state, _, context) in rows {
+    for row in rows {
         let src = GifSource {
-            media_kind: kind.as_deref().unwrap_or(""),
-            media_state: state.as_deref().unwrap_or(""),
-            file_id: &file_id,
-            file_unique_id: unique.as_deref().unwrap_or(""),
-            size: size.max(0) as u64,
-            caption: text.as_deref(),
-            reply_hint: context.as_deref(),
+            media_kind: row.media_kind.as_deref().unwrap_or(""),
+            media_state: row.media_state.as_deref().unwrap_or(""),
+            file_id: &row.file_id,
+            file_unique_id: row.file_unique_id.as_str().trim(),
+            size: row.size.max(0) as u64,
+            caption: row.text.as_deref(),
+            reply_hint: row.context.as_deref(),
             moment_hint: None,
         };
-        // The query already enforces every constructor precondition; a row
-        // that still fails is dropped rather than rendered as an invented GIF.
         if let Ok(record) = GifRecord::try_new(src) {
             records.push(record);
         }
     }
-    Ok(GifPage {
-        records,
-        offset,
-        total,
-    })
-}
-
-/// Total of the deduplicated catalogue, evaluated by the one page statement
-/// itself (`LIMIT -1 OFFSET 0` = every row). Never a second predicate that
-/// could drift from the page.
-fn total(con: &Connection) -> Result<i64> {
-    let sql = format!("SELECT COUNT(*) FROM ({GIF_PAGE_SQL})");
-    let mut stmt = con.prepare_cached(&sql)?;
-    let total: i64 = stmt.query_row(rusqlite::params![-1i64, 0i64], |r| r.get(0))?;
-    Ok(total)
-}
-
-/// Prompt projection: at most `max` (capped at 20) records, no total counter.
-/// Returns an empty string when the catalogue is empty, so the batch renderer
-/// can omit the block.
-pub fn prompt_view(con: &Connection, max: i64) -> Result<String> {
-    let limit = max.clamp(1, PROMPT_MAX);
-    Ok(render_prompt(&page(con, 0, limit)?.records))
+    records
 }
 
 /// Render the prompt projection from already-loaded records. This is the only
@@ -331,21 +246,27 @@ pub fn render_prompt(records: &[GifRecord]) -> String {
     )
 }
 
+/// Wrap a data-layer page in the typed projection.
+pub fn page_of(rows: Vec<GifRow>, offset: i64, total: i64) -> GifPage {
+    GifPage {
+        records: records_from(rows),
+        offset,
+        total,
+    }
+}
+
 /// Tool projection: one page plus the total counter. The page size is the
 /// caller's validated limit; the render does not clamp anything either.
-pub fn list_view(con: &Connection, offset: i64, limit: i64) -> Result<String> {
-    let page = page(con, offset, limit)?;
+pub fn list_view(page: GifPage) -> String {
     if page.records.is_empty() {
         if page.total == 0 {
-            return Ok(
-                "Гифок в истории пока нет (только подтверждённые анимации; старые записи без типа не угадываются)."
-                    .to_string(),
-            );
+            return "Гифок в истории пока нет (только подтверждённые анимации; старые записи без типа не угадываются)."
+                .to_string();
         }
-        return Ok(format!(
+        return format!(
             "Страница пуста: всего гифок {}, запрошено со смещения {}. Уменьши offset.",
             page.total, page.offset
-        ));
+        );
     }
     let lines: Vec<String> = page
         .records
@@ -353,12 +274,21 @@ pub fn list_view(con: &Connection, offset: i64, limit: i64) -> Result<String> {
         .enumerate()
         .map(|(i, r)| record_line(page.offset + i as i64 + 1, r))
         .collect();
-    Ok(format!(
+    format!(
         "Все известные гифки ({} из {}):\n{}",
         page.records.len(),
         page.total,
         lines.join("\n")
-    ))
+    )
+}
+
+/// Prompt projection: at most `max` (capped at 20) records, no total counter.
+/// Empty string when the catalogue is empty, so the renderer can omit it.
+pub fn prompt_view(rows: Vec<GifRow>, max: i64) -> String {
+    let limit = max.clamp(1, PROMPT_MAX) as usize;
+    let mut records = records_from(rows);
+    records.truncate(limit);
+    render_prompt(&records)
 }
 
 fn record_line(idx: i64, r: &GifRecord) -> String {
@@ -390,6 +320,7 @@ fn one_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use crate::db;
 
     fn temp_state(tag: &str) -> String {
@@ -397,6 +328,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.to_string_lossy().to_string()
+    }
+
+    fn load_page(con: &Connection, offset: i64, limit: i64) -> GifPage {
+        let (rows, total) = crate::store::catalog_page(con, offset, limit).unwrap();
+        page_of(rows, offset, total)
     }
 
     fn insert(
@@ -440,13 +376,26 @@ mod tests {
         assert!(GifRecord::try_new(src("video", "ready", "f", "u", 10)).is_err());
         assert!(GifRecord::try_new(src("sticker", "ready", "f", "u", 10)).is_err());
         assert!(GifRecord::try_new(src("document", "ready", "f", "u", 10)).is_err());
-        assert!(GifRecord::try_new(src("animation", "descriptor", "f", "u", 10)).is_err());
+        assert!(GifRecord::try_new(src("animation", "pending", "f", "u", 10)).is_err());
+        assert!(GifRecord::try_new(src("animation", "absent", "f", "u", 10)).is_err());
         assert!(GifRecord::try_new(src("animation", "ready", "", "u", 10)).is_err());
         assert!(GifRecord::try_new(src("animation", "ready", "f", "", 10)).is_err());
         assert!(GifRecord::try_new(src("animation", "ready", "f", "u", 0)).is_err());
         let empty_caption = GifRecord::try_new(src("animation", "ready", "f", "u", 10)).unwrap();
         assert_eq!(empty_caption.caption(), &Caption::Absent);
         assert_eq!(empty_caption.fits(), &FitsWhen::Unknown);
+    }
+
+    /// A wipe removes the bytes, not the entry: an animation whose file is gone
+    /// stays catalogued because sending works by `file_id` and the size is kept.
+    #[test]
+    fn evicted_and_descriptor_animations_stay_catalogued() {
+        for state in ["ready", "descriptor", "evicted"] {
+            let record = GifRecord::try_new(src("animation", state, "f", "u", 10))
+                .unwrap_or_else(|e| panic!("{state} must be catalogued: {e}"));
+            assert_eq!(record.file_id(), "f");
+            assert_eq!(record.size(), 10);
+        }
     }
 
     #[test]
@@ -543,11 +492,11 @@ mod tests {
             8,
             507,
             "animation",
-            "descriptor",
+            "pending",
             "fid_x",
             "uniq_x",
             4096,
-            "descriptor",
+            "ещё качается",
             None,
         );
         insert(
@@ -563,7 +512,8 @@ mod tests {
             None,
         );
 
-        let first = page(&con, 0, 200).unwrap();
+        let (rows, total) = crate::store::catalog_page(&con, 0, 200).unwrap();
+        let first = page_of(rows, 0, total);
         assert_eq!(
             first.total, 2,
             "non-animations leaked into the catalogue: {first:?}"
@@ -574,7 +524,8 @@ mod tests {
         assert_eq!(a.caption(), &Caption::Absent);
         assert_eq!(a.fits(), &FitsWhen::Reply("обычная реплика".to_string()));
 
-        let both = page(&con, 0, 20).unwrap();
+        let (rows, total) = crate::store::catalog_page(&con, 0, 20).unwrap();
+        let both = page_of(rows, 0, total);
         assert_eq!(both.total, 2, "{both:?}");
         assert_eq!(both.records[0].file_id(), "fid_a");
         assert_eq!(both.records[1].file_id(), "fid_b");
@@ -651,19 +602,20 @@ mod tests {
                 None,
             );
         }
-        let first = page(&con, 0, 30).unwrap();
+        let (rows, total) = crate::store::catalog_page(&con, 0, 30).unwrap();
+        let first = page_of(rows, 0, total);
         assert_eq!(
             first.total, 40,
             "a non-empty page lost the whole-catalogue total"
         );
         assert_eq!(first.records.len(), 30);
-        let list = list_view(&con, 0, 30).unwrap();
+        let list = list_view(load_page(&con, 0, 30));
         assert!(list.contains("30 из 40"), "{list}");
-        let beyond = list_view(&con, 35, 30).unwrap();
+        let beyond = list_view(load_page(&con, 35, 30));
         assert!(beyond.contains("5 из 40"), "{beyond}");
-        let empty = list_view(&con, 100, 30).unwrap();
+        let empty = list_view(load_page(&con, 100, 30));
         assert_eq!(
-            page(&con, 100, 30).unwrap().total,
+            crate::store::catalog_page(&con, 100, 30).unwrap().1,
             40,
             "an empty page reported total 0"
         );
@@ -696,21 +648,21 @@ mod tests {
                 None,
             );
         }
-        let prompt = prompt_view(&con, 50).unwrap();
+        let prompt = prompt_view(crate::store::catalog_page(&con, 0, 50).unwrap().0, 50);
         assert_eq!(prompt.matches("[gif:").count(), PROMPT_MAX as usize);
         assert!(
             !prompt.contains("из 25"),
             "prompt leaked a total counter: {prompt}"
         );
 
-        let list = list_view(&con, 0, LIST_PAGE_DEFAULT).unwrap();
+        let list = list_view(load_page(&con, 0, LIST_PAGE_DEFAULT));
         assert_eq!(list.matches("[gif:").count(), 25);
         assert!(
             list.contains("25 из 25"),
             "tool projection needs the total: {list}"
         );
-        assert_eq!(page(&con, 0, 200).unwrap().total, 25);
-        assert!(list_view(&con, 20, 30).unwrap().contains("[gif:21]"));
+        assert_eq!(crate::store::catalog_page(&con, 0, 200).unwrap().1, 25);
+        assert!(list_view(load_page(&con, 20, 30)).contains("[gif:21]"));
         let _ = std::fs::remove_dir_all(&state);
     }
 }

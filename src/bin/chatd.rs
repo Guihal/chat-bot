@@ -1,13 +1,12 @@
 use anyhow::{anyhow, Result};
-use chat_bot::db::Db;
-use chat_bot::ledger;
+use chat_bot::store::Store;
 use chat_bot::ops;
 use chat_bot::*;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// When an instance last proved it cannot serve again (`StaleExtensionContextError`).
 /// This, not bare absence, is the only evidence that lets the host generation be
@@ -58,6 +57,7 @@ async fn main() -> Result<()> {
                 "run" => cmd_run().await,
                 "sync" => cmd_sync().await,
                 "summarize" => cmd_summarize().await,
+                "knowledge" => cmd_knowledge().await,
                 "config" => cmd_config(),
                 "watchdog" => {
                     let loop_mode = std::env::args().nth(2).as_deref() == Some("--loop");
@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
                 }
                 _ => {
                     eprintln!(
-                        "usage: chatd run|sync|summarize|config --effective|watchdog [--loop]"
+                        "usage: chatd run|sync|summarize|knowledge [--day YYYY-MM-DD]|config --effective|watchdog [--loop]"
                     );
                     std::process::exit(2);
                 }
@@ -143,13 +143,12 @@ async fn cmd_sync() -> Result<()> {
         ));
     }
     let _lock = acquire_state_lock(&state)?;
-    let db = Db::open(&state)?;
-    let mut offset: i64 = db
-        .call(|con| Ok(kv_get(con, "offset", "0").parse().unwrap_or(0)))
-        .await?;
-    let chat: i64 = db
-        .call(|con| Ok(kv_get(con, "chat_id", "0").parse().unwrap_or(0)))
-        .await?;
+    let store = Store::open(&state)?;
+    let mut offset: i64 = chat_bot::store::kv_get(&store, "offset", "0")
+        .await?
+        .parse()
+        .unwrap_or(0);
+    let chat: i64 = chat_bot::store::chat_id(&store).await?;
     loop {
         let updates = api(
             "getUpdates",
@@ -174,8 +173,7 @@ async fn cmd_sync() -> Result<()> {
             }
         }
         if through > offset {
-            db.write(move |tx| tx.commit_page(envelopes, through))
-                .await?;
+            chat_bot::store::commit_page(&store, envelopes, through).await?;
             offset = through;
         }
         if n < 100 {
@@ -184,13 +182,11 @@ async fn cmd_sync() -> Result<()> {
     }
     // Rows are already durable and pending; this pass downloads them under
     // the same budget as the daemon.
-    let jobs = db
-        .call(|con| chat_bot::media::resume_pending(con, chat_bot::media::MEDIA_QUEUE_CAP))
-        .await?;
+    let jobs = chat_bot::store::pending_jobs_of(&store, chat_bot::media::MEDIA_QUEUE_CAP).await?;
     let source = chat_bot::media::TelegramSource;
     for job in jobs {
         let budget = chat_bot::media::MediaBudget::from_disk(&state);
-        if let Err(e) = chat_bot::media::fetch_job(&db, &state, &job, &budget, &source).await {
+        if let Err(e) = chat_bot::media::fetch_job(&store, &state, &job, &budget, &source).await {
             dlog(&format!(
                 "sync media fetch failed for {}: {e:#}",
                 job.row_id
@@ -204,13 +200,7 @@ async fn cmd_sync() -> Result<()> {
 async fn cmd_summarize() -> Result<()> {
     let state = state_dir();
     let con = db(&state)?;
-    let mut stmt = con.prepare(
-        "SELECT username, first_name, text FROM messages ORDER BY update_id DESC LIMIT 500",
-    )?;
-    let rows: Vec<(Option<String>, Option<String>, Option<String>)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-        .flatten()
-        .collect();
+    let rows = chat_bot::store::recent_digest(&con, 500)?;
     let mut lines = vec![];
     for (u, n, t) in rows.iter().rev() {
         if let Some(t) = t {
@@ -262,30 +252,373 @@ async fn summarize_prompt(sid: &str, sock: &str, digest: &str) -> Result<()> {
     )
     .await?;
     if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
-        for m in msgs.iter().rev() {
-            if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
-                continue;
-            }
-            let mut texts = vec![];
-            if let Some(content) = m.get("content").and_then(|v| v.as_array()) {
-                for c in content {
-                    if c.get("type").and_then(|v| v.as_str()) == Some("text") {
-                        if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
-                            if !t.is_empty() {
-                                texts.push(t.to_string());
-                            }
+        if let Some(text) = last_assistant_text(msgs) {
+            std::fs::write("chat-summary.md", text)?;
+            dlog("chat-summary.md updated");
+            return Ok(());
+        }
+    }
+    dlog("no summary produced");
+    Ok(())
+}
+
+/// Text of the newest assistant message among `--messages` rows. Only the
+/// LAST assistant message counts: earlier ones belong to other turns.
+fn last_assistant_text(msgs: &[Value]) -> Option<String> {
+    for m in msgs.iter().rev() {
+        if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let mut texts = vec![];
+        if let Some(content) = m.get("content").and_then(|v| v.as_array()) {
+            for c in content {
+                if c.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            texts.push(t.to_string());
                         }
                     }
                 }
             }
-            if !texts.is_empty() {
-                std::fs::write("chat-summary.md", texts.join("\n"))?;
-                dlog("chat-summary.md updated");
-                return Ok(());
+        }
+        if !texts.is_empty() {
+            return Some(texts.join("\n"));
+        }
+    }
+    None
+}
+
+/// One run of the daily knowledge job: read the whole calendar day, feed it to
+/// an isolated session in chunks, and merge the records into the three managed
+/// documents. Exit status is 0 only when every chunk both reached the web and
+/// produced a parseable answer; a degraded run must not look like a quiet day.
+async fn cmd_knowledge() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let mut day_arg: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--day" => match args.get(i + 1) {
+                Some(v) => {
+                    day_arg = Some(v.clone());
+                    i += 2;
+                }
+                None => {
+                    eprintln!("usage: chatd knowledge [--day YYYY-MM-DD] (missing value for --day)");
+                    std::process::exit(2);
+                }
+            },
+            other => {
+                eprintln!("usage: chatd knowledge [--day YYYY-MM-DD] (unknown argument: {other})");
+                std::process::exit(2);
             }
         }
     }
-    dlog("no summary produced");
+    let offset_min: i32 = cfg("CHATBOT_KNOWLEDGE_UTC_OFFSET_MIN", "180")
+        .parse()
+        .unwrap_or(180);
+    let tz = chrono::FixedOffset::east_opt(offset_min * 60)
+        .ok_or_else(|| anyhow!("bad CHATBOT_KNOWLEDGE_UTC_OFFSET_MIN={offset_min}"))?;
+    let today = chrono::Utc::now().with_timezone(&tz).date_naive();
+    let day = match day_arg {
+        Some(raw) => match chrono::NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d") {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("usage: chatd knowledge [--day YYYY-MM-DD] (bad --day value: {e})");
+                std::process::exit(2);
+            }
+        },
+        None => today - chrono::Duration::days(1),
+    };
+    let day_s = day.format("%Y-%m-%d").to_string();
+    let from = day
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| anyhow!("cannot resolve midnight of {day_s}"))?
+        .and_utc()
+        .timestamp()
+        - i64::from(offset_min) * 60;
+    let to = from + 86_400;
+    let target_dir = std::path::PathBuf::from(cfg(
+        "CHATBOT_KNOWLEDGE_DIR",
+        &cfg("CHATBOT_CWD", "."),
+    ));
+    std::fs::create_dir_all(&target_dir)?;
+    let scratch = std::path::PathBuf::from(cfg("CHATBOT_KNOWLEDGE_TMP", "/tmp"))
+        .join(format!("knowledge-{day_s}"));
+    std::fs::create_dir_all(&scratch)?;
+    let scratch_s = scratch.to_string_lossy().to_string();
+    println!(
+        "day={day_s} window={from}..{to} offset_min={offset_min} targets={} scratch={scratch_s}",
+        target_dir.display()
+    );
+    let res = knowledge_run(
+        &day_s,
+        from,
+        to,
+        &target_dir,
+        &scratch_s,
+        &cfg("CHATBOT_SYSTEM", "knowledge-prompt.md"),
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    res
+}
+
+async fn knowledge_run(
+    day_s: &str,
+    from: i64,
+    to: i64,
+    target_dir: &std::path::Path,
+    scratch: &str,
+    system_path: &str,
+) -> Result<()> {
+    let kinds = chat_bot::knowledge::kinds();
+    let paths: Vec<std::path::PathBuf> = kinds
+        .iter()
+        .map(|k| target_dir.join(k.file_name()))
+        .collect();
+    let mut docs: Vec<chat_bot::knowledge::Doc> = vec![];
+    for (kind, path) in kinds.iter().zip(&paths) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                chat_bot::knowledge::new_document(*kind)
+            }
+            Err(e) => return Err(anyhow!("read {}: {e}", path.display())),
+        };
+        docs.push(chat_bot::knowledge::parse_managed(&text));
+    }
+    let mut ref_hashes: Vec<String> = paths.iter().map(|p| file_hash(p)).collect();
+    let budget: usize = cfg("CHATBOT_KNOWLEDGE_CHUNK_CHARS", "40000")
+        .parse()
+        .unwrap_or(40000);
+    let store = Store::open(&state_dir())?;
+    let session = format!("knowledge-{day_s}");
+    let mut cursor = (0i64, 0i64);
+    let mut parts: Vec<(String, usize)> = vec![];
+    let mut lines: Vec<String> = vec![];
+    let mut used = 0usize;
+    let mut messages = 0i64;
+    loop {
+        let rows = chat_bot::store::knowledge_window_of(&store, from, to, cursor.0, cursor.1, 500)
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for (mid, date, username, first_name, text) in rows {
+            cursor = (date, mid);
+            let text = text.unwrap_or_default();
+            if text.trim().is_empty() {
+                continue;
+            }
+            messages += 1;
+            let who = username
+                .filter(|s| !s.is_empty())
+                .or(first_name)
+                .unwrap_or_default();
+            let clock = tz_clock(date);
+            let short: String = text.chars().take(2000).collect();
+            let line = format!("[{clock}] {mid} {who}: {short}");
+            used += line.chars().count() + 1;
+            lines.push(line);
+            if used >= budget {
+                parts.push((lines.join("\n"), lines.len()));
+                lines.clear();
+                used = 0;
+            }
+        }
+    }
+    // The last, partial chunk is real work: without this flush a quiet day
+    // would report messages>0 but process nothing.
+    if !lines.is_empty() {
+        parts.push((lines.join("\n"), lines.len()));
+    }
+    let mut chunks = 0usize;
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    let mut web_calls = 0usize;
+    let mut persons = 0usize;
+    for (digest, count) in parts {
+        chunks += 1;
+        match knowledge_chunk(
+            &session,
+            scratch,
+            system_path,
+            &knowledge_prompt_text(day_s, chunks, &digest, &docs),
+        )
+        .await
+        .and_then(|(calls, chunk)| {
+            if !chunk.web_ok {
+                return Err(anyhow!("web.ok=false reason={}", chunk.web_reason));
+            }
+            web_calls += calls;
+            persons += chunk.persons.len();
+            write_chunk(&mut docs, &kinds, &paths, &mut ref_hashes, &chunk, day_s)
+        }) {
+            Ok(stats) => {
+                ok += 1;
+                println!(
+                    "chunk {chunks} messages={count} ok added={} updated={}",
+                    stats.0, stats.1
+                );
+            }
+            Err(e) => {
+                failed += 1;
+                println!("chunk {chunks} FAILED messages={count}: {e:#}");
+            }
+        }
+    }
+    println!(
+        "day={day_s} messages={messages} chunks={chunks} ok={ok} failed={failed} web_calls={web_calls} persons={persons} hash-guard ok"
+    );
+    if failed > 0 {
+        return Err(anyhow!(
+            "{failed} of {chunks} chunks failed for {day_s}; the day is not closed"
+        ));
+    }
+    if persons > 0 && web_calls == 0 {
+        return Err(anyhow!(
+            "{persons} persons recorded for {day_s} but no web tool was called: the \"google who this is\" step did not run"
+        ));
+    }
+    Ok(())
+}
+
+fn tz_clock(ts: i64) -> String {
+    let offset_min: i32 = cfg("CHATBOT_KNOWLEDGE_UTC_OFFSET_MIN", "180")
+        .parse()
+        .unwrap_or(180);
+    chrono::DateTime::from_timestamp(ts, 0)
+        .and_then(|d| {
+            chrono::FixedOffset::east_opt(offset_min * 60).map(|tz| d.with_timezone(&tz))
+        })
+        .map(|d| d.format("%H:%M").to_string())
+        .unwrap_or_default()
+}
+
+fn knowledge_prompt_text(
+    day_s: &str,
+    part: usize,
+    digest: &str,
+    docs: &[chat_bot::knowledge::Doc],
+) -> String {
+    let existing = |i: usize, n: usize| chat_bot::knowledge::existing_digest(&docs[i], day_s, n);
+    format!(
+        "День {day_s}, часть {part} переписки (хронологический порядок).\n\n\
+Уже записано (ключ — что в нём уже описано). Если содержание куска попадает в такую запись, \
+верни ЕЁ ключ и обновлённое тело; новую запись создавай только для материала, которого нет ни в одной \
+из них:\n\nдискурс:\n{}\n\nперсоны:\n{}\n\nсловарь:\n{}\n\n\
+Сообщения:\n{digest}\n\n\
+Ответь ТОЛЬКО JSON по схеме из системного промпта.",
+        existing(0, 200),
+        existing(1, 300),
+        existing(2, 300)
+    )
+}
+
+async fn knowledge_chunk(
+    session: &str,
+    scratch: &str,
+    system_path: &str,
+    prompt: &str,
+) -> Result<(usize, chat_bot::knowledge::Chunk)> {
+    let (sid, sock) = isolated_session_of(system_path, session, scratch, true).await?;
+    let res = knowledge_turn(&sid, &sock, prompt).await;
+    close_summary_session(&sid, &sock).await;
+    res
+}
+
+async fn knowledge_wait(sid: &str, sock: &str) -> Result<Value> {
+    omo_on(
+        &["wait", sid, "--until", "idle", "--timeout", "900000"],
+        Duration::from_secs(920),
+        sock,
+    )
+    .await
+}
+
+async fn knowledge_turn(
+    sid: &str,
+    sock: &str,
+    prompt: &str,
+) -> Result<(usize, chat_bot::knowledge::Chunk)> {
+    knowledge_wait(sid, sock).await?;
+    omo_on(&["prompt", sid, prompt], Duration::from_secs(120), sock).await?;
+    knowledge_wait(sid, sock).await?;
+    let data = omo_on(
+        &["read", sid, "--tail", "10", "--messages"],
+        Duration::from_secs(60),
+        sock,
+    )
+    .await?;
+    let msgs = data
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("session read returned no messages"))?;
+    let web_calls = msgs
+        .iter()
+        .filter_map(|m| m.get("content"))
+        .map(chat_bot::knowledge::web_tool_calls)
+        .sum();
+    let text = last_assistant_text(msgs)
+        .ok_or_else(|| anyhow!("session produced no assistant message"))?;
+    Ok((web_calls, chat_bot::knowledge::parse_model_json(&text)?))
+}
+
+/// Merge one chunk into the documents and write them atomically. The hash
+/// guard runs BEFORE the merge: the managed zone is ours, every byte outside
+/// it belongs to another writer, and a concurrent change must stop the run
+/// instead of being silently re-rendered away. The reference is refreshed after
+/// our own write so the next chunk compares against our own output.
+fn write_chunk(
+    docs: &mut [chat_bot::knowledge::Doc],
+    kinds: &[chat_bot::knowledge::Kind],
+    paths: &[std::path::PathBuf],
+    ref_hashes: &mut [String],
+    chunk: &chat_bot::knowledge::Chunk,
+    day_s: &str,
+) -> Result<(usize, usize)> {
+    for (i, path) in paths.iter().enumerate() {
+        let now = file_hash(path);
+        if now != ref_hashes[i] {
+            return Err(anyhow!(
+                "hash-guard: {} changed by another writer during the run",
+                path.display()
+            ));
+        }
+    }
+    let mut added = 0;
+    let mut updated = 0;
+    for (i, kind) in kinds.iter().enumerate() {
+        let stats = chat_bot::knowledge::merge(&mut docs[i], chunk.records_for(*kind), day_s);
+        added += stats.added;
+        updated += stats.updated;
+    }
+    for (i, path) in paths.iter().enumerate() {
+        let text = chat_bot::knowledge::render(&docs[i], kinds[i]);
+        write_atomic(path, &text)?;
+        ref_hashes[i] = sha256_hex(text.as_bytes());
+    }
+    Ok((added, updated))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+fn file_hash(path: &std::path::Path) -> String {
+    std::fs::read(path)
+        .map(|b| sha256_hex(&b))
+        .unwrap_or_default()
+}
+
+fn write_atomic(path: &std::path::Path, text: &str) -> Result<()> {
+    let tmp = path.with_extension(format!("knowledge-tmp-{}", std::process::id()));
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -295,10 +628,12 @@ struct Job {
     batch: Vec<BatchMsg>,
 }
 
-/// A recovery request from the track unit. `recreate` is false for a batch the
-/// runtime never accepted (re-pushing is enough and never touches a
-/// live session) and true only when the delivery provably entered a run that
-/// then stopped making progress.
+/// A recovery request from the track unit. `recreate` is false for every
+/// failure that is not the session's own fault — a stalled batch, a terminal
+/// provider error, a refused frame. Those re-deliver into the SAME session,
+/// because a new one throws away the model's memory. It is true only for
+/// `HealAndRepush`: the gateway rejected media in the transcript and a fresh
+/// session is the only cure (the reason is logged by `recreate_session`).
 struct Recover {
     sig: String,
     recreate: bool,
@@ -354,7 +689,7 @@ enum Inbound {
 /// else asks through `recover_tx`.
 #[allow(clippy::too_many_arguments)]
 async fn admit_loop(
-    db: Db,
+    store: Store,
     mut jobs: tokio::sync::mpsc::UnboundedReceiver<Job>,
     ack: tokio::sync::mpsc::UnboundedSender<String>,
     admitted_tx: tokio::sync::mpsc::UnboundedSender<String>,
@@ -367,18 +702,18 @@ async fn admit_loop(
     let state = state_dir();
     let ref_ = cfg("CHATBOT_SESSION", "chat-participant");
     let mut sid: Option<String> = None;
-    match ensure_session(&db, &system_path, Some(&ref_)).await {
+    match ensure_session(&store, &system_path, Some(&ref_)).await {
         Ok(s) => {
             let offset = read_events(&state, 0).map(|(_, o)| o).unwrap_or(0);
-            let _ = settle_session(&state, &db, offset, Duration::from_secs(180)).await;
+            let _ = settle_session(&state, &store, offset, Duration::from_secs(180)).await;
             dlog(&format!("admit unit ready, session {s}"));
             sid = Some(s);
-            announce_session(&db, &out_tx).await;
+            announce_session(&store, &out_tx).await;
         }
         Err(e) => dlog(&format!("initial session ensure failed: {e:#}")),
     }
     recover_pending(
-        &db,
+        &store,
         &state,
         &mut sid,
         &system_path,
@@ -402,10 +737,22 @@ async fn admit_loop(
     // that may be finishing a turn.
     const HELD_STRIKES: u32 = 2;
     const HELD_COOLDOWN_TICKS: u32 = 5;
+    // A resume is a cheap human prompt, not a restart, so it may retry sooner
+    // than a heal - but not every tick, or a session that refuses would be
+    // flooded with user turns.
+    const RESUME_COOLDOWN_TICKS: u32 = 2;
     let mut held_strikes: u32 = 0;
     // Starts at the cooldown value: the cooldown spaces out REPEATED heals, it
     // must not delay the first one past the two-tick confirmation.
     let mut ticks_since_heal: u32 = HELD_COOLDOWN_TICKS;
+    // The engine pauses a session once automatic wakes pile up with no human
+    // input ("Paused while no one was here: N automatic wakes held"). A chat bot
+    // NEVER produces human input, so that pause is permanent on its own: the
+    // session takes every push, runs nothing, and every open batch stalls until
+    // it is re-pushed. The documented remedy is a message from a human, so send
+    // one instead of restarting the host (which throws the conversation away).
+    let mut resume_strikes: u32 = 0;
+    let mut ticks_since_resume: u32 = RESUME_COOLDOWN_TICKS;
     loop {
         tokio::select! {
             _ = host_tick.tick() => {
@@ -417,6 +764,34 @@ async fn admit_loop(
                 if host_alive() {
                     if let Some(uid) = sid.clone() {
                         if let Some(h) = chat_bot::session::health_on(&uid, &host_socket()).await {
+                            if chat_bot::session::needs_resume(&h) {
+                                resume_strikes = resume_strikes.saturating_add(1);
+                                dlog(&format!(
+                                    "session {uid} is paused {:?} (strike {resume_strikes}/{HELD_STRIKES})",
+                                    h.holds
+                                ));
+                                if resume_strikes >= HELD_STRIKES
+                                    && ticks_since_resume >= RESUME_COOLDOWN_TICKS
+                                    && !turn_recently_open()
+                                {
+                                    if chat_bot::session::resume_on(&uid, &host_socket()).await {
+                                        dlog(&format!("session {uid} resumed with a human prompt"));
+                                        ticks_since_resume = 0;
+                                        // A resume prompt consumes the held notices without
+                                        // re-enqueueing them, so nothing the paused session
+                                        // swallowed is in the transcript: push the open batches
+                                        // again instead of trusting them.
+                                        redrive_open_batches(&store, &state, &out_tx, "resume")
+                                            .await;
+                                    } else {
+                                        dlog(&format!(
+                                            "session {uid} resume was refused; retrying next tick"
+                                        ));
+                                    }
+                                }
+                            } else {
+                                resume_strikes = 0;
+                            }
                             if chat_bot::session::is_mute(&h) {
                                 held_strikes = held_strikes.saturating_add(1);
                                 dlog(&format!(
@@ -440,59 +815,17 @@ async fn admit_loop(
                                         "session {uid} is mute on interrupted-run; restarting the host generation"
                                     ));
                                     let _ = chat_bot::stop_host_on(&host_socket()).await;
-                                    match ensure_session(&db, &system_path, Some(&ref_)).await {
+                                    match ensure_session(&store, &system_path, Some(&ref_)).await {
                                         Ok(s) => {
                                             dlog(&format!("heal: fresh session {s}"));
                                             sid = Some(s);
-                                            announce_session(&db, &out_tx).await;
+                                            announce_session(&store, &out_tx).await;
                                         }
                                         Err(e) => dlog(&format!("heal: ensure failed: {e:#}")),
                                     }
                                     // The held session ate every push; re-drive the
-                                    // open batches now instead of waiting for the
-                                    // seven-minute stall budget.
-                                    let pend = db
-                                        .call(|con| Ok(ledger::open_batches(con)?))
-                                        .await
-                                        .unwrap_or_default();
-                                    for open_sig in pend {
-                                        let st = state.clone();
-                                        let sg = open_sig.clone();
-                                        let text = db
-                                            .call(move |con| {
-                                                Ok(regen_text(&st, con, &sg).ok().flatten())
-                                            })
-                                            .await
-                                            .unwrap_or(None);
-                                        let Some(text) = text else { continue };
-                                        let sg2 = open_sig.clone();
-                                        let ids = db
-                                            .call(move |con| Ok(ledger::message_ids(con, &sg2)?))
-                                            .await
-                                            .unwrap_or_default();
-                                        let sg3 = open_sig.clone();
-                                        let tid = db
-                                            .call(move |con| Ok(ledger::thread_id(con, &sg3)))
-                                            .await
-                                            .unwrap_or(None);
-                                        activity().thread.store(
-                                            tid.unwrap_or(-1),
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                        if out_tx
-                                            .send(Out::Push {
-                                                delivery_id: frame_id(&open_sig),
-                                                text,
-                                                batch_ids: ids,
-                                                thread_id: tid,
-                                            })
-                                            .is_ok()
-                                        {
-                                            dlog(&format!(
-                                                "heal: re-pushed {open_sig} into the fresh session"
-                                            ));
-                                        }
-                                    }
+                                    // open batches now instead of waiting for the stall budget.
+                                    redrive_open_batches(&store, &state, &out_tx, "heal").await;
                                     held_strikes = 0;
                                     ticks_since_heal = 0;
                                 }
@@ -506,12 +839,13 @@ async fn admit_loop(
                     }
                 }
                 ticks_since_heal = ticks_since_heal.saturating_add(1);
+                ticks_since_resume = ticks_since_resume.saturating_add(1);
                 if !host_alive() {
                     dlog(&format!(
                         "host watchdog: socket missing ({}), re-ensuring host",
                         host_socket()
                     ));
-                    match ensure_session(&db, &system_path, Some(&ref_)).await {
+                    match ensure_session(&store, &system_path, Some(&ref_)).await {
                         Ok(s) => {
                             // No settle here: a freshly ensured idle session never
                             // emits turn_end, so waiting for one would hold the
@@ -520,7 +854,7 @@ async fn admit_loop(
                             // actually opened a turn.
                             dlog(&format!("host watchdog: host re-ensured, session {s}"));
                             sid = Some(s);
-                            announce_session(&db, &out_tx).await;
+                            announce_session(&store, &out_tx).await;
                         }
                         Err(e) => dlog(&format!("host watchdog: re-ensure failed: {e:#}")),
                     }
@@ -539,7 +873,7 @@ async fn admit_loop(
                             ));
                         }
                     }
-                    announce_session(&db, &out_tx).await;
+                    announce_session(&store, &out_tx).await;
                 }
                 Some(Inbound::Result { delivery_id, kind }) => {
                     dlog(&format!("stray delivery result {delivery_id} ({kind})"));
@@ -548,7 +882,7 @@ async fn admit_loop(
             },
             job = jobs.recv() => match job {
                 Some(job) => {
-                    let res = admit_job(&db, &state, &mut sid, &system_path, &ref_, &admitted_tx, &inboxed_tx, &out_tx, &mut inbound_rx, job).await;
+                    let res = admit_job(&store, &state, &mut sid, &system_path, &ref_, &admitted_tx, &inboxed_tx, &out_tx, &mut inbound_rx, job).await;
                     if let Err(e) = res {
                         dlog(&format!("admit job failed: {e:#}"));
                     }
@@ -560,7 +894,7 @@ async fn admit_loop(
             },
             req = recover.recv() => {
                 if let Some(req) = req {
-                    if let Err(e) = recover_batch(&db, &state, &mut sid, &system_path, &ref_, &admitted_tx, &inboxed_tx, &out_tx, &mut inbound_rx, &req).await {
+                    if let Err(e) = recover_batch(&store, &state, &mut sid, &system_path, &ref_, &admitted_tx, &inboxed_tx, &out_tx, &mut inbound_rx, &req).await {
                         dlog(&format!("recover {} failed: {e:#}", req.sig));
                     }
                 }
@@ -572,14 +906,23 @@ async fn admit_loop(
 /// Executes one read-only control call on the database thread. The connection is
 /// waited on with the connection's own 300 ms busy_timeout, so a contended
 /// database is answered promptly instead of freezing the caller.
-async fn handle_control_call(db: &Db, op: &str, args: &Value) -> Result<String> {
+async fn handle_control_call(store: &Store, state: &str, op: &str, args: &Value) -> Result<String> {
     match op {
-        "chat_send" => chat_bot::send::chat_send(db, args).await,
-        "typing" => chat_bot::send::typing(db, args).await,
+        // A favourite is resolved here, before the transport sees the request:
+        // `send.rs` keeps knowing only about Bot API arguments, and the store
+        // stays with `favorites`, its only owner.
+        "chat_send" => {
+            let args = chat_bot::favorites::apply_favorite(state, args)?;
+            chat_bot::send::chat_send(store, &args).await
+        }
+        "chat_favorite" => chat_bot::favorites::control(state, args),
+        "typing" => chat_bot::send::typing(store, args).await,
         "gif_list" => {
             let (offset, limit) = chat_bot::catalog::parse_page_args(args)?;
-            db.call(move |con| chat_bot::catalog::list_view(con, offset, limit))
-                .await
+            let (rows, total) = chat_bot::store::catalog_page_of(store, offset, limit).await?;
+            Ok(chat_bot::catalog::list_view(chat_bot::catalog::page_of(
+                rows, offset, total,
+            )))
         }
         other => Err(anyhow!("unknown control op: {other}")),
     }
@@ -647,11 +990,51 @@ async fn tool_loop(state: String, sock: std::path::PathBuf) {
     }
 }
 
+/// Push every open batch again. Used after a host heal and after a resume: a
+/// held session parks deliveries as notices and a resume prompt consumes those
+/// notices without re-enqueueing them, so the text must be pushed again rather
+/// than trusted.
+async fn redrive_open_batches(
+    store: &chat_bot::store::Store,
+    state: &str,
+    out_tx: &tokio::sync::mpsc::UnboundedSender<Out>,
+    why: &str,
+) {
+    let pend = chat_bot::store::open_batches_of(store).await.unwrap_or_default();
+    for open_sig in pend {
+        let text = chat_bot::regen_text(store, state, &open_sig)
+            .await
+            .ok()
+            .flatten();
+        let Some(text) = text else { continue };
+        let ids = chat_bot::store::message_ids_of(store, open_sig.clone())
+            .await
+            .unwrap_or_default();
+        let tid = chat_bot::store::thread_of_batch(store, open_sig.clone())
+            .await
+            .unwrap_or(None);
+        activity()
+            .thread
+            .store(tid.unwrap_or(-1), std::sync::atomic::Ordering::Relaxed);
+        if out_tx
+            .send(Out::Push {
+                delivery_id: frame_id(&open_sig),
+                text,
+                batch_ids: ids,
+                thread_id: tid,
+            })
+            .is_ok()
+        {
+            dlog(&format!("{why}: re-pushed {open_sig}"));
+        }
+    }
+}
+
 /// Hosts the control socket and moves frames between it and the admit unit.
 /// One connection at a time, newest wins: a host restart brings a new extension
 /// instance that reconnects on its own.
 async fn control_loop(
-    db: Db,
+    store: Store,
     sock: std::path::PathBuf,
     state: String,
     mut out_rx: tokio::sync::mpsc::UnboundedReceiver<Out>,
@@ -674,6 +1057,9 @@ async fn control_loop(
         }
     };
     dlog(&format!("control socket listening on {}", sock.display()));
+    // The favourites store needs the state directory on every `chat_send`; keep
+    // our own copy so the loop below can move the original into other units.
+    let state_dir = state.clone();
     loop {
         let stream = match listener.accept().await {
             Ok((s, _)) => s,
@@ -757,10 +1143,11 @@ async fn control_loop(
                                 let id = c.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
                                 let op = c.get("op").and_then(|x| x.as_str()).unwrap_or("").to_string();
                                 let args = c.get("args").cloned().unwrap_or(json!({}));
-                                let db = db.clone();
+                                let store = store.clone();
                                 let frames_tx = frames_tx.clone();
+                                let fav_state = state_dir.clone();
                                 tokio::task::spawn_local(async move {
-                                    let frame = match handle_control_call(&db, &op, &args).await {
+                                    let frame = match handle_control_call(&store, &fav_state, &op, &args).await {
                                         Ok(text) => {
                                             dlog(&format!("control call {op} ok ({} chars)", text.chars().count()));
                                             json!({"return": {"id": id, "ok": true, "text": text}})
@@ -796,15 +1183,14 @@ async fn control_loop(
     }
 }
 
-async fn announce_session(db: &Db, out_tx: &tokio::sync::mpsc::UnboundedSender<Out>) {
-    if let Ok(Some((uid, generation))) = db.call(|con| chat_bot::session::live_identity(con)).await
-    {
+async fn announce_session(store: &Store, out_tx: &tokio::sync::mpsc::UnboundedSender<Out>) {
+    if let Ok(Some((uid, generation))) = chat_bot::store::live_identity_of(&store).await {
         let _ = out_tx.send(Out::Session { uid, generation });
     }
 }
 
 async fn ensure_sid(
-    db: &Db,
+    store: &Store,
     sid: &mut Option<String>,
     system_path: &str,
     ref_: &str,
@@ -819,15 +1205,15 @@ async fn ensure_sid(
             host_socket()
         ));
     }
-    let s = ensure_session(db, system_path, Some(ref_)).await?;
+    let s = ensure_session(store, system_path, Some(ref_)).await?;
     *sid = Some(s.clone());
-    announce_session(db, out_tx).await;
+    announce_session(store, out_tx).await;
     Ok(s)
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn admit_job(
-    db: &Db,
+    store: &Store,
     state: &str,
     sid_slot: &mut Option<String>,
     system_path: &str,
@@ -838,53 +1224,50 @@ async fn admit_job(
     inbound_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Inbound>,
     job: Job,
 ) -> Result<()> {
-    let batch = job.batch;
+    let raw_len = job.batch.len();
+    let known_group = chat_bot::store::known_group_post_keys_of(store).await?;
+    let batch = chat_bot::dedupe_channel_posts_known(job.batch, &known_group);
+    if batch.len() < raw_len {
+        dlog(&format!(
+            "dedupe: dropped {} channel copy(ies) already answered in the discussion group",
+            raw_len - batch.len()
+        ));
+    }
     // One closure: building the text and writing its pending ledger entry must
     // not be separated by another unit's write.
-    let state_for_db = state.to_string();
-    let (text, sig, ids, tome, _anchor) = {
-        db.call(move |con| build_batch_text(&state_for_db, con, &batch))
-            .await?
-    };
+    let (text, sig, ids, tome, _anchor, skipped) =
+        build_batch_text(store, state, &batch).await?;
     if ids.is_empty() {
-        dlog("flush skipped: every batch row already answered");
+        if !skipped.is_empty() {
+            // Every row was too old to reach the model: seal the batch so the
+            // ledger names it, then close it as skipped. It never pushes, so
+            // it can never stall or be re-delivered.
+            let chat: i64 = chat_bot::store::chat_id(store).await?;
+            let thread = chat_bot::store::batch_thread_of(store, skipped.clone()).await?;
+            chat_bot::store::seal_and_push(store, sig.clone(), chat, thread, skipped.clone(), vec![])
+                .await?;
+            let _ = chat_bot::store::close_batch_of(store, sig.clone(), "skip_by_time".to_string())
+                .await;
+            dlog(&format!(
+                "flush skipped: {skipped:?} stale by time, closed as skip_by_time"
+            ));
+        } else {
+            dlog("flush skipped: every batch row already answered");
+        }
         return Ok(());
     }
-    let state_db = state.to_string();
-    let ids_db = ids.clone();
-    let (chat, thread) = db
-        .call(move |con| {
-            let _ = state_db;
-            let chat: i64 = kv_get(con, "chat_id", "0").parse().unwrap_or(0);
-            let mut thread = None;
-            for id in &ids_db {
-                if let Ok(t) = con.query_row(
-                    "SELECT thread_id FROM messages WHERE message_id=? LIMIT 1",
-                    [id],
-                    |r| r.get::<_, Option<i64>>(0),
-                ) {
-                    if t.is_some() {
-                        thread = t;
-                        break;
-                    }
-                }
-            }
-            Ok((chat, thread))
-        })
-        .await?;
+    let chat: i64 = chat_bot::store::chat_id(store).await?;
+    let thread = chat_bot::store::batch_thread_of(store, ids.clone()).await?;
     {
-        let (sig_c, ids_c, tome_c) = (sig.clone(), ids.clone(), tome.clone());
-        db.write(move |tx| {
-            tx.seal_batch(&sig_c, chat, thread, &ids_c, &tome_c)?;
-            tx.mark_pushed(&sig_c)
-        })
-        .await?;
+        chat_bot::store::seal_and_push(store, sig.clone(), chat, thread, ids.clone(), tome.clone())
+            .await?;
     }
     // Registration with the track clock happens BEFORE the push: a batch the
     // runtime refuses must keep its retry clock.
     let _ = inboxed_tx.send(sig.clone());
     deliver_sig(
-        db,
+        store,
+        state,
         sid_slot,
         system_path,
         ref_,
@@ -892,10 +1275,36 @@ async fn admit_job(
         out_tx,
         inbound_rx,
         &sig,
-        &text,
+        text,
         &ids,
     )
     .await
+}
+
+/// Whether every message of this batch is past the age budget, so pushing it
+/// would wake a dead thread. The pool decides age once per batch at build time;
+/// a batch that then sits in delivery longer than the budget must be dropped at
+/// the point of sending instead of being answered late. This is exactly the
+/// restart flood: hundreds of day-old claimed batches were re-pushed and
+/// answered one by one. Fail-closed: an empty or unreadable batch is left alone
+/// (nothing to judge), but any batch whose rows are all stale is dropped.
+async fn batch_all_stale(store: &Store, sig: &str) -> bool {
+    let ids = chat_bot::store::message_ids_of(store, sig.to_string())
+        .await
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return false;
+    }
+    let ids: Vec<Value> = ids.into_iter().map(|i| json!(i)).collect();
+    let rows = chat_bot::store::batch_rows_of(store, ids)
+        .await
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return false;
+    }
+    let now = now_ms() / 1000;
+    rows.iter()
+        .all(|r| chat_bot::is_stale_by_time(r.date, now))
 }
 
 /// Push the batch over the socket and wait for an ACCEPTED admission. A refusal
@@ -903,7 +1312,8 @@ async fn admit_job(
 /// delivered; the push is repeated and the track clock re-drives it later.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_sig(
-    db: &Db,
+    store: &Store,
+    state: &str,
     sid_slot: &mut Option<String>,
     system_path: &str,
     ref_: &str,
@@ -911,11 +1321,23 @@ async fn deliver_sig(
     out_tx: &tokio::sync::mpsc::UnboundedSender<Out>,
     inbound_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Inbound>,
     sig: &str,
-    text: &str,
+    mut text: String,
     ids: &[i64],
 ) -> Result<()> {
     let first = Duration::from_secs_f64(cfg("CHATBOT_ADMIT_FIRST_SEC", "8").parse().unwrap_or(8.0));
     let rest = Duration::from_secs_f64(cfg("CHATBOT_ADMIT_SEC", "10").parse().unwrap_or(10.0));
+    // The batch left the pool fresh, but delivery can stall: by the time a frame
+    // goes out, every message behind it may be hours old. Drop it here instead
+    // of waking a dead thread, whichever path brought us (ingest, recover,
+    // bootstrap or track retry).
+    if batch_all_stale(store, sig).await {
+        let sig_db = sig.to_string();
+        let _ = chat_bot::store::close_batch_of(store, sig_db, "skip_by_time".to_string()).await;
+        dlog(&format!(
+            "age guard: {sig} dropped from the send pool (every message is stale)"
+        ));
+        return Ok(());
+    }
     // A dead host cannot run the extension, so nothing would answer the push:
     // re-ensure it before the first frame instead of burning the budget.
     if !host_alive() {
@@ -923,11 +1345,13 @@ async fn deliver_sig(
             "host socket missing ({}), re-ensuring before delivery of {sig}",
             host_socket()
         ));
-        let _ = ensure_sid(db, sid_slot, system_path, ref_, out_tx).await;
+        // Re-ensuring can open a NEW session: the text in hand was built for
+        // the old context and would reach a fresh model without its history.
+        let before = chat_bot::store::live_identity_of(store).await.unwrap_or(None);
+        let _ = ensure_sid(store, sid_slot, system_path, ref_, out_tx).await;
+        rebuild_after_session_change(store, state, sig, &mut text, before).await;
     }
-    let sig_thread = sig.to_string();
-    let thread = db
-        .call(move |con| Ok(ledger::thread_id(con, &sig_thread)))
+    let thread = chat_bot::store::thread_of_batch(store, sig.to_string())
         .await
         .unwrap_or(None);
     // Addressability before the first frame. The daemon's own `sessions.state`
@@ -935,10 +1359,7 @@ async fn deliver_sig(
     // the host is asked for the durable id and for an occupied attachment slot.
     // Pushing anyway is exactly the 10:43-12:05 mute window - batches stalled in
     // `inboxed` while no instance was attached to the control socket.
-    let live_uid = db
-        .call(|con| Ok(chat_bot::session::live_identity(con)?))
-        .await
-        .unwrap_or(None);
+    let live_uid = chat_bot::store::live_identity_of(store).await.unwrap_or(None);
     if let Some((uid, _gen)) = live_uid {
         let address = chat_bot::session::address_on(ref_, &host_socket(), &uid).await;
         match chat_bot::session::next_target(&address) {
@@ -947,7 +1368,7 @@ async fn deliver_sig(
                 dlog(&format!(
                     "{sig}: host does not list session {uid}; ensuring it before the push"
                 ));
-                let _ = ensure_sid(db, sid_slot, system_path, ref_, out_tx).await;
+                let _ = ensure_sid(store, sid_slot, system_path, ref_, out_tx).await;
                 return Ok(());
             }
             chat_bot::session::Target::Wait => {
@@ -964,13 +1385,24 @@ async fn deliver_sig(
     }
     for cycle in 0..3 {
         let budget = if cycle == 0 { first } else { rest };
+        // A retry that lands after the age budget must not push either: the
+        // batch was fresh when it entered the pool, not necessarily now.
+        if cycle > 0 && batch_all_stale(store, sig).await {
+            let sig_db = sig.to_string();
+            let _ = chat_bot::store::close_batch_of(store, sig_db, "skip_by_time".to_string())
+                .await;
+            dlog(&format!(
+                "age guard: {sig} dropped from the send pool on retry (every message is stale)"
+            ));
+            return Ok(());
+        }
         activity()
             .thread
             .store(thread.unwrap_or(-1), std::sync::atomic::Ordering::Relaxed);
         if out_tx
             .send(Out::Push {
                 delivery_id: frame_id(sig),
-                text: text.to_string(),
+                text: text.clone(),
                 batch_ids: ids.to_vec(),
                 thread_id: thread,
             })
@@ -993,11 +1425,31 @@ async fn deliver_sig(
                     if accepted_kind(&kind) {
                         let sig_db = sig.to_string();
                         let kind_db = kind.clone();
-                        db.write(move |tx| tx.admit_batch(&sig_db, &kind_db))
-                            .await?;
+                        chat_bot::store::admit_batch_of(store, sig_db, kind_db).await?;
+                        // A fresh frame is a fresh attempt: the stall flag from
+                        // an earlier exhausted run no longer applies.
+                        let _ = chat_bot::store::kv_set(
+                            store,
+                            &format!("batch_stalled:{sig}"),
+                            "",
+                        )
+                        .await;
                         let _ = admitted_tx.send(sig.to_string());
                         dlog(&format!("admitted {sig} ({kind})"));
-                        let _ = ensure_sid(db, sid_slot, system_path, ref_, out_tx).await;
+                        // The indicator belongs to the daemon, not to the model's
+                        // step boundaries (owner's contract, 2026-11-07): it
+                        // answers "is the bot working", so it must light the
+                        // moment the batch is accepted, not when the extension's
+                        // first `agent_activity` lands. That gap is measurable -
+                        // one admission on the live host waited 12.9 s for host
+                        // warm-up with the indicator dark - and every reply
+                        // shorter than the gap looked like a bot that never
+                        // started typing. `agent_settled`/a dead extension still
+                        // own the off switch.
+                        activity()
+                            .working
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = ensure_sid(store, sid_slot, system_path, ref_, out_tx).await;
                         return Ok(());
                     }
                     dlog(&format!(
@@ -1021,7 +1473,7 @@ async fn deliver_sig(
                             ));
                         }
                     }
-                    announce_session(db, out_tx).await;
+                    announce_session(store, out_tx).await;
                     continue;
                 }
                 Ok(None) => return Ok(()),
@@ -1039,7 +1491,7 @@ async fn deliver_sig(
             "{sig}: no admission and the instance is dead-gated ({absent}s); rearming the host generation"
         ));
         let _ = chat_bot::stop_host_on(&host_socket()).await;
-        let _ = ensure_sid(db, sid_slot, system_path, ref_, out_tx).await;
+        let _ = ensure_sid(store, sid_slot, system_path, ref_, out_tx).await;
         return Ok(());
     }
     dlog(&format!(
@@ -1048,9 +1500,46 @@ async fn deliver_sig(
     Ok(())
 }
 
+/// Any session change invalidates the text in hand: the window decision was
+/// made against the previous `durableSessionId:generation`, so a frame built
+/// for the old context reaches a brand-new model without its history. Rebuild
+/// through the same builder, which then sees the new epoch (or the recorded
+/// sig rule keeps a rebuild byte-identical when the identity did not move).
+async fn rebuild_after_session_change(
+    store: &Store,
+    state: &str,
+    sig: &str,
+    text: &mut String,
+    before: Option<(String, i64)>,
+) {
+    let after = chat_bot::store::live_identity_of(store).await.unwrap_or(None);
+    if after == before {
+        return;
+    }
+    let name = |id: &Option<(String, i64)>| {
+        id.as_ref()
+            .map(|(u, g)| format!("{u}:{g}"))
+            .unwrap_or_else(|| "none".to_string())
+    };
+    match chat_bot::regen_text(store, state, sig).await {
+        Ok(Some(rebuilt)) if rebuilt != *text => {
+            dlog(&format!(
+                "recover {sig}: session epoch changed ({} -> {}); rebuilding the batch text",
+                name(&before),
+                name(&after)
+            ));
+            *text = rebuilt;
+        }
+        Ok(_) => {}
+        Err(e) => dlog(&format!(
+            "recover {sig}: rebuild after the session change failed: {e:#}"
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn recover_batch(
-    db: &Db,
+    store: &Store,
     state: &str,
     sid_slot: &mut Option<String>,
     system_path: &str,
@@ -1064,46 +1553,43 @@ async fn recover_batch(
     let sig = req.sig.as_str();
     // Regenerating the text and reading its owner set is one consistent view of
     // the same batch: one closure for both.
-    let state_for_db = state.to_string();
-    let sig_for_db = sig.to_string();
-    let (text, ids) = db
-        .call(move |con| {
-            let text = push_pending(&state_for_db, con, &sig_for_db)?;
-            let ids = ledger::message_ids(con, &sig_for_db)?;
-            Ok((text, ids))
-        })
-        .await?;
-    let text = match text {
+    let text = chat_bot::push_pending(store, state, sig).await?;
+    let ids = chat_bot::store::message_ids_of(store, sig.to_string()).await?;
+    let mut text = match text {
         Some(t) => t,
         None => {
             dlog(&format!("recover {sig}: nothing left to ask"));
             return Ok(());
         }
     };
+    // Any branch below may move the session, which invalidates the text.
+    let before = chat_bot::store::live_identity_of(store).await.unwrap_or(None);
     if req.recreate {
         dlog(&format!(
-            "recover {sig}: recreating session and re-delivering"
+            "recover {sig}: replacing the session and re-delivering"
         ));
         if let Some(sid) = sid_slot.clone() {
             match recreate_session(
-                db,
+                store,
                 &sid,
                 system_path,
                 Some(ref_),
-                &format!("stalled delivery {sig}"),
+                &format!(
+                    "gateway-rejected media in the transcript, a fresh session is the only cure (batch {sig})"
+                ),
             )
             .await
             {
                 Ok(new_sid) => {
                     let offset = read_events(state, 0).map(|(_, o)| o).unwrap_or(0);
-                    let _ = settle_session(state, db, offset, Duration::from_secs(120)).await;
+                    let _ = settle_session(state, store, offset, Duration::from_secs(120)).await;
                     *sid_slot = Some(new_sid);
                 }
                 Err(e) => dlog(&format!("recreate for {sig} failed: {e:#}")),
             }
-        } else if let Ok(s) = ensure_session(db, system_path, Some(ref_)).await {
+        } else if let Ok(s) = ensure_session(store, system_path, Some(ref_)).await {
             *sid_slot = Some(s);
-            announce_session(db, out_tx).await;
+            announce_session(store, out_tx).await;
         }
         // Delivery evidence is never wiped here: an admitted/emitted/settled
         // mark is the only thing that stops a restart from re-asking a message
@@ -1114,15 +1600,25 @@ async fn recover_batch(
         // Never-accepted batch on a dead host: the socket, not the session, is
         // what is missing, so re-ensure host+session and then re-deliver.
         dlog(&format!("recover {sig}: host socket missing, re-ensuring"));
-        let _ = ensure_sid(db, sid_slot, system_path, ref_, out_tx).await;
+        let _ = ensure_sid(store, sid_slot, system_path, ref_, out_tx).await;
     } else {
         // Never-accepted batch, live host: re-push only. A live session is not
         // touched at all.
         dlog(&format!("recover {sig}: re-pushing (no session change)"));
     }
+    // The transcript may have been rewritten under us (a failed compaction is
+    // the signature case: no event, no turn, same session): the next turn
+    // recovers with the history window instead of trusting a context the
+    // model may no longer hold.
+    let _ = chat_bot::force_window_next_turn(store).await;
+    // The window decision belongs to the session that will receive the frame:
+    // a frame prepared for the old epoch would reach a fresh model without its
+    // history.
+    rebuild_after_session_change(store, state, sig, &mut text, before).await;
     let _ = inboxed_tx.send(sig.to_string());
     deliver_sig(
-        db,
+        store,
+        state,
         sid_slot,
         system_path,
         ref_,
@@ -1130,7 +1626,7 @@ async fn recover_batch(
         out_tx,
         inbound_rx,
         sig,
-        &text,
+        text,
         &ids,
     )
     .await
@@ -1138,7 +1634,7 @@ async fn recover_batch(
 
 #[allow(clippy::too_many_arguments)]
 async fn recover_pending(
-    db: &Db,
+    store: &Store,
     state: &str,
     sid_slot: &mut Option<String>,
     system_path: &str,
@@ -1149,27 +1645,23 @@ async fn recover_pending(
     inbound_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Inbound>,
 ) {
     // Open batches come from the journal, not from `pending:*` kv marks.
-    let pending = db
-        .call(|con| ledger::open_batches(con))
+    let pending = chat_bot::store::open_batches_of(store)
         .await
         .unwrap_or_default();
     for sig in pending {
-        let state_for_db = state.to_string();
-        let sig_db = sig.clone();
-        let (view, text) = match db
-            .call(move |con| {
-                let view = ledger::view(con, &sig_db)?;
-                let text = match regen_text(&state_for_db, con, &sig_db) {
-                    Ok(Some(t)) => t,
-                    Ok(None) => String::new(),
-                    Err(_) => String::new(),
-                };
-                Ok((view, text))
-            })
-            .await
-        {
+        let view = match chat_bot::store::batch_view_of(store, sig.clone()).await {
             Ok(v) => v,
             Err(_) => return,
+        };
+        let text = match chat_bot::regen_text(store, state, &sig).await {
+            Ok(Some(t)) => t,
+            Ok(None) => String::new(),
+            // A read failure is transient: retry on the next tick instead of
+            // retiring a batch that may still have a question in it.
+            Err(e) => {
+                dlog(&format!("bootstrap: {sig} not readable yet: {e}"));
+                continue;
+            }
         };
         let Some(mut view) = view else { continue };
         if view.state == "closed" {
@@ -1186,7 +1678,7 @@ async fn recover_pending(
                     .unwrap_or(false);
                 if !failed_after_admit && view.admitted_at.map(|a| settled >= a).unwrap_or(false) {
                     let sig_db = sig.clone();
-                    let _ = db.write(move |tx| tx.mark_settled(&sig_db, settled)).await;
+                    let _ = chat_bot::store::mark_settled_of(store, sig_db, settled).await;
                     view.settled_at = Some(settled);
                     dlog(&format!(
                         "bootstrap: {sig} settled late, recorded {settled}"
@@ -1198,16 +1690,25 @@ async fn recover_pending(
             let sig_db = sig.clone();
             let outcome = if reason == "settled" {
                 "skipped"
+            } else if reason == "skip_by_time" {
+                "skip_by_time"
             } else {
                 "delivered"
             };
-            let _ = db
-                .write(move |tx| ledger::close_batch(tx.handle(), &sig_db, outcome))
-                .await;
+            let _ = chat_bot::store::close_batch_of(&store, sig_db, outcome.to_string()).await;
             dlog(&format!("bootstrap: {sig} retired ({reason})"));
             continue;
         }
         if text.is_empty() {
+            // Nothing left to answer: every message of this batch is already
+            // answered, or its rows were consumed by an earlier push. Retiring
+            // it beats leaving it claimed forever — the track unit would wait
+            // for a delivery proof that can never arrive, the batch would log
+            // "still waiting" every minute, and the bot would look mute while
+            // holding a queue of dead batches.
+            let sig_db = sig.clone();
+            let _ = chat_bot::store::close_batch_of(store, sig_db, "skipped".to_string()).await;
+            dlog(&format!("bootstrap: {sig} closed: nothing left to answer"));
             continue;
         }
         dlog(&format!(
@@ -1216,12 +1717,12 @@ async fn recover_pending(
         ));
         let _ = inboxed_tx.send(sig.clone());
         let sig_db = sig.clone();
-        let ids = db
-            .call(move |con| ledger::message_ids(con, &sig_db))
-            .await
-            .unwrap_or_default();
+        let ids = chat_bot::store::message_ids_of(store, sig_db)
+        .await
+        .unwrap_or_default();
         if deliver_sig(
-            db,
+            store,
+            state,
             sid_slot,
             system_path,
             ref_,
@@ -1229,7 +1730,7 @@ async fn recover_pending(
             out_tx,
             inbound_rx,
             &sig,
-            &text,
+            text,
             &ids,
         )
         .await
@@ -1286,6 +1787,44 @@ fn settle_decision(
     SettleDecision::Settle
 }
 
+/// Verdict for one redelivery of a batch that never produced a run: a stall
+/// with no turn in flight, or a refused prompt (`delivery_state failed`).
+/// Same bound as the run-failure path (`FAIL_RETRY_LIMIT`), so a session that
+/// accepts pushes but starts nothing — the failed-compaction signature —
+/// escalates to the owner instead of spinning the queue forever. The stall
+/// clock itself is the cooldown (a retry fires only after a full budget of no
+/// progress), so this never hot-loops. Pure, so the bound is testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedeliveryDecision {
+    Retry,
+    Escalate,
+}
+
+fn redelivery_decision(tries: u32, limit: u32) -> RedeliveryDecision {
+    if tries < limit {
+        RedeliveryDecision::Retry
+    } else {
+        RedeliveryDecision::Escalate
+    }
+}
+
+/// Owner-visible end of automated redelivery: the batch stays OPEN (a batch
+/// is closed by an answer or a proven clean run), the owner hears about it
+/// once via the existing `run_failed:<sig>` transition, and a new frame
+/// clears the stall mark on its next accepted admission. Same session: a
+/// failed compaction is never a reason to throw the model's memory away.
+async fn escalate_no_delivery(store: &Store, sig: &str, why: &str) {
+    dlog(&format!(
+        "batch {sig}: {why}; automated redelivery exhausted, batch left open"
+    ));
+    ops::alert_transition(
+        &format!("run_failed:{sig}"),
+        true,
+        &format!("batch {sig} could not be delivered after retries; left open"),
+    );
+    let _ = chat_bot::store::kv_set(store, &format!("batch_stalled:{sig}"), "1").await;
+}
+
 /// Frame suffix of a delivery id (`<sig>#<n>`). A larger number is a new attempt.
 fn frame_seq(id: &str) -> u64 {
     id.rsplit('#')
@@ -1319,8 +1858,12 @@ fn activity() -> &'static Activity {
 /// (agent start -> true, step end -> false) plus the run ends, nothing else.
 fn activity_state_for(kind: &str, phase: Option<bool>) -> Option<bool> {
     match kind {
+        // Exactly two states matter to the owner (2026-11-07): the agent started
+        // working and the agent finished. Everything between is a step of the
+        // same run and must never move the indicator. `agent_activity` carries
+        // that boolean from the runtime; `turn_start` does NOT: it is a step
+        // boundary, and using it made the light depend on the model's pace.
         "agent_activity" => phase,
-        "turn_start" => Some(true),
         // Only the END OF THE RUN clears the indicator. `agent_end_aborted` is NOT
         // that end: the runtime emits it for a RETRYABLE abort too (willRetry),
         // where the run keeps working through the retry backoff — treating it as a
@@ -1334,7 +1877,7 @@ fn activity_state_for(kind: &str, phase: Option<bool>) -> Option<bool> {
 /// on the same beat as the turn (owner: the indicator must be visible for the
 /// whole run, and a 1 s tick made it appear only at the tail of short runs);
 /// after that the cadence is one send per second, which is what Telegram wants.
-async fn typing_loop(db: Db) {
+async fn typing_loop(store: Store) {
     const TICK_MS: u64 = 200;
     const RESEND_MS: u128 = 1000;
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(TICK_MS));
@@ -1369,7 +1912,7 @@ async fn typing_loop(db: Db) {
         } else {
             json!({})
         };
-        match chat_bot::send::typing(&db, &args).await {
+        match chat_bot::send::typing(&store, &args).await {
             Ok(_) => {
                 if !lit {
                     dlog(&format!("typing on (thread={thread})"));
@@ -1388,7 +1931,7 @@ async fn typing_loop(db: Db) {
 }
 
 async fn track_loop(
-    db: Db,
+    store: Store,
     mut admitted_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     mut inboxed_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     recover_tx: tokio::sync::mpsc::UnboundedSender<Recover>,
@@ -1540,13 +2083,7 @@ async fn track_loop(
                             }
                             if !settle_now.is_empty() {
                                 let sigs_db = settle_now.clone();
-                                let _ = db
-                                    .write(move |tx| {
-                                        for sig in &sigs_db {
-                                            tx.mark_settled(sig, at)?;
-                                        }
-                                        Ok(())
-                                    })
+                                let _ = chat_bot::store::mark_settled_many_of(&store, sigs_db, at)
                                     .await;
                                 for sig in &settle_now {
                                     settled_sigs.insert(sig.clone(), at);
@@ -1570,7 +2107,7 @@ async fn track_loop(
                             for sig in retry_now {
                                 *tries.entry(sig.clone()).or_insert(0) += 1;
                                 dlog(&format!(
-                                    "batch {sig}: run failed with a provider error; re-pushing"
+                                    "batch {sig}: run failed with a provider error; re-delivery in the same session"
                                 ));
                                 let _ = recover_tx.send(Recover {
                                     sig: sig.clone(),
@@ -1591,6 +2128,18 @@ async fn track_loop(
                                         "batch {sig} could not be delivered after retries; left open"
                                     ),
                                 );
+                                // A stalled batch must not attract someone else's
+                                // answer: `chat_send` without `reply_to` skips it
+                                // (`ledger::latest_open_unanswered` reads this kv),
+                                // otherwise an answer lands in a stale forum topic
+                                // and the real incoming batch goes unanswered.
+                                // A new frame for this sig clears the flag.
+                                let _ = chat_bot::store::kv_set(
+                                    &store,
+                                    &format!("batch_stalled:{sig}"),
+                                    "1",
+                                )
+                                .await;
                                 // The marks stay: the batch is still the attempt
                                 // that failed, so a later settle from another run
                                 // cannot close it as "the model was silent".
@@ -1631,31 +2180,58 @@ async fn track_loop(
                                     // decided this batch settled cleanly.
                                     let settled_seen =
                                         settled_sigs.get(&id_db).copied().unwrap_or(0);
-                                    let _ = db
-                                        .write(move |tx| {
-                                            tx.mark_emitted(&id_db, at)?;
-                                            if settled_seen > 0 {
-                                                tx.mark_settled(&id_db, settled_seen)?;
-                                            }
-                                            Ok(())
-                                        })
-                                        .await;
+                                    let _ = chat_bot::store::mark_emitted_of(
+                                        &store,
+                                        id_db.clone(),
+                                        at,
+                                        settled_seen,
+                                    )
+                                    .await;
+                                    // The model now holds this batch: a frame
+                                    // that carried the history window has done
+                                    // its job, and a post-compaction flag it
+                                    // covered is dropped with it.
+                                    let _ = chat_bot::mark_window_emitted(&store, &id_db).await;
                                     last_progress.insert(id.clone(), at);
                                 }
                                 "failed" => {
                                     // Refused by the session file: admissible
-                                    // again, so the admit unit re-pushes it.
+                                    // again, so the admit unit re-pushes it —
+                                    // bounded, or a session that refuses every
+                                    // prompt (committed compaction, wedged
+                                    // transcript) spins this forever.
                                     let err =
                                         ev.get("error").and_then(|v| v.as_str()).unwrap_or("");
-                                    dlog(&format!(
-                                        "delivery {id} failed ({err}); asking admit to re-push"
-                                    ));
                                     let sig_db = sig_of_frame(&id).to_string();
-                                    let _ = db.write(move |tx| tx.fail_attempt(&sig_db)).await;
-                                    let _ = recover_tx.send(Recover {
-                                        sig: id.clone(),
-                                        recreate: false,
-                                    });
+                                    let _ =
+                                        chat_bot::store::fail_attempt_of(&store, sig_db.clone())
+                                            .await;
+                                    let n = tries.get(&sig_db).copied().unwrap_or(0);
+                                    match redelivery_decision(n, FAIL_RETRY_LIMIT) {
+                                        RedeliveryDecision::Retry => {
+                                            *tries.entry(sig_db.clone()).or_insert(0) += 1;
+                                            dlog(&format!(
+                                                "delivery {id} failed ({err}); asking admit to re-push (try {})",
+                                                n + 1
+                                            ));
+                                            // `Recover` carries the BATCH key: the frame id
+                                            // (`sig#n`) names one attempt, never a batch.
+                                            let _ = recover_tx.send(Recover {
+                                                sig: sig_db,
+                                                recreate: false,
+                                            });
+                                        }
+                                        RedeliveryDecision::Escalate => {
+                                            escalate_no_delivery(
+                                                &store,
+                                                &sig_db,
+                                                &format!(
+                                                    "delivery refused {n} times ({err})"
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                    }
                                     last_progress.insert(id.clone(), at);
                                 }
                                 _ => {}
@@ -1680,6 +2256,13 @@ async fn track_loop(
                                 }
                             }
                         }
+                        "context_compacted" => {
+                            // The transcript was rewritten: the model no longer
+                            // holds the details, so the next turn must carry
+                            // the history window even in the same session.
+                            let _ = chat_bot::force_window_next_turn(&store).await;
+                            dlog("context compacted: the next turn carries the history window");
+                        }
                         _ => {}
                     }
                 }
@@ -1703,23 +2286,15 @@ async fn track_loop(
         let working = turn_in_flight || now.saturating_sub(last_working_at) < 30_000;
         let sigs: Vec<String> = inflight.iter().cloned().collect();
         if !sigs.is_empty() {
-            let snap = db
-                .call(move |con| {
-                    let mut out = vec![];
-                    for sig in &sigs {
-                        if let Some(view) = ledger::view(con, sig)? {
-                            out.push(view);
-                        }
-                    }
-                    Ok(out)
-                })
-                .await;
+            let snap = chat_bot::store::views_of(&store, sigs).await;
             if let Ok(snap) = snap {
                 let mut retired: Vec<(String, String)> = vec![];
                 for view in snap {
                     if let Some(reason) = view.close_reason() {
                         let outcome = if reason == "settled" {
                             "skipped"
+                        } else if reason == "skip_by_time" {
+                            "skip_by_time"
                         } else {
                             "delivered"
                         };
@@ -1751,30 +2326,53 @@ async fn track_loop(
                         ));
                     }
                     if stalled(now, last, budget, working, extra) {
-                        // A run in flight is never recreated; an unaccepted batch
-                        // only needs the batch re-pushed.
-                        let recreate = !turn_in_flight && phase != "inboxed";
-                        dlog(&format!(
-                            "batch {sig} stalled in phase {phase} (budget {budget}s, turn_in_flight={turn_in_flight}); recovery recreate={recreate}"
-                        ));
-                        let _ = recover_tx.send(Recover {
-                            sig: sig.clone(),
-                            recreate,
-                        });
+                        // A stalled batch is never the session's fault: the
+                        // model keeps its memory and the batch is re-delivered
+                        // into the same session — bounded, or a session that
+                        // starts no turns (failed compaction with no event)
+                        // queues redeliveries forever.
+                        let n = tries.get(&sig).copied().unwrap_or(0);
+                        match redelivery_decision(n, FAIL_RETRY_LIMIT) {
+                            RedeliveryDecision::Retry => {
+                                *tries.entry(sig.clone()).or_insert(0) += 1;
+                                dlog(&format!(
+                                    "batch {sig} stalled in phase {phase} (budget {budget}s, turn_in_flight={turn_in_flight}); re-delivery in the same session (try {})",
+                                    n + 1
+                                ));
+                                let _ = recover_tx.send(Recover {
+                                    sig: sig.clone(),
+                                    recreate: false,
+                                });
+                            }
+                            RedeliveryDecision::Escalate => {
+                                escalate_no_delivery(
+                                    &store,
+                                    &sig,
+                                    &format!(
+                                        "stalled in phase {phase} with no turn in flight after {n} redeliveries"
+                                    ),
+                                )
+                                .await;
+                            }
+                        }
                         last_progress.insert(sig.clone(), now);
                     }
                 }
                 if !retired.is_empty() {
                     let retired_db = retired.clone();
-                    let _ = db
-                        .write(move |tx| {
-                            for (sig, outcome) in &retired_db {
-                                ledger::close_batch(tx.handle(), sig, outcome)?;
-                            }
-                            Ok(())
-                        })
-                        .await;
+                    let _ = chat_bot::store::close_batches_of(&store, retired_db).await;
                     for (sig, outcome) in retired {
+                        // A delivered batch's proof (`delivery_state emitted`)
+                        // may legally arrive AFTER retirement. Dropping the
+                        // pending window here for `delivered` erased the only
+                        // key `mark_window_emitted` needs, so the epoch was
+                        // never recorded and the next turn repeated the
+                        // 50-message window (found by the live stand). Only a
+                        // batch that will never reach the model may drop it;
+                        // the late proof then records the served epoch.
+                        if outcome != "delivered" {
+                            let _ = chat_bot::drop_window_pending(&store, &sig).await;
+                        }
                         dlog(&format!("batch {sig} retired ({outcome})"));
                         inflight.remove(&sig);
                         last_progress.remove(&sig);
@@ -1822,8 +2420,8 @@ async fn cmd_run() -> Result<()> {
     }
     // The database thread starts before any unit needs it; a broken database
     // fails here, visibly, instead of inside the worker.
-    let db = match Db::open(&state) {
-        Ok(db) => db,
+    let store = match Store::open(&state) {
+        Ok(store) => store,
         Err(e) => {
             ops::db_failure_sync("open", &e);
             return Err(e);
@@ -1832,7 +2430,7 @@ async fn cmd_run() -> Result<()> {
     // Crash window repair: a process that died between Intent -> Sending and
     // the Telegram reply leaves Sending behind. It becomes Unknown here, with
     // ONE incident and no HTTP call, so a restart cannot post a second message.
-    match chat_bot::send::repair_sending(&db).await {
+    match chat_bot::send::repair_sending(&store).await {
         Ok(n) if n > 0 => {
             dlog(&format!(
                 "startup: {n} send(s) stuck in Sending -> Unknown (one alert, no resend)"
@@ -1865,17 +2463,13 @@ async fn cmd_run() -> Result<()> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        db.call(move |con| {
-            kv_set(con, "self_id", &bot_id.to_string())?;
-            kv_set(con, "self_username", &self_username)?;
-            kv_set(con, "self_first", &self_first)?;
-            Ok(())
-        })
-        .await?;
+        chat_bot::store::set_self_identity(&store, bot_id, self_username.clone(), self_first.clone())
+            .await?;
     }
-    let offset: i64 = db
-        .call(|con| Ok(kv_get(con, "offset", "0").parse().unwrap_or(0)))
-        .await?;
+    let offset: i64 = chat_bot::store::kv_get(&store, "offset", "0")
+        .await?
+        .parse()
+        .unwrap_or(0);
     let system_path = cfg("CHATBOT_SYSTEM", "system-prompt.md");
     let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
     let (ack_tx, ack_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -1886,6 +2480,8 @@ async fn cmd_run() -> Result<()> {
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<Inbound>();
     let (media_tx, media_rx) =
         tokio::sync::mpsc::channel::<chat_bot::media::MediaJob>(chat_bot::media::MEDIA_QUEUE_CAP);
+    let (thumb_tx, thumb_rx) =
+        tokio::sync::mpsc::channel::<chat_bot::media::ThumbJob>(chat_bot::media::MEDIA_QUEUE_CAP);
     let health_session = cfg("CHATBOT_SESSION", "chat-participant");
     tokio::task::spawn_local(ops::health_loop(
         state.clone(),
@@ -1899,7 +2495,7 @@ async fn cmd_run() -> Result<()> {
     .parse()
     .unwrap_or(chat_bot::media::ROW_RETENTION_DAYS);
     tokio::task::spawn_local(control_loop(
-        db.clone(),
+        store.clone(),
         control_sock_path(&state),
         state.clone(),
         out_rx,
@@ -1907,7 +2503,7 @@ async fn cmd_run() -> Result<()> {
     ));
     tokio::task::spawn_local(tool_loop(state.clone(), chat_bot::tool_socket_path(&state)));
     tokio::task::spawn_local(admit_loop(
-        db.clone(),
+        store.clone(),
         job_rx,
         ack_tx,
         admitted_tx,
@@ -1917,8 +2513,8 @@ async fn cmd_run() -> Result<()> {
         recover_rx,
         system_path,
     ));
-    tokio::task::spawn_local(track_loop(db.clone(), admitted_rx, inboxed_rx, recover_tx));
-    tokio::task::spawn_local(typing_loop(db.clone()));
+    tokio::task::spawn_local(track_loop(store.clone(), admitted_rx, inboxed_rx, recover_tx));
+    tokio::task::spawn_local(typing_loop(store.clone()));
 
     // One cleanup pass at startup, then resume every unfinished download.
     // Both run before polling so a pending row from the previous process is
@@ -1926,25 +2522,20 @@ async fn cmd_run() -> Result<()> {
     {
         let budget = chat_bot::media::MediaBudget::from_disk(&state);
         let st = state.clone();
-        if let Err(e) = db
-            .call(move |con| {
-                chat_bot::media::cleanup_media(
-                    con,
-                    &st,
-                    &budget,
-                    std::time::SystemTime::now(),
-                    chat_bot::media::ORPHAN_GRACE,
-                    retention_days,
-                )
-            })
-            .await
+        if let Err(e) = chat_bot::media::cleanup_media(
+            &store,
+            &st,
+            &budget,
+            std::time::SystemTime::now(),
+            chat_bot::media::ORPHAN_GRACE,
+            retention_days,
+        )
+        .await
         {
             dlog(&format!("startup media cleanup failed: {e:#}"));
             ops::db_failure("startup_media_cleanup", &e);
         }
-        match db
-            .call(|con| chat_bot::media::resume_pending(con, chat_bot::media::MEDIA_QUEUE_CAP))
-            .await
+        match chat_bot::store::pending_jobs_of(&store, chat_bot::media::MEDIA_QUEUE_CAP).await
         {
             Ok(jobs) => {
                 for job in jobs {
@@ -1958,12 +2549,28 @@ async fn cmd_run() -> Result<()> {
                 ops::db_failure("startup_media_resume", &e);
             }
         }
+        match chat_bot::store::pending_thumbs_of(&store, chat_bot::media::MEDIA_QUEUE_CAP).await
+        {
+            Ok(jobs) => {
+                for job in jobs {
+                    if thumb_tx.try_send(job).is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                dlog(&format!("startup thumb resume failed: {e:#}"));
+                ops::db_failure("startup_thumb_resume", &e);
+            }
+        }
     }
-    tokio::task::spawn_local(media_loop(db.clone(), state.clone(), media_rx));
+    tokio::task::spawn_local(media_loop(store.clone(), state.clone(), media_rx));
+    tokio::task::spawn_local(thumb_loop(store.clone(), state.clone(), thumb_rx));
     tokio::task::spawn_local(media_maintenance_loop(
-        db.clone(),
+        store.clone(),
         state.clone(),
         media_tx.clone(),
+        thumb_tx.clone(),
         retention_days,
     ));
     dlog(&format!(
@@ -1972,7 +2579,7 @@ async fn cmd_run() -> Result<()> {
         host_socket()
     ));
     ingest_loop(
-        db, state, bot_id, username, offset, job_tx, media_tx, ack_rx,
+        store, state, bot_id, username, offset, job_tx, media_tx, thumb_tx, ack_rx,
     )
     .await
 }
@@ -1982,23 +2589,91 @@ async fn cmd_run() -> Result<()> {
 /// `commit_page` transaction, and media downloads are only enqueued (the row
 /// is already durable in `pending`). A commit failure leaves the cursor where
 /// it was and the next poll re-fetches the same page.
+/// A linked channel post arrives twice: first as `channel_post` with a
+/// negative sender id, then as the automatic group forward with a positive
+/// one. The channel copy's message id is not addressable in the discussion
+/// chat, so it must never become its own batch. Hold it briefly for the
+/// group twin; a lone channel post is still released after the grace.
+fn is_channel_copy(row: &BatchMsg) -> bool {
+    row.user_id.map(|u| u < 0).unwrap_or(false)
+}
+
+fn drop_pending_twins(pending: &mut Vec<(Instant, BatchMsg)>, group: &BatchMsg) -> usize {
+    let Some(key) = channel_post_identity(group) else {
+        return 0;
+    };
+    let before = pending.len();
+    pending.retain(|(_, p)| channel_post_identity(p).as_ref() != Some(&key));
+    before - pending.len()
+}
+
+fn take_due_channel_copies(
+    pending: &mut Vec<(Instant, BatchMsg)>,
+    grace: Duration,
+    now: Instant,
+) -> Vec<BatchMsg> {
+    let mut due = vec![];
+    pending.retain(|(at, row)| {
+        if now.saturating_duration_since(*at) >= grace {
+            due.push(row.clone());
+            false
+        } else {
+            true
+        }
+    });
+    due
+}
+
 async fn ingest_loop(
-    db: Db,
+    store: Store,
     _state: String,
     bot_id: i64,
     username: String,
     mut offset: i64,
     job_tx: tokio::sync::mpsc::UnboundedSender<Job>,
     media_tx: tokio::sync::mpsc::Sender<chat_bot::media::MediaJob>,
+    thumb_tx: tokio::sync::mpsc::Sender<chat_bot::media::ThumbJob>,
     mut ack_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
     let window: f64 = cfg("CHATBOT_BATCH_SEC", "10").parse().unwrap_or(10.0);
     let mut batch: Vec<BatchMsg> = vec![];
+    let channel_grace = Duration::from_secs(
+        cfg("CHATBOT_CHANNEL_TWIN_GRACE_SEC", "6")
+            .parse()
+            .unwrap_or(6),
+    );
+    let mut pending_channels: Vec<(Instant, BatchMsg)> = vec![];
+    // A restart must not lose a channel copy that is still waiting for its
+    // group forward. Rebuild the in-memory grace window from the durable kv
+    // ledger; retire records older than the hold so the ledger stays bounded.
+    if let Ok(held) = chat_bot::store::held_channels_of(&store).await {
+        let now = now_ms();
+        let stale = (channel_grace.as_millis() as i64).saturating_mul(4);
+        let mut fresh_ids = vec![];
+        for (mid, _identity, first_seen_ms) in &held {
+            if now.saturating_sub(*first_seen_ms) <= stale {
+                fresh_ids.push(json!(mid));
+            } else {
+                let _ = chat_bot::store::clear_held_channel_of(&store, *mid).await;
+            }
+        }
+        if !fresh_ids.is_empty() {
+            if let Ok(rows) = chat_bot::store::batch_rows_of(&store, fresh_ids).await {
+                for row in rows.into_iter().filter(is_channel_copy) {
+                    pending_channels.push((Instant::now(), row));
+                }
+            }
+        }
+        if !pending_channels.is_empty() {
+            dlog(&format!(
+                "dedupe: recovered {} durable channel hold(s) after restart",
+                pending_channels.len()
+            ));
+        }
+    }
     let mut poll_failures = 0u32;
     let mut last_flush = std::time::Instant::now();
-    let chat: i64 = db
-        .call(|con| Ok(kv_get(con, "chat_id", "0").parse().unwrap_or(0)))
-        .await?;
+    let chat: i64 = chat_bot::store::chat_id(&store).await?;
     let mut inflight = 0usize;
     loop {
         let updates: Value = match api(
@@ -2091,7 +2766,7 @@ async fn ingest_loop(
         if through > offset {
             let mut by_key: std::collections::HashMap<MessageKey, Envelope> =
                 envelopes.iter().cloned().map(|e| (e.key, e)).collect();
-            let page = match db.write(move |tx| tx.commit_page(envelopes, through)).await {
+            let page = match chat_bot::store::commit_page(&store, envelopes, through).await {
                 Ok(p) => p,
                 Err(e) => {
                     // The cursor was not advanced: the same page is fetched
@@ -2120,6 +2795,16 @@ async fn ingest_loop(
                         dlog("media queue full; pending row will be resumed by maintenance");
                     }
                 }
+                // A video kind is never downloaded as bytes; only its frame is.
+                if env.thumb_state == chat_bot::media::MediaState::Pending {
+                    let job = chat_bot::media::ThumbJob {
+                        row_id: ins.row_id,
+                        file_id: env.thumb_file_id.clone(),
+                    };
+                    if thumb_tx.try_send(job).is_err() {
+                        dlog("thumb queue full; pending frame will be resumed by maintenance");
+                    }
+                }
                 if env.user_id == Some(bot_id) {
                     continue;
                 }
@@ -2129,9 +2814,42 @@ async fn ingest_loop(
                         && row.text.to_lowercase().contains(&format!("@{username}")));
                 if urgent {
                     row.to_me = true;
+                }
+                if is_channel_copy(&row) {
+                    if let Some(identity) = chat_bot::channel_post_identity(&row) {
+                        let _ = chat_bot::store::note_held_channel_of(
+                            &store,
+                            row.message_id,
+                            &identity,
+                            now_ms(),
+                        )
+                        .await;
+                    }
+                    dlog(&format!(
+                        "dedupe: holding channel copy {} for group twin",
+                        row.message_id
+                    ));
+                    pending_channels.push((Instant::now(), row));
+                    continue;
+                }
+                let dropped = drop_pending_twins(&mut pending_channels, &row);
+                if dropped > 0 {
+                    if let Some(identity) = chat_bot::channel_post_identity(&row) {
+                        let _ =
+                            chat_bot::store::clear_held_channel_identity_of(&store, &identity).await;
+                    }
+                    dlog(&format!(
+                        "dedupe: dropped {dropped} pending channel twin(s) when the group copy arrived"
+                    ));
+                }
+                if urgent {
                     let mut combo = std::mem::take(&mut batch);
                     combo.push(row);
                     inflight += 1;
+                    // An addressed message is answered at once, but its own photo
+                    // may still be downloading: wait for it briefly instead of
+                    // handing the model a bare `[photo]` marker.
+                    media_settle(&store, &combo).await;
                     if job_tx.send(Job { batch: combo }).is_err() {
                         dlog("admit unit gone; dropping urgent batch");
                     }
@@ -2141,9 +2859,19 @@ async fn ingest_loop(
                 }
             }
         }
-        if !batch.is_empty() && last_flush.elapsed().as_secs_f64() >= window {
+        let due = take_due_channel_copies(&mut pending_channels, channel_grace, Instant::now());
+        // No group twin arrived within the grace: this is a lone channel post
+        // and will be admitted normally. Retire its durable hold so a later
+        // restart does not re-hold an already-answered copy.
+        for row in &due {
+            let _ = chat_bot::store::clear_held_channel_of(&store, row.message_id).await;
+        }
+        let force_flush = due.iter().any(|m| m.to_me);
+        batch.extend(due);
+        if !batch.is_empty() && (force_flush || last_flush.elapsed().as_secs_f64() >= window) {
             let combo = std::mem::take(&mut batch);
             inflight += 1;
+            media_settle(&store, &combo).await;
             if job_tx.send(Job { batch: combo }).is_err() {
                 dlog("admit unit gone; dropping batch");
             }
@@ -2155,17 +2883,36 @@ async fn ingest_loop(
     }
 }
 
+/// Wait briefly for the media of the batch that is about to be sent. The batch
+/// is a snapshot taken at ingest, so a photo that lands a moment later would
+/// otherwise reach the model as a bare `[photo]` marker. The wait is bounded by
+/// `MEDIA_WAIT_SEC` and keyed to the real row state, never to a fixed sleep.
+async fn media_settle(store: &Store, batch: &[chat_bot::BatchMsg]) {
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(chat_bot::media::MEDIA_WAIT_SEC);
+    loop {
+        let ids: Vec<i64> = batch.iter().map(|m| m.message_id).collect();
+        let pending = chat_bot::store::any_pending_of(store, ids)
+            .await
+            .unwrap_or(false);
+        if !pending || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
 /// Media fetcher: one job at a time, each bounded by FETCH_DEADLINE. A budget
 /// refusal is not an error: the row stays `pending` and maintenance resumes it.
 async fn media_loop(
-    db: Db,
+    store: Store,
     state: String,
     mut rx: tokio::sync::mpsc::Receiver<chat_bot::media::MediaJob>,
 ) {
     let source = chat_bot::media::TelegramSource;
     while let Some(job) = rx.recv().await {
         let budget = chat_bot::media::MediaBudget::from_disk(&state);
-        match chat_bot::media::fetch_job(&db, &state, &job, &budget, &source).await {
+        match chat_bot::media::fetch_job(&store, &state, &job, &budget, &source).await {
             Ok(chat_bot::media::FetchOutcome::Deferred) => {
                 dlog(&format!("media budget deferred row {}", job.row_id));
             }
@@ -2183,38 +2930,60 @@ async fn media_loop(
     }
 }
 
+/// Frame fetcher: same discipline as the media fetcher — one job at a time, a
+/// budget refusal leaves the row `pending` for maintenance. A frame is the only
+/// part of a video the model can actually look at on this wire.
+async fn thumb_loop(
+    store: Store,
+    state: String,
+    mut rx: tokio::sync::mpsc::Receiver<chat_bot::media::ThumbJob>,
+) {
+    let source = chat_bot::media::TelegramSource;
+    while let Some(job) = rx.recv().await {
+        let budget = chat_bot::media::MediaBudget::from_disk(&state);
+        match chat_bot::media::fetch_thumb(&store, &state, &job, &budget, &source).await {
+            Ok(chat_bot::media::ThumbOutcome::Deferred) => {
+                dlog(&format!("thumb budget deferred row {}", job.row_id));
+            }
+            Ok(chat_bot::media::ThumbOutcome::Skipped) => {
+                dlog(&format!("thumb row {} vanished before finalize", job.row_id));
+            }
+            Ok(chat_bot::media::ThumbOutcome::Finalized { size, .. }) => {
+                dlog(&format!("thumb row {} ready ({size} bytes)", job.row_id));
+            }
+            Err(e) => dlog(&format!("thumb fetch failed for {}: {e:#}", job.row_id)),
+        }
+    }
+}
+
 /// Startup cleanup plus a five-minute pass: one cleanup pass, then resume
 /// pending downloads. The victim order inside cleanup is fixed in
 /// `media::cleanup_media`.
 async fn media_maintenance_loop(
-    db: Db,
+    store: Store,
     state: String,
     tx: tokio::sync::mpsc::Sender<chat_bot::media::MediaJob>,
+    thumb_tx: tokio::sync::mpsc::Sender<chat_bot::media::ThumbJob>,
     retention_days: i64,
 ) {
     loop {
         tokio::time::sleep(chat_bot::media::MAINTENANCE_INTERVAL).await;
         let budget = chat_bot::media::MediaBudget::from_disk(&state);
         let st = state.clone();
-        if let Err(e) = db
-            .call(move |con| {
-                chat_bot::media::cleanup_media(
-                    con,
-                    &st,
-                    &budget,
-                    std::time::SystemTime::now(),
-                    chat_bot::media::ORPHAN_GRACE,
-                    retention_days,
-                )
-            })
-            .await
+        if let Err(e) = chat_bot::media::cleanup_media(
+            &store,
+            &st,
+            &budget,
+            std::time::SystemTime::now(),
+            chat_bot::media::MEDIA_GRACE,
+            retention_days,
+        )
+        .await
         {
             dlog(&format!("media cleanup failed: {e:#}"));
             ops::db_failure("media_cleanup", &e);
         }
-        match db
-            .call(|con| chat_bot::media::resume_pending(con, chat_bot::media::MEDIA_QUEUE_CAP))
-            .await
+        match chat_bot::store::pending_jobs_of(&store, chat_bot::media::MEDIA_QUEUE_CAP).await
         {
             Ok(jobs) => {
                 for job in jobs {
@@ -2228,12 +2997,89 @@ async fn media_maintenance_loop(
                 ops::db_failure("media_resume", &e);
             }
         }
+        match chat_bot::store::pending_thumbs_of(&store, chat_bot::media::MEDIA_QUEUE_CAP).await
+        {
+            Ok(jobs) => {
+                for job in jobs {
+                    if thumb_tx.try_send(job).is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                dlog(&format!("thumb resume failed: {e:#}"));
+                ops::db_failure("thumb_resume", &e);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod channel_twin_tests {
+    use super::{drop_pending_twins, is_channel_copy, take_due_channel_copies};
+    use crate::BatchMsg;
+    use std::time::{Duration, Instant};
+
+    fn msg(id: i64, user: Option<i64>, text: &str) -> BatchMsg {
+        BatchMsg {
+            message_id: id,
+            date: 1,
+            user_id: user,
+            username: "u".into(),
+            first_name: "U".into(),
+            text: text.into(),
+            reply_to: None,
+            media_path: String::new(),
+            media_kind: String::new(),
+            file_id: String::new(),
+            thumb_path: String::new(),
+            to_me: false,
+        }
+    }
+
+    #[test]
+    fn a_group_twin_cancels_the_held_channel_copy() {
+        let mut pending = vec![(
+            Instant::now(),
+            msg(4255, Some(-1004421941006), "пост"),
+        )];
+        assert!(is_channel_copy(&pending[0].1));
+        let dropped = drop_pending_twins(&mut pending, &msg(18569, Some(777000), "пост"));
+        assert_eq!(dropped, 1);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn an_unmatched_group_copy_keeps_the_held_channel_copy() {
+        let mut pending = vec![(Instant::now(), msg(1, Some(-100), "пост"))];
+        assert_eq!(
+            drop_pending_twins(&mut pending, &msg(2, Some(777000), "другой")),
+            0
+        );
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn a_lone_channel_copy_is_released_after_the_grace() {
+        let now = Instant::now();
+        let mut pending = vec![
+            (now - Duration::from_secs(7), msg(1, Some(-100), "старый")),
+            (now, msg(2, Some(-100), "свежий")),
+        ];
+        let due = take_due_channel_copies(&mut pending, Duration::from_secs(6), now);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].message_id, 1);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1.message_id, 2);
     }
 }
 
 #[cfg(test)]
 mod settle_tests {
-    use super::{frame_seq, settle_decision, SettleDecision};
+    use super::{
+        frame_seq, redelivery_decision, settle_decision, RedeliveryDecision, SettleDecision,
+        FAIL_RETRY_LIMIT,
+    };
 
     const LIMIT: u32 = 3;
 
@@ -2387,6 +3233,25 @@ mod settle_tests {
         assert_eq!(frame_seq("abc#12"), 12);
         assert_eq!(frame_seq("abc"), 0);
     }
+
+    #[test]
+    fn stalled_and_refused_batches_retry_then_escalate() {
+        // The failed-compaction signature: no run, no turn, same session.
+        // Bounded retries, then the owner hears about it once.
+        assert_eq!(redelivery_decision(0, FAIL_RETRY_LIMIT), RedeliveryDecision::Retry);
+        assert_eq!(
+            redelivery_decision(FAIL_RETRY_LIMIT - 1, FAIL_RETRY_LIMIT),
+            RedeliveryDecision::Retry
+        );
+        assert_eq!(
+            redelivery_decision(FAIL_RETRY_LIMIT, FAIL_RETRY_LIMIT),
+            RedeliveryDecision::Escalate
+        );
+        assert_eq!(
+            redelivery_decision(FAIL_RETRY_LIMIT + 5, FAIL_RETRY_LIMIT),
+            RedeliveryDecision::Escalate
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2400,10 +3265,16 @@ mod typing_tests {
             activity_state_for("agent_activity", Some(false)),
             Some(false)
         );
-        assert_eq!(activity_state_for("turn_start", None), Some(true));
+        assert_eq!(
+            activity_state_for("turn_start", None),
+            None,
+            "a step boundary must never move the indicator"
+        );
         assert_eq!(activity_state_for("turn_end", None), None);
         assert_eq!(activity_state_for("agent_settled", None), Some(false));
         assert_eq!(activity_state_for("agent_end_aborted", None), None);
+        // The start edge itself is lit by `admit_job` the moment the batch is
+        // accepted, so the light cannot wait for the runtime's first turn.
     }
 
     #[test]

@@ -10,14 +10,21 @@
  *   decides message parts (sticker + text is two messages), mints the answer in
  *   its journal, writes the durable send intent before HTTP, and replays the
  *   stored receipt for a repeated call with the same arguments.
- * - A push carries the batch text, incoming ids and forum topic. The
- *   extension admits it via `admitExternalMessage` and answers
+ * - A push carries the batch text, incoming ids and forum topic. The extension
+ *   delivers it as a USER MESSAGE (`sendUserMessage`) and answers
  *   `{"result":{"delivery_id","kind"}}`; the daemon retries a refusal.
- * - Delivery proof: `listAdmittedDeliveries()` is the only honest source for
- *   "the agent has it in context" (`emitted`) or "the session file refused it"
- *   (`failed`); both are mirrored into events as `delivery_state`.
+ *   A user message is the shape a person's typing has, so the engine never books
+ *   it as an automatic wake and never pauses the session over it.
+ * - Delivery proof: the honest source is the START OF THE TURN that message
+ *   triggered — `sendUserMessage` returns as soon as the text is queued and the
+ *   engine parks it as a held wake while the session is paused, so a proof at
+ *   send time would claim a batch the model never saw. On `turn_start` one
+ *   pending delivery is reported `emitted`; `listAdmittedDeliveries()` still
+ *   covers engine admits (`failed` included). Both reach the daemon as
+ *   `delivery_state` events.
  * - Events for the daemon land in `<state>/events.jsonl` (`turn_start`,
- *   `turn_end`, `admitted`, `admit_error`, `agent_end_aborted`, `compacted`).
+ *   `turn_end`, `admitted`, `admit_error`, `agent_end_aborted`, `compacted`,
+ *   `context_compacted`).
  * - `subagent` dispatches a one-shot `omo -p` process carrying the `general`
  *   persona, allowed as the persona text describes.
  */
@@ -31,17 +38,38 @@ const SKIP_TOKEN = "[skip]";
 
 // Pure argument shape for the daemon RPC. Kept exported so the send contract is
 // testable without an omo runtime; it contains no URL and no token.
-export function sendArgs(params, batchKey, threadId) {
+export function sendArgs(params) {
   const p = params || {};
-  const out = { batch_key: String(batchKey || "") };
+  const out = {};
   if (p.text !== undefined && p.text !== null) out.text = String(p.text);
   if (p.reply_to !== undefined && p.reply_to !== null)
     out.reply_to = Number(p.reply_to);
   if (p.gif_file_id) out.gif_file_id = String(p.gif_file_id);
   if (p.sticker_file_id) out.sticker_file_id = String(p.sticker_file_id);
   if (p.media_path) out.media_path = String(p.media_path);
-  if (threadId !== undefined && threadId !== null)
-    out.thread_id = Number(threadId);
+  if (p.favorite_id) out.favorite_id = String(p.favorite_id);
+  return out;
+}
+
+// Compaction events for the daemon. Two facts with different consumers:
+// - `compacted` names the in-flight deliveries a compaction erased, so the
+//   daemon re-delivers them (only when there are any);
+// - `context_compacted` is unconditional: the model lost its details, so the
+//   NEXT turn must carry the history window even though the session did not
+//   change.
+// A rejected compaction leaves the context intact and yields nothing.
+// Pure and exported so the contract is testable without an omo runtime.
+export function compactEvents(ev, deliveryIds) {
+  if (ev && ev.accepted === false) return [];
+  const meta = {
+    requestId: (ev && ev.requestId) || null,
+    reason: (ev && ev.reason) || null,
+  };
+  const out = [];
+  if (deliveryIds && deliveryIds.length) {
+    out.push({ kind: "compacted", delivery_ids: [...deliveryIds], ...meta });
+  }
+  out.push({ kind: "context_compacted", ...meta });
   return out;
 }
 
@@ -100,6 +128,38 @@ const BLOCKED_MEDIA_RE = /^(video|audio)\//i;
 const MEDIA_ERROR_RE =
   /unsupported media type|image_parse_error|invalid_image|does not represent a valid image/i;
 const MAX_WALK_DEPTH = 32;
+// Mirrors `media::PHOTO_CONTEXT_LIMIT` in src/media.rs. A raster part inside a
+// tool result whose decoded bytes exceed this would re-inflate the long-lived
+// session (the live 3.36 MB base64 toolResult). Bound it at the request edge
+// too so a blob finalized before the ingest bound existed cannot keep entering
+// the transcript.
+const PHOTO_CONTEXT_BYTES = 256 * 1024;
+
+function rasterMime(part) {
+  const mime = mediaMime(part);
+  return /^image\//i.test(mime) ? mime : "";
+}
+
+function base64Payload(part) {
+  const candidates = [part.image_url, part.data, part.b64_json];
+  const source = part.source && typeof part.source === "object" ? part.source : null;
+  if (source) candidates.push(source.data, source.url);
+  for (const raw of candidates) {
+    if (typeof raw !== "string" || raw.length === 0) continue;
+    const comma = raw.indexOf(",");
+    return comma >= 0 && /^data:/i.test(raw) ? raw.slice(comma + 1) : raw;
+  }
+  return "";
+}
+
+function decodedBase64Bytes(part) {
+  const payload = base64Payload(part);
+  if (!payload) return 0;
+  const clean = payload.replace(/\s/g, "");
+  let pad = 0;
+  for (let i = clean.length - 1; i >= 0 && clean[i] === "="; i -= 1) pad += 1;
+  return Math.max(0, Math.floor((clean.length * 3) / 4) - pad);
+}
 
 function mediaMime(part) {
   if (!part || typeof part !== "object") return "";
@@ -127,6 +187,13 @@ function blockedPlaceholder(part) {
   return anthropic ? { type: "text", text } : { type: "input_text", text };
 }
 
+function oversizedPlaceholder(part) {
+  const mime = rasterMime(part) || "image";
+  const text = `[изображение ${mime} опущено: файл больше ${PHOTO_CONTEXT_BYTES} байт и может испортить сессию; демон должен был уменьшить его при сохранении]`;
+  const anthropic = part && part.type === "image";
+  return anthropic ? { type: "text", text } : { type: "input_text", text };
+}
+
 function collectsToolResults(node) {
   if (!node || typeof node !== "object") return false;
   if (node.type === "function_call_output" || node.type === "tool_result") return true;
@@ -148,6 +215,11 @@ function rewriteParts(node, inToolResult, depth, stats) {
     stats.removed += 1;
     stats.mimes.add(mediaMime(node));
     return blockedPlaceholder(node);
+  }
+  if (inToolResult && rasterMime(node) && decodedBase64Bytes(node) > PHOTO_CONTEXT_BYTES) {
+    stats.removed += 1;
+    stats.mimes.add(rasterMime(node));
+    return oversizedPlaceholder(node);
   }
   const childInTool = inToolResult || collectsToolResults(node);
   let changed = false;
@@ -206,11 +278,6 @@ export default function (pi) {
   const stateDir = env("CHATBOT_STATE_DIR", "./state");  const controlSockPath = path.join(stateDir, "control.sock");
   const eventsPath = path.join(stateDir, "events.jsonl");
 
-  // Batches admitted in this turn: key, incoming ids and forum topic. The
-  // daemon validates reply targets and owns message_thread_id, but choosing
-  // WHICH batch an answer belongs to needs the ticket the push carried.
-  let activeBatches = [];
-
   // Delivery ids admitted by drain and served by the current turn. The daemon
   // serializes batches (one turn at a time), so this normally holds exactly one.
   let activeDeliveries = [];
@@ -226,17 +293,6 @@ export default function (pi) {
     } catch {
       // Events are observability only; never break the turn for them.
     }
-  }
-
-  function chooseBatch(replyTo) {
-    if (!activeBatches.length) return null;
-    const wanted = Number(replyTo);
-    if (Number.isInteger(wanted)) {
-      for (let i = activeBatches.length - 1; i >= 0; i--) {
-        if (activeBatches[i].ids.includes(wanted)) return activeBatches[i];
-      }
-    }
-    return activeBatches[activeBatches.length - 1];
   }
 
   pi.registerTool({
@@ -260,8 +316,9 @@ export default function (pi) {
         reply_to: {
           type: "integer",
           description:
-            "message_id to reply to — MUST be one of this batch's [id] markers; " +
-            "ids from the history block or the GIF catalog are not reply targets.",
+            "Do not use it: the assistant answers in the chat without quoting. " +
+            "The daemon accepts any message_id (no restriction), but quoting is " +
+            "off by the owner's rule, so leave this out.",
         },
         gif_file_id: {
           type: "string",
@@ -277,6 +334,12 @@ export default function (pi) {
             "Absolute path of a local media file from a batch [file] marker " +
             "(.gif -> animation, image -> photo, video -> video, else document).",
         },
+        favorite_id: {
+          type: "string",
+          description:
+            "id of a saved favourite (see chat_favorite). Mutually exclusive " +
+            "with gif_file_id / sticker_file_id / media_path.",
+        },
       },
       additionalProperties: false,
     },
@@ -289,12 +352,8 @@ export default function (pi) {
         .replace(/^\s*\[reply:\d+\]\s*/, "")
         .replace(/\[gif:\d+\]/g, "")
         .trim();
-      const batch = chooseBatch(params.reply_to);
-      if (!batch) {
-        return deny("нет активной пачки — chat_send вызывается только в ходе с доставленной пачкой");
-      }
-      const args = sendArgs({ ...params, text }, batch.key, batch.thread);
-      if (!text && !args.gif_file_id && !args.sticker_file_id && !args.media_path) {
+      const args = sendArgs({ ...params, text });
+      if (!text && !args.gif_file_id && !args.sticker_file_id && !args.media_path && !args.favorite_id) {
         return deny("empty body, nothing sent");
       }
       if (text === SKIP_TOKEN) {
@@ -368,6 +427,68 @@ export default function (pi) {
               text: `error: ручка демона недоступна: ${String(e).slice(0, 200)}`,
             },
           ],
+          isError: true,
+        };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "chat_favorite",
+    label: "Save or list favourites",
+    description:
+      "Favourites survive every cleanup: they live in their own folder and are " +
+      "never wiped. `save` keeps one file (media_path from a batch [file] line) " +
+      "or one sticker/gif file_id together with a mandatory note, and returns its " +
+      "favorite_id; the same save twice returns the same id. `list` returns the " +
+      "newest records with their notes. Send one later with " +
+      "chat_send(favorite_id=...).",
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["save", "list"],
+          description: "save a new favourite or list the existing ones (default list).",
+        },
+        note: {
+          type: "string",
+          description: "Required for save: why this is worth keeping and when to send it.",
+        },
+        media_path: {
+          type: "string",
+          description: "Absolute path from a batch [file] line; the file is copied into the store.",
+        },
+        file_id: {
+          type: "string",
+          description: "file_id of a sticker or GIF from the batch, re-sent later by id.",
+        },
+        kind: {
+          type: "string",
+          description: "animation / sticker / photo / video / document; inferred from the path when omitted.",
+        },
+        limit: {
+          type: "integer",
+          description: "How many records `list` returns (default 20, max 100).",
+        },
+      },
+      additionalProperties: false,
+    },
+    execute: async (toolCallId, params) => {
+      const args = {};
+      for (const k of ["action", "note", "media_path", "file_id", "kind"]) {
+        if (params[k] !== undefined && params[k] !== null) args[k] = String(params[k]);
+      }
+      if (params.limit !== undefined && params.limit !== null)
+        args.limit = Number(params.limit);
+      try {
+        const text = await controlCall("chat_favorite", args, 15000);
+        return { content: [{ type: "text", text }] };
+      } catch (e) {
+        const msg = String(e).slice(0, 300);
+        emit({ kind: "chat_favorite_error", toolCallId, error: msg });
+        return {
+          content: [{ type: "text", text: `error: избранное недоступно: ${msg}` }],
           isError: true,
         };
       }
@@ -512,6 +633,10 @@ export default function (pi) {
   });
 
   pi.on("turn_start", (ev) => {
+    // The turn really started, so the text really is in the model's context:
+    // this is the honest moment for the delivery proof (see admitDelivery).
+    // One delivery per turn - each user message starts its own turn.
+    if (pendingProof.length) markDeliveryState(pendingProof.shift(), "emitted");
     turnSends = new Map();
     emit({ kind: "turn_start", turnIndex: ev.turnIndex });
     emit({ kind: "agent_activity", phase: "working" });
@@ -531,8 +656,11 @@ export default function (pi) {
         }
       }),
     });
-    activeDeliveries = [];
-    activeBatches = [];
+    // A TURN is one assistant cycle (a tool call ends it and the next one
+    // begins); a RUN is the whole chain up to the answer. Clearing the batch
+    // here destroyed it before the `read` of a photo/video could be followed
+    // by `chat_send` in the same run (observed live 2026-11-06: "нет активной
+    // пачки" after every read). Deliveries are cleared on the run's settle.
   });
 
   // A run fully settled: the only signal the daemon accepts as "the agent
@@ -542,6 +670,7 @@ export default function (pi) {
     // The run is over: this is the "agent stopped" hook the daemon polls for.
     emit({ kind: "agent_activity", phase: "stopped" });
     reportDeliveryStates();
+    activeDeliveries = [];
   });
 
   // Last chance to keep an unwedgeable request: the provider payload is built
@@ -629,31 +758,17 @@ export default function (pi) {
   // leave the context intact and need no re-delivery.
   pi.on("session_compact", (ev) => {
     try {
-      if (ev && ev.accepted === false) return;
-      if (activeDeliveries.length) {
-        emit({
-          kind: "compacted",
-          delivery_ids: [...activeDeliveries],
-          requestId: (ev && ev.requestId) || null,
-          reason: (ev && ev.reason) || null,
-        });
-      }
+      for (const e of compactEvents(ev, [...activeDeliveries])) emit(e);
     } catch {
       // Observability only; the daemon's turn_end timeout is the fallback.
     }
   });
 
-  // Kinds that mean the runtime took the text. Everything else enqueued
-  // nothing and must be retried, never reported as delivered.
-  const ACCEPTED_KINDS = new Set([
-    "started",
-    "steered",
-    "queued",
-    "already_admitted",
-  ]);
   // Deliveries this process admitted, and the (id,state) pairs already mirrored
   // into events (the runtime ledger is process-lifetime, so repeats are noise).
   const trackedDeliveries = new Set();
+  // Deliveries whose turn has not started yet: the proof waits for turn_start.
+  const pendingProof = [];
   const reportedStates = new Set();
 
   function currentTurnEpoch() {
@@ -668,10 +783,24 @@ export default function (pi) {
     return undefined;
   }
 
-  // Delivery proof the daemon closes on: `emitted` means the transcript entry
-  // (custom `session_control_delivery` with details.delivery_id) exists, so the
-  // agent really has the text in context. `failed` means the session file
-  // refused it and it must be retried.
+  // One delivery_state event per (id, state). The daemon closes a batch on the
+  // `emitted` proof and re-pushes on `failed`.
+  function markDeliveryState(id, state, extra) {
+    const key = `${id}:${state}`;
+    if (reportedStates.has(key)) return;
+    reportedStates.add(key);
+    emit({
+      kind: "delivery_state",
+      delivery_id: String(id),
+      state,
+      ...(extra || {}),
+    });
+  }
+
+  // Delivery proof the daemon closes on. For an engine admit the ledger says
+  // whether the transcript entry exists; for a user message the send itself is
+  // the proof (see admitDelivery). `failed` means the session file refused it
+  // and it must be retried.
   function reportDeliveryStates() {
     if (!trackedDeliveries.size) return;
     let ledger = null;
@@ -681,24 +810,13 @@ export default function (pi) {
       return;
     }
     if (!ledger) return;
-    const mark = (id, state, extra) => {
-      const key = `${id}:${state}`;
-      if (reportedStates.has(key)) return;
-      reportedStates.add(key);
-      emit({
-        kind: "delivery_state",
-        delivery_id: String(id),
-        state,
-        ...(extra || {}),
-      });
-    };
     for (const id of ledger.emitted || []) {
-      if (trackedDeliveries.has(String(id))) mark(id, "emitted");
+      if (trackedDeliveries.has(String(id))) markDeliveryState(id, "emitted");
     }
     for (const f of ledger.failed || []) {
       const id = String((f && f.delivery_id) || "");
       if (id && trackedDeliveries.has(id)) {
-        mark(id, "failed", {
+        markDeliveryState(id, "failed", {
           error: String((f && f.error) || "").slice(0, 200),
         });
       }
@@ -870,19 +988,6 @@ export default function (pi) {
     const deliveryId = String(push.delivery_id || "");
     const text = String(push.text || "");
     if (!deliveryId || !text) return;
-    // The batch ticket: which incoming ids it carried and which forum topic it
-    // came from. A steer in the same turn adds a second batch; turn_end clears
-    // the list. The daemon validates reply targets itself.
-    const batchKey = deliveryId.split("#")[0];
-    const ids = (Array.isArray(push.batch_ids) ? push.batch_ids : [])
-      .map(Number)
-      .filter((n) => Number.isInteger(n) && n > 0);
-    activeBatches = activeBatches.filter((b) => b.key !== batchKey);
-    activeBatches.push({
-      key: batchKey,
-      ids,
-      thread: Number.isInteger(push.thread_id) ? push.thread_id : null,
-    });
     const kind = admitDelivery(deliveryId, text, push.deliverAs || "steer");
     if (!controlSock) return;
     try {
@@ -897,34 +1002,57 @@ export default function (pi) {
   // Returns the admission kind: the daemon closes a batch only on acceptance and
   // retries on a refusal. The epoch is what lets a steer land in a running turn
   // instead of being refused with `turn_conflict`.
-  function admitDelivery(deliveryId, text, deliverAs) {
-    const params = {
-      delivery_id: deliveryId,
-      text,
-      deliverAs,
-      sender: { kind: "external", platform: "telegram" },
-    };
-    if (deliverAs === "steer") {
-      const epoch = currentTurnEpoch();
-      if (epoch !== undefined) params.expected_turn_id = epoch;
-    }
+  // `deliverAs` from the daemon ("steer") is no longer honoured literally: the
+  // delivery shape is a user message, so a running turn takes it as a follow-up.
+  function admissionGateOrNull() {
     try {
-      const res = pi.session.admitExternalMessage(params);
+      return pi.session.admissionGate() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function admitDelivery(deliveryId, text, _deliverAs) {
+    // Owner (2026-11-08): «просто отправляй сообщения боту как юзер-промты».
+    // `admitExternalMessage` books every batch as an automatic wake under the
+    // producer `session_control_delivery`, and the engine pauses a session once
+    // those pile up with no human input ("Paused while no one was here: N
+    // automatic wakes held") — a chat bot never produces human input, so that
+    // pause never lifted and the bot went mute while looking healthy. A user
+    // message is the shape a person's typing has: it starts a turn, it counts as
+    // human input, and the session is never paused because of it.
+    // A held/paused session parks an extension user message as a notice instead of
+    // putting it in the transcript, and only the engine's own resume replays those.
+    // Sending into that state would let the daemon close a batch (and mark the
+    // history window served) for text the model never saw, so refuse here and let
+    // the daemon re-push once the session actually accepts turns.
+    const gateNow = admissionGateOrNull();
+    if (gateNow && gateNow.can_admit === false) {
+      emit({
+        kind: "admit_deferred",
+        delivery_id: deliveryId,
+        admission: "held_draft",
+      });
+      return "held_draft";
+    }
+    const running = currentTurnEpoch() !== undefined;
+    try {
+      if (running) pi.sendUserMessage(text, { deliverAs: "followUp" });
+      else pi.sendUserMessage(text);
+      const kind = running ? "queued" : "started";
+      // The proof is NOT claimed here. `sendUserMessage` returns as soon as the
+      // text is queued, and the engine parks it as a held wake while the session
+      // is paused (`_engineTurnHold`) - a proof here would tell the daemon the
+      // model holds a batch it never saw and would mark the history window as
+      // served. It is reported on the turn_start of that message instead.
+      pendingProof.push(deliveryId);
       trackedDeliveries.add(deliveryId);
-      if (ACCEPTED_KINDS.has(res.kind)) {
-        if (!activeDeliveries.includes(deliveryId)) {
-          activeDeliveries.push(deliveryId);
-        }
-        emit({ kind: "admitted", delivery_id: deliveryId, admission: res.kind });
-      } else {
-        emit({
-          kind: "admit_deferred",
-          delivery_id: deliveryId,
-          admission: res.kind,
-        });
+      if (!activeDeliveries.includes(deliveryId)) {
+        activeDeliveries.push(deliveryId);
       }
+      emit({ kind: "admitted", delivery_id: deliveryId, admission: kind });
       reportDeliveryStates();
-      return res.kind;
+      return kind;
     } catch (e) {
       const text = String(e);
       const stale =

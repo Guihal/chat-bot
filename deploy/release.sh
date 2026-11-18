@@ -1,14 +1,15 @@
 #!/bin/sh
 # Release manifest, verification, backup and rollback for the chat-bot set.
 #
-# One hash covers every file that defines the release: the daemon binary, the
-# extension, the phase-strip transformer, the system prompt, the persona and
-# agent-profile sources, the provisioning script, the env file and the systemd
-# unit. Rollback restores that whole set byte-for-byte and re-provisions the
-# agent profile from the restored persona sources, then re-computes the same
-# manifest hash as a post-check.
+# One hash covers every CODE file of the release. Agent-authored state is not
+# release content: the workspace `agents.md`, the global `AGENTS.md`, the
+# `system-prompt.md` the bot rewrites itself, the `md-inject.ts` rule block and
+# every `knowledge/*.md` document are deliberately NOT in this set and are never
+# synced by the deploy. A necessary content change to them is transferred by
+# hand into the live file.
 #
 # Usage:
+#   release.sh list     --root DIR
 #   release.sh manifest --root DIR --env-file PATH [--manifest PATH]
 #   release.sh verify   --root DIR --env-file PATH --manifest PATH
 #   release.sh backup   --root DIR --env-file PATH --dest DIR [--agent-dir DIR]
@@ -52,13 +53,32 @@ entries() {
     printf 'bin\t%s\n' 'target/release/botwatch'
     printf 'ext\t%s\n' 'chat-ext.mjs'
     printf 'phase\t%s\n' 'muse-spark-phase-strip.ts'
-    printf 'prompt\t%s\n' 'system-prompt.md'
-    printf 'persona\t%s\n' 'bot-home/AGENTS.md'
+    printf 'compactor\t%s\n' 'chat-compactor'
+    printf 'compactor_cfg\t%s\n' 'bot-home/compactors/rich.json'
+    printf 'compactor_cfg\t%s\n' 'bot-home/compactors/rich.md'
+    printf 'control_task\t%s\n' 'chat-control-task.mjs'
     printf 'agent_settings\t%s\n' 'bot-home/settings.json'
+    printf 'agent_ext\t%s\n' 'bot-home/extensions'
     printf 'agent_mcp\t%s\n' 'bot-home/mcp.json'
     printf 'provision\t%s\n' 'provision-agent.sh'
     printf 'unit\t%s\n' 'deploy/chat-bot.service'
     printf 'env\t%s\n' "$ENV_FILE"
+}
+
+# Expand a directory row into one row per file, sorted, so the manifest, the
+# backup and the rollback all address individual files of the compactor tree.
+expand_entries() {
+    while IFS="$TAB" read -r label rel; do
+        file=$(source_path "$rel")
+        if [ -d "$file" ]; then
+            ( cd "$ROOT" && find "$rel" -type f -print | LC_ALL=C sort ) |
+            while IFS= read -r sub; do
+                printf '%s\t%s\n' "$label" "$sub"
+            done
+        else
+            printf '%s\t%s\n' "$label" "$rel"
+        fi
+    done
 }
 
 source_path() {
@@ -74,7 +94,7 @@ manifest_write() {
     list="$out.entries.$$"
     lines="$out.lines.$$"
     canon="$out.canon.$$"
-    entries > "$list"
+    entries | expand_entries > "$list"
     : > "$lines"
     : > "$canon"
     while IFS="$TAB" read -r label rel; do
@@ -102,6 +122,9 @@ case "$CMD" in
         manifest_write "$MANIFEST"
         echo "MANIFEST_OK $(manifest_hash "$MANIFEST")"
         ;;
+    list)
+        entries | expand_entries
+        ;;
     verify)
         [ -f "$MANIFEST" ] || die "no manifest at $MANIFEST"
         tmp="$MANIFEST.recheck.$$"
@@ -115,7 +138,7 @@ case "$CMD" in
     backup)
         [ -n "$DEST" ] || die "backup needs --dest"
         manifest_write "$DEST/before.manifest"
-        entries > "$DEST/entries.$$"
+        entries | expand_entries > "$DEST/entries.$$"
         while IFS="$TAB" read -r label rel; do
             src=$(source_path "$rel")
             case "$rel" in

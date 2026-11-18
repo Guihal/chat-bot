@@ -20,6 +20,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -115,10 +116,16 @@ struct Daemon {
     state: String,
     sock: PathBuf,
     tool_sock: PathBuf,
+    /// The stub host socket: `host_alive()` connects to it, and the daemon asks
+    /// the `omo` stub (not this socket) for the session list. Kept alive for the
+    /// whole test so the daemon never enters the re-ensure loop.
+    _host: std::os::unix::net::UnixListener,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        // Kill before the run ends: a surviving daemon keeps writing its own
+        // state and would poison the next run of the same test.
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -127,9 +134,29 @@ impl Drop for Daemon {
 
 fn write_stub_omo(dir: &Path) -> std::io::Result<()> {
     let path = dir.join("omo");
+    // `list` is what decides delivery: the daemon pushes only when the host
+    // names the recorded durable id. An empty list (the old stub) sent the
+    // daemon into an endless "does not list session" re-ensure loop.
+    //
+    // Each invocation is logged next to the stub, so a test can prove whether
+    // the daemon closed a session. After a close the stub reports a NEW durable
+    // id, like a host that really lost the old session.
     std::fs::write(
         &path,
-        "#!/bin/sh\ncase \"$*\" in\n  *list*) echo '{\"sessions\":[]}' ;;\n  *open*) echo '{\"durableSessionId\":\"smoke-session\"}' ;;\n  *) echo '{}' ;;\nesac\nexit 0\n",
+        concat!(
+            "#!/bin/sh\n",
+            "D=$(dirname \"$0\")\n",
+            "echo \"$*\" >> \"$D/omo-calls.log\"\n",
+            "GEN=1\n",
+            "if [ -f \"$D/omo-closed\" ]; then GEN=2; fi\n",
+            "case \"$*\" in\n",
+            "  *list*) echo \"{\\\"sessions\\\":[{\\\"name\\\":\\\"smoke\\\",\\\"durableSessionId\\\":\\\"smoke-session-$GEN\\\",\\\"generation\\\":$GEN,\\\"attachments\\\":1}]}\" ;;\n",
+            "  *close*) : > \"$D/omo-closed\"; echo '{}' ;;\n",
+            "  *open*|*ensure*) echo \"{\\\"durableSessionId\\\":\\\"smoke-session-$GEN\\\"}\" ;;\n",
+            "  *) echo '{}' ;;\n",
+            "esac\n",
+            "exit 0\n",
+        ),
     )?;
     let mut perms = std::fs::metadata(&path)?.permissions();
     perms.set_mode(0o755);
@@ -156,6 +183,12 @@ fn seed_mirror(state: &str) {
 }
 
 fn start_daemon(api_base: &str) -> Daemon {
+    start_daemon_with(api_base, &[])
+}
+
+/// The stall/provider scenarios need a short no-progress budget, so the test
+/// may override the daemon's env.
+fn start_daemon_with(api_base: &str, extra: &[(&str, &str)]) -> Daemon {
     // Tests in this file run in parallel: a per-process counter keeps their
     // state dirs distinct (a wall-clock/elapsed stamp collided and the two
     // daemons shared one sqlite file).
@@ -177,13 +210,34 @@ fn start_daemon(api_base: &str) -> Daemon {
     std::fs::set_permissions(&token_path, perms).unwrap();
     let state = dir.join("state").to_string_lossy().to_string();
     seed_mirror(&state);
+    // A stub host socket: without a listener here `host_alive()` is false and
+    // the daemon spends the whole test re-ensuring a host that never appears.
+    let host = std::os::unix::net::UnixListener::bind(dir.join("host.sock"))
+        .expect("bind stub host socket");
+    {
+        let host = host.try_clone().expect("clone stub host listener");
+        std::thread::spawn(move || {
+            for stream in host.incoming() {
+                if stream.is_err() {
+                    break;
+                }
+            }
+        });
+    }
     let path_env = format!(
         "{}:{}",
         stubs.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_chatd"))
-        .arg("run")
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_chatd"));
+    cmd.arg("run")
+        // The daemon must never inherit the harness pipes: a child (or an
+        // orphaned grandchild such as the `omo` host stub) holding them keeps
+        // cargo waiting for EOF long after the test itself finished. The raw
+        // log lives in <state>/chatd.log and the test tail-reads that file.
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .env("CHATBOT_STATE_DIR", &state)
         .env("CHATBOT_TOKEN_FILE", &token_path)
         .env("CHATBOT_API_BASE", api_base)
@@ -193,15 +247,18 @@ fn start_daemon(api_base: &str) -> Daemon {
         .env("CHATBOT_HOST_SOCKET", dir.join("host.sock"))
         .env("CHATBOT_CWD", &dir)
         .env("CHATBOT_OWNER_USERNAME", "nobody-here")
-        .env("PATH", path_env)
-        .spawn()
-        .expect("spawn chatd");
+        .env("PATH", path_env);
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn().expect("spawn chatd");
     Daemon {
         child,
         sock: control_sock_path(&state),
         tool_sock: tool_socket_path(&state),
         dir,
         state,
+        _host: host,
     }
 }
 
@@ -331,6 +388,123 @@ fn wait_for_row(daemon: &Daemon, message_id: i64) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
     false
+}
+
+// ---------- helpers for the history-window / recovery scenarios ----------
+
+/// Append one event to the daemon's journal - the extension's real write path.
+fn append_event(daemon: &Daemon, ev: Value) {
+    let path = Path::new(&daemon.state).join("events.jsonl");
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(f, "{ev}").unwrap();
+    f.flush().unwrap();
+}
+
+/// Every argument list the daemon handed to the omo stub.
+fn omo_calls(daemon: &Daemon) -> String {
+    std::fs::read_to_string(daemon.dir.join("stubs").join("omo-calls.log")).unwrap_or_default()
+}
+
+fn live_session_uid(daemon: &Daemon) -> Option<String> {
+    let con = rusqlite::Connection::open(Path::new(&daemon.state).join("history.db")).ok()?;
+    con.query_row(
+        "SELECT session_uid FROM sessions WHERE state='live' ORDER BY generation DESC, id DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+fn queue_text(api: &FakeApi, id: i64, text: &str) {
+    let now = chrono::Utc::now().timestamp();
+    api.queue.lock().unwrap().push(json!({
+        "update_id": 900_000 + id,
+        "message": {
+            "message_id": id,
+            "date": now,
+            "chat": {"id": -100},
+            "from": {"id": 557, "username": "smoker", "first_name": "Smoke"},
+            "text": text
+        }
+    }));
+}
+
+fn chatd_log(daemon: &Daemon) -> String {
+    std::fs::read_to_string(Path::new(&daemon.state).join("chatd.log")).unwrap_or_default()
+}
+
+/// Next pushed batch frame, or None within the budget. The reader's socket
+/// timeout decides the polling granularity.
+fn try_read_push(reader: &mut BufReader<UnixStream>, secs: u64) -> Option<Value> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => panic!("control socket closed before a push"),
+            Ok(_) => {
+                let v: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+                if let Some(p) = v.get("push") {
+                    return Some(p.clone());
+                }
+            }
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Wait for the next pushed batch frame on an open control stream.
+fn read_push(reader: &mut BufReader<UnixStream>, daemon: &Daemon, secs: u64) -> Value {
+    try_read_push(reader, secs).unwrap_or_else(|| {
+        panic!(
+            "no push within {secs}s; log tail: {}",
+            chatd_log_tail(daemon)
+        )
+    })
+}
+
+/// Admit the frame the way the extension does, so the daemon stops retrying.
+fn accept_push(stream: &UnixStream, push: &Value) {
+    let delivery = push
+        .get("delivery_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    writeln!(
+        stream.try_clone().unwrap(),
+        "{}",
+        json!({"result": {"delivery_id": delivery, "kind": "steered"}})
+    )
+    .unwrap();
+}
+
+fn push_text(push: &Value) -> String {
+    push.get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn wait_until(daemon: &Daemon, what: &str, secs: u64, f: impl Fn(&Daemon) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if f(daemon) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "{what} never happened; omo calls: {}; log: {}",
+        omo_calls(daemon),
+        chatd_log(daemon)
+    );
 }
 
 #[test]
@@ -535,9 +709,10 @@ fn daemon_serves_control_calls_and_ingests() {
     );
 }
 
-/// The control frame is the contract between the daemon and the extension:
-/// `batch_ids` is what makes an out-of-batch `reply_to` refusable, and the batch
-/// text must show the nearest parent's text (crystal M1: replies are rendered
+/// The control frame is the contract between the daemon and the extension: it
+/// carries the delivery id and the batch ids (bookkeeping, NOT a reply
+/// restriction - replies are unrestricted since 2026-11-08), and the batch text
+/// must show the nearest parent's text (crystal M1: replies are rendered
 /// "ответ на такое-то сообщение", one hop only).
 #[test]
 fn push_frame_carries_batch_ids_and_reply_parent() {
@@ -724,4 +899,459 @@ fn chat_send_rpc_closes_the_journal_batch() {
         )
         .unwrap();
     assert_eq!(sent, 1, "mirror row missing after RPC send");
+}
+
+/// Owner's contract: the last 50 messages reach the model only when it gets a
+/// new context (session start / new durable id) or right after a compaction.
+/// Every other turn carries the batch, the guard and the catalogue only.
+#[test]
+fn history_window_only_at_session_start_and_after_compact() {
+    let api = start_fake_api();
+    let daemon = start_daemon(&api.base);
+    wait_ready(&daemon);
+    let stream = open_control_stream(&daemon.sock, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    std::fs::write(
+        Path::new(&daemon.state).join("events.jsonl"),
+        "{\"kind\":\"turn_end\"}\n",
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let now = chrono::Utc::now().timestamp();
+
+    // Turn 1: the session is new, so the seeded history rides along.
+    queue_text(&api, 5001, "turn one question");
+    let p1 = read_push(&mut reader, &daemon, 30);
+    let t1 = push_text(&p1);
+    assert!(t1.contains("[5001] @smoker: turn one question"), "batch missing: {t1}");
+    assert!(
+        t1.contains("[4800] @smoker: seeded gif caption"),
+        "no history window on the first turn of a session: {t1}"
+    );
+    accept_push(&stream, &p1);
+    append_event(
+        &daemon,
+        json!({"kind": "delivery_state", "delivery_id": p1["delivery_id"], "state": "emitted", "t": now}),
+    );
+
+    // Turn 2: same session, no compaction - the batch only.
+    queue_text(&api, 5002, "turn two question");
+    let p2 = read_push(&mut reader, &daemon, 30);
+    let t2 = push_text(&p2);
+    assert!(t2.contains("[5002] @smoker: turn two question"), "batch missing: {t2}");
+    assert!(
+        !t2.contains("[4800] @smoker:"),
+        "history window repeated in an ordinary turn: {t2}"
+    );
+    assert!(
+        !t2.contains("[5001] @smoker:"),
+        "the previous turn was repeated as history: {t2}"
+    );
+    accept_push(&stream, &p2);
+    append_event(
+        &daemon,
+        json!({"kind": "delivery_state", "delivery_id": p2["delivery_id"], "state": "emitted", "t": now}),
+    );
+
+    // A compaction rewrites the transcript: the next turn carries the window.
+    append_event(&daemon, json!({"kind": "context_compacted"}));
+    std::thread::sleep(Duration::from_millis(600));
+    queue_text(&api, 5003, "turn three question");
+    let p3 = read_push(&mut reader, &daemon, 30);
+    let t3 = push_text(&p3);
+    assert!(t3.contains("[5003] @smoker: turn three question"), "{t3}");
+    assert!(
+        t3.contains("[4800] @smoker:") && t3.contains("[5001] @smoker:"),
+        "no history window on the turn after a compaction: {t3}"
+    );
+    accept_push(&stream, &p3);
+    append_event(
+        &daemon,
+        json!({"kind": "delivery_state", "delivery_id": p3["delivery_id"], "state": "emitted", "t": now}),
+    );
+    wait_until(&daemon, "the post-compact window to be retired", 10, |d| {
+        chatd_log(d).contains("history window delivered")
+    });
+
+    // Served once, not on every turn after the compact.
+    queue_text(&api, 5004, "turn four question");
+    let p4 = read_push(&mut reader, &daemon, 30);
+    let t4 = push_text(&p4);
+    assert!(t4.contains("[5004] @smoker: turn four question"), "{t4}");
+    assert!(
+        !t4.contains("[4800] @smoker:") && !t4.contains("[5003] @smoker:"),
+        "the post-compact window was never retired: {t4}"
+    );
+    accept_push(&stream, &p4);
+    assert_eq!(
+        live_session_uid(&daemon).as_deref(),
+        Some("smoke-session-1"),
+        "the turns did not stay in one session"
+    );
+}
+
+/// A frame that never reached the model keeps its window on the retry, even
+/// when the rebuilt document hashes differently (a new row, a new answered
+/// marker, a hydrated file). The window is recorded as served only by the
+/// delivery proof, and the batch is identified by its ledger key, not by the
+/// hash of the text being rebuilt.
+#[test]
+fn retry_keeps_the_window_when_the_document_changed() {
+    let api = start_fake_api();
+    let daemon = start_daemon(&api.base);
+    wait_ready(&daemon);
+    let stream = open_control_stream(&daemon.sock, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    std::fs::write(
+        Path::new(&daemon.state).join("events.jsonl"),
+        "{\"kind\":\"turn_end\"}\n",
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let now = chrono::Utc::now().timestamp();
+
+    queue_text(&api, 5400, "attempt one question");
+    let p1 = read_push(&mut reader, &daemon, 30);
+    let t1 = push_text(&p1);
+    assert!(
+        t1.contains("[4800] @smoker: seeded gif caption"),
+        "the first turn of the session had no history window: {t1}"
+    );
+    accept_push(&stream, &p1);
+    // No `emitted` follows: the frame never reached the model, so the window was
+    // not served and the retry still owes it.
+
+    // The document changes between the build and the retry: a new row joins the
+    // history window, so `batch_sig(text)` moves.
+    {
+        let con = rusqlite::Connection::open(Path::new(&daemon.state).join("history.db")).unwrap();
+        con.execute(
+            "INSERT INTO messages(update_id,message_id,date,user_id,username,first_name,text,reply_to,media_path,file_id) VALUES(11,5401,?1,556,'smoker','Smoke','arrived meanwhile',NULL,'','')",
+            [now + 1],
+        )
+        .unwrap();
+    }
+
+    append_event(
+        &daemon,
+        json!({"kind": "delivery_state", "delivery_id": p1["delivery_id"], "state": "failed", "error": "session file refused", "t": now}),
+    );
+    let p2 = read_push(&mut reader, &daemon, 30);
+    let t2 = push_text(&p2);
+    assert!(t2.contains("attempt one question"), "{t2}");
+    assert!(
+        t2.contains("[5401] @smoker: arrived meanwhile"),
+        "the document did not change between the attempts: {t2}"
+    );
+    assert!(
+        t2.contains("[4800] @smoker: seeded gif caption"),
+        "the retry dropped the history window: {t2}"
+    );
+    assert_eq!(
+        p1["delivery_id"].as_str().unwrap().split('#').next(),
+        p2["delivery_id"].as_str().unwrap().split('#').next(),
+        "the retry became a different batch"
+    );
+    accept_push(&stream, &p2);
+}
+
+/// One window per epoch, even when the post-compaction window rides a REBUILD of
+/// a batch that was originally built without one: the flag is cleared by the
+/// proof of exactly that frame, so the following turn carries the batch only.
+#[test]
+fn single_window_despite_pending_redelivery() {
+    let api = start_fake_api();
+    let daemon = start_daemon(&api.base);
+    wait_ready(&daemon);
+    let stream = open_control_stream(&daemon.sock, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    std::fs::write(
+        Path::new(&daemon.state).join("events.jsonl"),
+        "{\"kind\":\"turn_end\"}\n",
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let now = chrono::Utc::now().timestamp();
+
+    // Turn 1: session start - the window is served and proven.
+    queue_text(&api, 5500, "opening question");
+    let p1 = read_push(&mut reader, &daemon, 30);
+    assert!(
+        push_text(&p1).contains("[4800] @smoker: seeded gif caption"),
+        "no window at session start: {}",
+        push_text(&p1)
+    );
+    accept_push(&stream, &p1);
+    append_event(
+        &daemon,
+        json!({"kind": "delivery_state", "delivery_id": p1["delivery_id"], "state": "emitted", "t": now}),
+    );
+    wait_until(&daemon, "the opening window to be marked delivered", 10, |d| {
+        chatd_log(d).contains("history window delivered")
+    });
+
+    // Turn 2: same session, no window. The frame hangs without a proof.
+    queue_text(&api, 5501, "unproven question");
+    let p2 = read_push(&mut reader, &daemon, 30);
+    let t2 = push_text(&p2);
+    assert!(t2.contains("unproven question"), "{t2}");
+    assert!(
+        !t2.contains("[4800] @smoker:"),
+        "an ordinary turn repeated the history window: {t2}"
+    );
+    accept_push(&stream, &p2);
+
+    // A compaction rewrites the transcript, then the hanging batch is re-delivered:
+    // its rebuild carries the window.
+    append_event(&daemon, json!({"kind": "context_compacted"}));
+    std::thread::sleep(Duration::from_millis(600));
+    let sig2 = p2["delivery_id"]
+        .as_str()
+        .unwrap()
+        .split('#')
+        .next()
+        .unwrap()
+        .to_string();
+    append_event(
+        &daemon,
+        json!({"kind": "compacted", "delivery_ids": [sig2]}),
+    );
+    let p3 = read_push(&mut reader, &daemon, 30);
+    let t3 = push_text(&p3);
+    assert!(t3.contains("unproven question"), "{t3}");
+    assert!(
+        t3.contains("[4800] @smoker: seeded gif caption"),
+        "the post-compaction rebuild carried no window: {t3}"
+    );
+    assert_eq!(
+        p2["delivery_id"].as_str().unwrap().split('#').next(),
+        p3["delivery_id"].as_str().unwrap().split('#').next(),
+        "the redelivery became a different batch"
+    );
+    accept_push(&stream, &p3);
+    append_event(
+        &daemon,
+        json!({"kind": "delivery_state", "delivery_id": p3["delivery_id"], "state": "emitted", "t": now}),
+    );
+    wait_until(&daemon, "the post-compact window to be marked delivered", 10, |d| {
+        chatd_log(d).matches("history window delivered").count() >= 2
+    });
+
+    // The next turn must not repeat it.
+    queue_text(&api, 5502, "after the compact");
+    let p4 = read_push(&mut reader, &daemon, 30);
+    let t4 = push_text(&p4);
+    assert!(t4.contains("after the compact"), "{t4}");
+    assert!(
+        !t4.contains("[4800] @smoker:") && !t4.contains("unproven question"),
+        "the post-compact window was not retired: {t4}"
+    );
+    accept_push(&stream, &p4);
+    assert_eq!(live_session_uid(&daemon).as_deref(), Some("smoke-session-1"));
+}
+
+/// A stalled batch is not the session's fault: the re-delivery goes into the
+/// SAME session and nothing is closed.
+#[test]
+fn stalled_batch_recovers_in_the_same_session() {
+    let api = start_fake_api();
+    let daemon = start_daemon_with(
+        &api.base,
+        &[("CHATBOT_TURN_SEC", "1"), ("CHATBOT_TURN_EXTRA_SEC", "0")],
+    );
+    wait_ready(&daemon);
+    let stream = open_control_stream(&daemon.sock, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    std::fs::write(
+        Path::new(&daemon.state).join("events.jsonl"),
+        "{\"kind\":\"turn_end\"}\n",
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    queue_text(&api, 5100, "stalled question");
+    let p1 = read_push(&mut reader, &daemon, 30);
+    accept_push(&stream, &p1);
+    // No `emitted` follows: after the 1s budget the batch is stalled.
+    wait_until(&daemon, "a same-session stall recovery", 25, |d| {
+        chatd_log(d).contains("re-delivery in the same session")
+    });
+    let p2 = read_push(&mut reader, &daemon, 30);
+    accept_push(&stream, &p2);
+    assert_eq!(
+        p1["delivery_id"].as_str().unwrap().split('#').next(),
+        p2["delivery_id"].as_str().unwrap().split('#').next(),
+        "the re-delivery was a different batch"
+    );
+    let log = chatd_log(&daemon);
+    assert!(log.contains("stalled in phase"), "no stall observed: {log}");
+    assert!(
+        !log.contains("recreate session"),
+        "a stalled batch replaced the session: {log}"
+    );
+    assert!(
+        !omo_calls(&daemon).contains("close"),
+        "a session was closed on a stall: {}",
+        omo_calls(&daemon)
+    );
+    assert_eq!(live_session_uid(&daemon).as_deref(), Some("smoke-session-1"));
+}
+
+/// A terminal provider error is a pause, not a memory wipe: the batch is
+/// re-delivered into the same session.
+#[test]
+fn provider_error_keeps_the_same_session() {
+    let api = start_fake_api();
+    let daemon = start_daemon(&api.base);
+    wait_ready(&daemon);
+    let stream = open_control_stream(&daemon.sock, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    std::fs::write(
+        Path::new(&daemon.state).join("events.jsonl"),
+        "{\"kind\":\"turn_end\"}\n",
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let now = chrono::Utc::now().timestamp();
+
+    queue_text(&api, 5200, "quota problem question");
+    let p1 = read_push(&mut reader, &daemon, 30);
+    accept_push(&stream, &p1);
+    append_event(
+        &daemon,
+        json!({"kind": "run_failed", "error": "GoUsageLimitError: usage limit reached", "t": now}),
+    );
+    append_event(&daemon, json!({"kind": "agent_settled", "t": now}));
+    wait_until(&daemon, "a same-session retry", 25, |d| {
+        chatd_log(d).contains("re-delivery in the same session")
+    });
+    let p2 = read_push(&mut reader, &daemon, 30);
+    accept_push(&stream, &p2);
+    let log = chatd_log(&daemon);
+    assert!(
+        log.contains("run failed (provider error): GoUsageLimitError"),
+        "the cause is missing from the log: {log}"
+    );
+    assert!(
+        !log.contains("recreate session"),
+        "a provider error replaced the session: {log}"
+    );
+    assert!(
+        !omo_calls(&daemon).contains("close"),
+        "a session was closed on a provider error: {}",
+        omo_calls(&daemon)
+    );
+    assert_eq!(live_session_uid(&daemon).as_deref(), Some("smoke-session-1"));
+}
+
+/// The one legitimate replacement: the gateway rejected media in the
+/// transcript. The reason is named, the session is closed once, and the first
+/// frame of the new session carries the history window (the text is rebuilt
+/// AFTER the replacement, never before it).
+#[test]
+fn media_heal_recreates_with_history_in_the_new_session() {
+    let api = start_fake_api();
+    let daemon = start_daemon(&api.base);
+    wait_ready(&daemon);
+    let stream = open_control_stream(&daemon.sock, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    std::fs::write(
+        Path::new(&daemon.state).join("events.jsonl"),
+        "{\"kind\":\"turn_end\"}\n",
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let now = chrono::Utc::now().timestamp();
+
+    queue_text(&api, 5300, "poisoned media question");
+    let p1 = read_push(&mut reader, &daemon, 30);
+    accept_push(&stream, &p1);
+    append_event(
+        &daemon,
+        json!({"kind": "run_failed", "media_rejected": true, "error": "400 rejected media", "t": now}),
+    );
+    append_event(&daemon, json!({"kind": "agent_settled", "t": now}));
+    wait_until(&daemon, "the poisoned session to be closed", 25, |d| {
+        omo_calls(d).contains("close")
+    });
+    // The heal waits for a turn boundary before delivering into the new
+    // session; feed one until the frame arrives.
+    let mut p2 = None;
+    for _ in 0..30 {
+        append_event(&daemon, json!({"kind": "turn_end"}));
+        if let Some(p) = try_read_push(&mut reader, 1) {
+            p2 = Some(p);
+            break;
+        }
+    }
+    let p2 = p2.expect("the healed session never received the batch");
+    let t2 = push_text(&p2);
+    accept_push(&stream, &p2);
+    assert!(
+        t2.contains("[4800] @smoker: seeded gif caption"),
+        "the healed session started without its history: {t2}"
+    );
+    let log = chatd_log(&daemon);
+    assert!(
+        log.contains("recreate session smoke-session-1") && log.contains("gateway-rejected media"),
+        "the replacement reason is not named: {log}"
+    );
+    assert_eq!(
+        omo_calls(&daemon).matches("close").count(),
+        1,
+        "the session was replaced more than once: {}",
+        omo_calls(&daemon)
+    );
+    assert_eq!(
+        live_session_uid(&daemon).as_deref(),
+        Some("smoke-session-2"),
+        "the heal did not land in a fresh session"
+    );
+}
+
+/// The owner's contract (2026-11-07): the indicator follows "the agent is
+/// working", not the model's steps, and it must not wait for the runtime's
+/// first turn - on the live host admission sat 12.9 s before the first
+/// `agent_activity`, so every reply shorter than that never showed "typing".
+/// Here NO agent event is ever written: if the light comes on, the daemon lit
+/// it at admission, which is the whole point.
+#[test]
+fn the_indicator_lights_at_admit_without_any_agent_event() {
+    let api = start_fake_api();
+    let daemon = start_daemon(&api.base);
+    wait_ready(&daemon);
+
+    let stream = open_control_stream(&daemon.sock, Duration::from_secs(10));
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    queue_text(&api, 908_811, "свет включается по приёму батча");
+    let push = read_push(&mut reader, &daemon, 20);
+    accept_push(&stream, &push);
+
+    wait_until(&daemon, "typing on right after admission", 10, |d| {
+        chatd_log(d).contains("typing on")
+    });
+    let log = chatd_log(&daemon);
+    assert!(
+        log.contains("admitted"),
+        "the indicator lit without an admission to lit it: {log}"
+    );
+    assert!(
+        !std::fs::read_to_string(Path::new(&daemon.state).join("events.jsonl"))
+            .unwrap_or_default()
+            .contains("agent_activity"),
+        "the test wrote a runtime event; the light must come from admission"
+    );
 }

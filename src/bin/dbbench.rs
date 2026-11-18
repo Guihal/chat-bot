@@ -307,7 +307,8 @@ fn legacy_p6(con: &Connection) -> Result<String> {
 }
 
 fn new_p1(con: &Connection) -> Result<String> {
-    let page = chat_bot::catalog::page(con, 0, 200)?;
+    let (rows, total) = chat_bot::store::catalog_page(con, 0, 200)?;
+    let page = chat_bot::catalog::page_of(rows, 0, total);
     let rows: Vec<String> = page
         .records
         .iter()
@@ -324,7 +325,7 @@ fn new_p1(con: &Connection) -> Result<String> {
 
 fn new_p2(con: &Connection) -> Result<String> {
     let ids = [serde_json::json!(1042i64)];
-    let rows = batch_rows_by_ids(con, &ids)?;
+    let rows = chat_bot::store::batch_rows_by_ids(con, &ids)?;
     Ok(rows
         .iter()
         .map(|r| {
@@ -340,7 +341,7 @@ fn new_p2(con: &Connection) -> Result<String> {
 }
 
 fn new_p3(con: &Connection) -> Result<String> {
-    let rows = recent_rows(con, 50)?;
+    let rows = chat_bot::store::recent_rows(con, 50)?;
     Ok(rows
         .iter()
         .map(|r| {
@@ -364,7 +365,7 @@ fn guard_qids(text: &str) -> Vec<i64> {
 
 fn new_p4(con: &Connection) -> Result<String> {
     let ids = legacy_answered(con)?;
-    let guard = guard_qids(&answered_guard(con, 5)?);
+    let guard = guard_qids(&chat_bot::store::answered_guard(con, 5)?);
     Ok(format!("answered={ids};guard={guard:?}"))
 }
 

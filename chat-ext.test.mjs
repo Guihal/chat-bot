@@ -14,12 +14,41 @@ import os from "node:os";
 import path from "node:path";
 
 import chatExt, {
+  compactEvents,
   helloFrame,
   sanitizePayload,
   sendArgs,
   staleGate,
   terminalProviderError,
 } from "./chat-ext.mjs";
+
+test("a compaction always reports the lost context, delivery ids or not", () => {
+  // The daemon needs the unconditional fact: the next turn must carry the
+  // history window even when no delivery was in flight.
+  assert.deepEqual(compactEvents({ requestId: "r1", reason: "auto" }, []), [
+    { kind: "context_compacted", requestId: "r1", reason: "auto" },
+  ]);
+  assert.deepEqual(compactEvents(null, []), [
+    { kind: "context_compacted", requestId: null, reason: null },
+  ]);
+});
+
+test("a compaction with in-flight deliveries reports both facts", () => {
+  const evs = compactEvents({ requestId: "r2" }, ["sig-a#1", "sig-b#1"]);
+  assert.deepEqual(evs, [
+    {
+      kind: "compacted",
+      delivery_ids: ["sig-a#1", "sig-b#1"],
+      requestId: "r2",
+      reason: null,
+    },
+    { kind: "context_compacted", requestId: "r2", reason: null },
+  ]);
+});
+
+test("a rejected compaction leaves the context intact and reports nothing", () => {
+  assert.deepEqual(compactEvents({ accepted: false }, ["sig-a#1"]), []);
+});
 
 test("hello carries the durable session id and generation, never the name", () => {
   assert.deepEqual(helloFrame("dur-7f3a", 4, 1234), {
@@ -37,49 +66,37 @@ test("a stale instance refuses reconnect until a fresh session start", () => {
   assert.equal(gate.isDead(), false);
 });
 
-test("sendArgs carries the batch ticket and text", () => {
-  assert.deepEqual(sendArgs({ text: "привет" }, "sig-b", null), {
-    batch_key: "sig-b",
-    text: "привет",
-  });
+test("sendArgs carries the text and nothing about batches", () => {
+  assert.deepEqual(sendArgs({ text: "привет" }), { text: "привет" });
 });
 
-test("sendArgs keeps every media argument and the topic", () => {
+test("sendArgs keeps every media argument", () => {
   assert.deepEqual(
-    sendArgs(
-      {
-        text: "подпись",
-        reply_to: 501,
-        gif_file_id: "gif_1",
-        media_path: "/state/media/a.gif",
-      },
-      "sig-c",
-      4113,
-    ),
-    {
-      batch_key: "sig-c",
+    sendArgs({
       text: "подпись",
       reply_to: 501,
       gif_file_id: "gif_1",
       media_path: "/state/media/a.gif",
-      thread_id: 4113,
+    }),
+    {
+      text: "подпись",
+      reply_to: 501,
+      gif_file_id: "gif_1",
+      media_path: "/state/media/a.gif",
     },
   );
 });
 
 test("a sticker plus text stays one RPC call and two messages", () => {
-  const args = sendArgs(
-    { sticker_file_id: "stick_1", text: "подпись" },
-    "sig-d",
-    77,
-  );
+  const args = sendArgs({ sticker_file_id: "stick_1", text: "подпись" });
   assert.equal(args.sticker_file_id, "stick_1");
   assert.equal(args.text, "подпись");
-  assert.equal(args.thread_id, 77);
 });
 
-test("blank batch ticket is represented, never guessed", () => {
-  assert.equal(sendArgs({ text: "x" }, "", null).batch_key, "");
+test("a send never carries a batch ticket", () => {
+  const args = sendArgs({ text: "x" });
+  assert.equal("batch_key" in args, false);
+  assert.equal("thread_id" in args, false);
 });
 
 test("the extension contains no Bot API transport or token access", () => {
@@ -149,7 +166,8 @@ import net from "node:net";
 const THREAD = 6043;
 const BATCH = "sig-run";
 
-function fakeRuntime(admitKind) {
+function fakeRuntime(admitKind, gate) {
+  const sentUserMessages = [];
   const handlers = new Map();
   const tools = new Map();
   const pi = {
@@ -160,21 +178,25 @@ function fakeRuntime(admitKind) {
     registerTool(tool) {
       tools.set(tool.name, tool);
     },
+    // Top-level, like the real `pi`: a user message is a runtime API, not a
+    // session-control action.
+    sendUserMessage: (text, options) => {
+      sentUserMessages.push({ text, options });
+    },
     session: {
-      admissionGate: () => ({ can_admit: true, turn_epoch: 1 }),
-      admitExternalMessage: () => ({ kind: admitKind }),
+      admissionGate: () => gate || { can_admit: true, turn_epoch: 1 },
       listAdmittedDeliveries: () => ({ pending: [], emitted: [], failed: [] }),
     },
   };
   const fire = async (name, ev) => {
     for (const fn of handlers.get(name) || []) await fn(ev || {});
   };
-  return { pi, fire, tools };
+  return { pi, fire, tools, sentUserMessages };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function withControlSock(t, admitKind) {
+async function withControlSock(t, admitKind, gate) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "chat-ext-typing-"));
   const sockPath = path.join(dir, "control.sock");
   const calls = [];
@@ -210,7 +232,7 @@ async function withControlSock(t, admitKind) {
 
   const prevState = process.env.CHATBOT_STATE_DIR;
   process.env.CHATBOT_STATE_DIR = dir;
-  const rt = fakeRuntime(admitKind);
+  const rt = fakeRuntime(admitKind, gate);
   chatExt(rt.pi);
   await rt.fire("session_start", {});
 
@@ -292,6 +314,70 @@ test("the extension reports activity and never drives the indicator", async (t) 
   );
 });
 
+// The daemon closes a batch on the emitted proof. A user message leaves no
+// entry in the engine's external-admission ledger, so the extension must report
+// that proof itself - without it the daemon waits out its 60s delivery clock and
+// the history window is never marked served (it would ride every later turn).
+test("a user-prompt delivery reports the emitted proof", async (t) => {
+  const h = await withControlSock(t, "started");
+  const sock = await h.waitConnected();
+  pushFrame(sock, `${BATCH}#2`);
+  await sleep(600);
+
+  assert.equal(h.rt.sentUserMessages.length, 1, "the push reaches the model as a user message");
+  assert.ok(
+    h.rt.sentUserMessages[0].text.includes("сделай задачу"),
+    "the batch text is the user message",
+  );
+  const readEvents = () =>
+    fs
+      .readFileSync(path.join(process.env.CHATBOT_STATE_DIR, "events.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+  const emitted = () =>
+    readEvents().filter((ev) => ev.kind === "delivery_state" && ev.state === "emitted");
+
+  // The send alone proves nothing: the engine can park the text as a held wake
+  // while the session is paused, and a proof here would mark the batch delivered
+  // (and the history window served) for text the model never saw.
+  assert.equal(emitted().length, 0, "no proof before the turn starts");
+
+  await h.rt.fire("turn_start", { turnIndex: 0 });
+  await sleep(150);
+  const proof = emitted();
+  assert.equal(proof.length, 1, "exactly one emitted proof per started turn");
+  assert.equal(proof[0].delivery_id, `${BATCH}#2`);
+});
+
+// A held session parks an extension user message as a notice instead of writing it
+// to the transcript, and only the engine's own resume replays those notices. The
+// extension must refuse such a delivery, or the daemon closes the batch (and marks
+// the history window served) for text the model never saw.
+test("a held session refuses the delivery instead of parking it", async (t) => {
+  const h = await withControlSock(t, "started", { can_admit: false, turn_epoch: 1 });
+  const sock = await h.waitConnected();
+  pushFrame(sock, `${BATCH}#3`);
+  await sleep(400);
+
+  assert.equal(h.rt.sentUserMessages.length, 0, "nothing is handed to a held session");
+  const events = fs
+    .readFileSync(path.join(process.env.CHATBOT_STATE_DIR, "events.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(
+    events.filter((ev) => ev.kind === "delivery_state").length,
+    0,
+    "a refusal must not report a proof",
+  );
+  assert.equal(
+    events.filter((ev) => ev.kind === "admit_deferred").length,
+    1,
+    "the deferral is reported so the daemon retries later",
+  );
+});
+
 // ---- gateway-rejected media in tool results -------------------------------
 
 // The installed runtime serializes a tool result as
@@ -335,6 +421,21 @@ test("sanitizePayload leaves an image inside a tool result untouched", () => {
   assert.equal(result.changed, false);
   assert.equal(result.removed, 0);
   assert.equal(result.payload, payload, "an unchanged request must be sent identically");
+});
+
+test("sanitizePayload replaces an oversized raster inside a tool result", () => {
+  const oversize = "A".repeat(Math.ceil(((256 * 1024 + 1) * 4) / 3));
+  const payload = responsesPayload([
+    { type: "input_image", detail: "auto", image_url: `data:image/png;base64,${oversize}` },
+  ]);
+  const result = sanitizePayload(payload);
+  assert.equal(result.changed, true);
+  assert.equal(result.removed, 1);
+  const parts = result.payload.input[1].output;
+  assert.equal(parts.length, 1);
+  assert.equal(parts[0].type, "input_text");
+  assert.match(parts[0].text, /изображение image\/png опущено/);
+  assert.equal("image_url" in parts[0], false);
 });
 
 test("sanitizePayload leaves user-message media untouched", () => {

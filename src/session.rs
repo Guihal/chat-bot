@@ -3,7 +3,7 @@
 //! only ever selects candidates, never the close argument.
 use crate::{cfg, dlog, omo_on};
 use anyhow::{anyhow, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+
 use serde_json::Value;
 use std::time::Duration;
 
@@ -151,6 +151,30 @@ pub fn is_mute(health: &SessionHealth) -> bool {
 /// running daemon.
 pub fn should_heal(strikes: u32, turn_recent: bool, ticks_since_heal: u32) -> bool {
     strikes >= 2 && !turn_recent && ticks_since_heal >= 5
+}
+
+/// The engine paused the session and holds every automatic wake, so nothing runs
+/// at all. Unlike `is_mute`, this does not need a particular hold kind: the engine
+/// raises `unattended` once automatic wakes arrive with no human input ("Paused
+/// while no one was here: N automatic wakes held"), and a chat bot NEVER produces
+/// human input, so that pause is permanent without an explicit resume.
+pub fn needs_resume(health: &SessionHealth) -> bool {
+    health.paused
+}
+
+/// The text of the resume delivery. It reaches the model as a HUMAN message —
+/// exactly what the engine's own notice asks for ("Resume or send a message to
+/// continue") — so it lifts the unattended hold and bumps `humanInputRevision`.
+pub const RESUME_TEXT: &str = "Продолжай: отвечай на сообщения чата, которые пришли.";
+
+/// Lift the paused session with one human prompt. `true` when the host accepted
+/// it; a failure is not evidence of a fault, so the caller only logs it and the
+/// next tick retries.
+pub async fn resume_on(uid: &str, sock: &str) -> bool {
+    match omo_on(&["prompt", uid, RESUME_TEXT], Duration::from_secs(30), sock).await {
+        Ok(v) => v.get("action").and_then(|a| a.as_str()) == Some("prompt"),
+        Err(_) => false,
+    }
 }
 
 /// Ask the host about the session. `None` means the host could not answer; that
@@ -324,56 +348,8 @@ pub async fn close_all_sessions_on(sock: &str) -> Result<usize> {
 
 /// Record the session the daemon is now live in and return its generation. A
 /// new durable id bumps the generation; the same id keeps it.
-pub fn record_live(con: &Connection, name: &str, uid: &str) -> Result<i64> {
-    let current: Option<(Option<String>, Option<i64>)> = con
-        .query_row(
-            "SELECT session_uid, generation FROM sessions WHERE name=?",
-            [name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let now = chrono::Utc::now().timestamp();
-    let generation = match current {
-        Some((Some(old), Some(g))) if old == uid => g,
-        Some((_, Some(g))) => g.saturating_add(1),
-        _ => 1,
-    };
-    con.execute(
-        "INSERT INTO sessions(name,session_uid,generation,state,updated_at) VALUES(?,?,?,'live',?)
-         ON CONFLICT(name) DO UPDATE SET
-           session_uid=excluded.session_uid,
-           generation=excluded.generation,
-           state='live',
-           updated_at=excluded.updated_at",
-        params![name, uid, generation, now],
-    )?;
-    Ok(generation)
-}
 
-pub fn mark_dead(con: &Connection, uid: &str) -> Result<()> {
-    con.execute(
-        "UPDATE sessions SET state='dead', updated_at=? WHERE session_uid=?",
-        params![chrono::Utc::now().timestamp(), uid],
-    )?;
-    Ok(())
-}
 
-pub fn live_identity(con: &Connection) -> Result<Option<(String, i64)>> {
-    let row: Option<(String, Option<i64>)> = con
-        .query_row(
-            "SELECT session_uid, generation FROM sessions WHERE state='live' ORDER BY generation DESC, id DESC LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(row.and_then(|(uid, generation)| {
-        if uid.trim().is_empty() {
-            None
-        } else {
-            Some((uid, generation.unwrap_or(0)))
-        }
-    }))
-}
 
 pub fn configured_name() -> String {
     cfg("CHATBOT_SESSION", "chat-participant")
@@ -511,6 +487,23 @@ mod tests {
         assert_eq!(parse_state(&serde_json::json!({"action": "error"})), None);
     }
 
+    /// The pause a chat bot hits for real: automatic wakes held with no human
+    /// input. is_mute deliberately ignores it (a client-less session is normal),
+    /// but nothing runs under it, so it needs the resume instead of a restart.
+    #[test]
+    fn a_paused_session_needs_a_resume_even_without_interrupted_run() {
+        let paused = parse_state(&serde_json::json!({"state": {"paused": true, "holds": [
+            {"kind": "unattended", "key": "unattended"},
+        ]}}))
+        .unwrap();
+        assert!(needs_resume(&paused));
+        assert!(!is_mute(&paused), "unattended is not a hold to restart on");
+
+        let idle =
+            parse_state(&serde_json::json!({"state": {"paused": false, "holds": []}})).unwrap();
+        assert!(!needs_resume(&idle), "an idle session must not be prompted");
+    }
+
     #[test]
     fn rearm_needs_a_dead_gate_idleness_and_no_running_turn() {
         assert!(!rearm_allowed(false, 999, false));
@@ -527,12 +520,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let state = dir.to_string_lossy().to_string();
         let con = crate::db(&state).unwrap();
-        assert_eq!(record_live(&con, "chat-participant", "sid-1").unwrap(), 1);
-        assert_eq!(record_live(&con, "chat-participant", "sid-1").unwrap(), 1);
-        assert_eq!(record_live(&con, "chat-participant", "sid-2").unwrap(), 2);
-        assert_eq!(live_identity(&con).unwrap(), Some(("sid-2".to_string(), 2)));
-        mark_dead(&con, "sid-2").unwrap();
-        assert_eq!(live_identity(&con).unwrap(), None);
+        assert_eq!(crate::store::record_live(&con, "chat-participant", "sid-1").unwrap(), 1);
+        assert_eq!(crate::store::record_live(&con, "chat-participant", "sid-1").unwrap(), 1);
+        assert_eq!(crate::store::record_live(&con, "chat-participant", "sid-2").unwrap(), 2);
+        assert_eq!(crate::store::live_identity(&con).unwrap(), Some(("sid-2".to_string(), 2)));
+        crate::store::mark_dead(&con, "sid-2").unwrap();
+        assert_eq!(crate::store::live_identity(&con).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
