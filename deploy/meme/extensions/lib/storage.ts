@@ -74,6 +74,13 @@ export function saveCandidate(input: SaveInput): SaveResult {
 	}
 	const sha256 = sha256Bytes(input.media.buffer);
 	if (ledgerHas({ sha256 })) return { status: "duplicate" };
+	const hardLimit = Number(env("MEME_STORAGE_HARD_BYTES", String(256 * 1024 * 1024))) || 256 * 1024 * 1024;
+	if (storageBytes() + input.media.buffer.length > hardLimit) {
+		prune();
+		if (storageBytes() + input.media.buffer.length > hardLimit) {
+			throw new Error("storage hard limit reached");
+		}
+	}
 
 	ensureLayout();
 	const extension = extensionForMime(mime);
@@ -140,6 +147,7 @@ export function saveCandidate(input: SaveInput): SaveResult {
 		published_at: null,
 		first_seen: candidate.discovered_at,
 	});
+	prune(id);
 	return { status: "saved", candidate };
 }
 
@@ -256,7 +264,17 @@ export function markFailed(id: string, errorText: string): void {
 	  });
 }
 
-export function prune(): void {
+function storageBytes(): number {
+	let total = 0;
+	for (const row of allCandidates()) {
+		try {
+			total += fs.statSync(row.media.path).size;
+		} catch {}
+	}
+	return total;
+}
+
+export function prune(protectId?: string): void {
 	const rows = allCandidates();
 	let totalBytes = 0;
 	for (const row of rows) {
@@ -272,6 +290,7 @@ export function prune(): void {
 	for (const row of ordered) {
 		 if (totalBytes <= maxBytes && entries <= maxEntries) break;
 		 if (!["published", "failed", "candidate"].includes(row.status)) continue;
+	 if (row.id === protectId) continue;
 		 let size = 0;
 		 try {
 		   size = fs.statSync(row.media.path).size;

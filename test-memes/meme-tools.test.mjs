@@ -355,3 +355,13 @@ test("alerts are rate limited once per day and kind", () => {
 	expect(common.alertOnce(kind, "first" )).toBe(true);
 	expect(common.alertOnce(kind, "second" )).toBe(false);
 });
+
+test("save fails closed above the storage hard limit", () => {
+	const previous = process.env.MEME_STORAGE_HARD_BYTES;
+	process.env.MEME_STORAGE_HARD_BYTES = "1";
+	try {
+		expect(() => saveUnique("second", "918", "hard-limit")).toThrow(/hard limit/);
+	} finally {
+		process.env.MEME_STORAGE_HARD_BYTES = previous || String(256 * 1024 * 1024);
+	}
+});

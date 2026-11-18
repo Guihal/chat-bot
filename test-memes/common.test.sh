@@ -30,6 +30,14 @@ run_case() {
 
 run_case "kill switch exits NO_NEW" 0 MEME_ENABLED=false
 
+run_case "missing sources aborts" 78 MEME_ENABLED=true MEME_MIN_DISK_MIB=1 MEME_MIN_MEM_MIB=1
+mkdir -p "$MEME_ROOT"
+: >"$MEME_ROOT/meme-sources.md"
+run_case "empty sources aborts" 78 MEME_ENABLED=true MEME_MIN_DISK_MIB=1 MEME_MIN_MEM_MIB=1
+printf '# only comments\n' >"$MEME_ROOT/meme-sources.md"
+run_case "comment-only sources aborts" 78 MEME_ENABLED=true MEME_MIN_DISK_MIB=1 MEME_MIN_MEM_MIB=1
+printf 'catmodernews\n' >"$MEME_ROOT/meme-sources.md"
+
 run_case "low memory aborts" 75 \
   MEME_ENABLED=true MEME_TEST_MEM_MIB=10
 

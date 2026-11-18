@@ -75,6 +75,20 @@ meme_check_resources() {
   fi
 }
 
+meme_validate_sources() {
+  sources=${MEME_SOURCES_PATH:-$MEME_ROOT/meme-sources.md}
+  if [ ! -s "$sources" ]; then
+    meme_log "sources file missing or empty: $sources"
+    meme_alert_once sources "meme sources missing or empty: $sources"
+    return 78
+  fi
+  if ! grep -Eq '^[[:space:]]*(https?://t\.me/[A-Za-z0-9_]+|[A-Za-z0-9_]{4,})([[:space:]]|$)' "$sources"; then
+    meme_log "sources file has no valid entries: $sources"
+    meme_alert_once sources "meme sources file has no valid entries: $sources"
+    return 78
+  fi
+}
+
 meme_preflight() {
   role=$1
   if [ "$MEME_ENABLED" = "false" ]; then
@@ -107,6 +121,10 @@ meme_preflight() {
 
   export MEME_DATA_DIR="$MEME_ROOT"
   export MEME_SOURCES_PATH="${MEME_SOURCES_PATH:-$MEME_ROOT/meme-sources.md}"
+
+  if [ "$role" = discovery ]; then
+    meme_validate_sources || exit $?
+  fi
 }
 
 meme_run() {
