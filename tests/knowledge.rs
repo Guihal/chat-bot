@@ -83,6 +83,38 @@ async fn window_reaches_own_replies_and_the_tail_of_the_day() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn cursor_paging_resumes_at_the_tail_without_duplicates() {
+    let (state, store) = temp_store("paging");
+    let from = 1_800_000_000i64;
+    let rows: Vec<_> = (10..15)
+        .map(|i| envelope(-100, i, i, from + i, &format!("строка-{i}")))
+        .collect();
+    chat_bot::store::commit_page(&store, rows, 15)
+        .await
+        .unwrap();
+
+    let mut cursor = (0i64, 0i64);
+    let mut seen = vec![];
+    loop {
+        let page = chat_bot::store::knowledge_window_of(&store, from, from + 100, cursor.0, cursor.1, 2)
+            .await
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        for row in page {
+            cursor = (row.1, row.0);
+            seen.push(row.4.unwrap_or_default());
+        }
+    }
+    assert_eq!(seen.len(), 5);
+    assert_eq!(seen.first().unwrap(), "строка-10");
+    assert_eq!(seen.last().unwrap(), "строка-14");
+    assert_eq!(seen.iter().collect::<std::collections::HashSet<_>>().len(), 5);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn rerun_of_the_same_keys_does_not_grow_the_document() {
     let mut doc = knowledge::parse_managed(&knowledge::new_document(Kind::Persons));
     let mut first = Record {

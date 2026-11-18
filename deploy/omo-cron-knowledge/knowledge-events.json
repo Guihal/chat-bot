@@ -1,0 +1,16 @@
+{
+  "schedule": {
+    "type": "interval",
+    "minutes": 60
+  },
+  "command": [
+    "/bin/bash",
+    "-c",
+    "set -o pipefail; /usr/bin/env CHATBOT_STATE_DIR=/opt/omo-chat/data/chat-state CHATBOT_CHAT_ID=-1004493415890 CHATBOT_CWD=/opt/omo-server/workspace/chat-bot CHATBOT_AGENT_DIR=/opt/omo-chat/state/knowledge-agent CHATBOT_KNOWLEDGE_DIR=/opt/omo-server/workspace/chat-bot/knowledge CHATBOT_KNOWLEDGE_TMP=/root/omo-cron-tmp CHATBOT_SYSTEM=/opt/omo-server/workspace/chat-bot/knowledge-prompt.md /opt/omo-chat/bin/chatd knowledge --doc events 2>&1 | tee -a /root/omo-cron/logs/knowledge-events/run.log"
+  ],
+  "cwd": "/opt/omo-server/workspace/chat-bot",
+  "timeout": 660,
+  "deliver": "none",
+  "chat": null,
+  "enabled": true
+}

@@ -11,12 +11,16 @@
 //!   replace the old ones while an empty one keeps them — a failed second
 //!   lookup must not erase a confirmed link;
 //! * no SQL and no file IO: the caller reads and atomically writes the file.
+//! * a run owns ONE document: the per-document cursor is `<date>:<message_id>`,
+//!   the run digest is sha256(batch + that document's bytes), and the
+//!   scoped hash-guard only compares the target path.
 //!
 //! The model answers records, never a file, so this module — not model
 //! diligence — decides what the document looks like.
 
 use anyhow::{anyhow, Result};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 pub const BEGIN: &str = "<!-- knowledge:begin -->";
 pub const END: &str = "<!-- knowledge:end -->";
@@ -56,6 +60,41 @@ impl Kind {
     pub fn has_sources(self) -> bool {
         matches!(self, Kind::Persons)
     }
+
+    /// CLI/document slug: the stable identity in job names and kv keys.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Kind::Discourse => "discourse",
+            Kind::Persons => "persons",
+            Kind::Dictionary => "dictionary",
+            Kind::Donors => "donors",
+            Kind::Events => "events",
+        }
+    }
+
+    pub fn from_slug(slug: &str) -> Option<Kind> {
+        match slug.trim() {
+            "discourse" => Some(Kind::Discourse),
+            "persons" => Some(Kind::Persons),
+            "dictionary" => Some(Kind::Dictionary),
+            "donors" => Some(Kind::Donors),
+            "events" => Some(Kind::Events),
+            _ => None,
+        }
+    }
+
+    /// The JSON array the model must fill for this run. Other arrays stay
+    /// empty and are ignored by the merge, so one job cannot write another
+    /// document.
+    pub fn array_field(self) -> &'static str {
+        match self {
+            Kind::Discourse => "discourse",
+            Kind::Persons => "persons",
+            Kind::Dictionary => "dictionary",
+            Kind::Donors => "donors",
+            Kind::Events => "events",
+        }
+    }
 }
 
 pub fn kinds() -> [Kind; 5] {
@@ -66,6 +105,85 @@ pub fn kinds() -> [Kind; 5] {
         Kind::Donors,
         Kind::Events,
     ]
+}
+
+/// Persisted high-water mark for one document run, in the mirror's order:
+/// `(date, message_id)`, never `update_id` (own replies carry negative ids).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Cursor {
+    pub date: i64,
+    pub message_id: i64,
+}
+
+impl Cursor {
+    /// Parse the persisted `knowledge:cursor:<slug>` value. An unparsable value
+    /// is an error, never a silent reset to the beginning of history.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let raw = raw.trim();
+        let (date, message_id) = raw
+            .split_once(':')
+            .ok_or_else(|| anyhow!("bad knowledge cursor {raw:?}: expected <date>:<message_id>"))?;
+        Ok(Cursor {
+            date: date
+                .parse()
+                .map_err(|e| anyhow!("bad knowledge cursor date {date:?}: {e}"))?,
+            message_id: message_id
+                .parse()
+                .map_err(|e| anyhow!("bad knowledge cursor message_id {message_id:?}: {e}"))?,
+        })
+    }
+
+    pub fn format(self) -> String {
+        format!("{}:{}", self.date, self.message_id)
+    }
+}
+
+/// The rolling window and the exclusive upper bound for a run that starts now.
+/// The cursor may be older than this window; the caller scans from the cursor
+/// then, so a cap-limited backlog continues on the next hourly run.
+pub fn window_plan(now: i64, window_min: i64) -> (i64, i64) {
+    let window = window_min.max(0).saturating_mul(60);
+    (now.saturating_sub(window), now)
+}
+
+/// Start of the previous local calendar day. The first per-document run must
+/// start here, not at `now - window`: the old daily job covered the previous
+/// day and the current day would otherwise be skipped at cutover.
+pub fn previous_local_day_start(now: i64, offset_min: i32) -> Result<i64> {
+    let tz = chrono::FixedOffset::east_opt(offset_min * 60)
+        .ok_or_else(|| anyhow!("bad knowledge UTC offset {offset_min}"))?;
+    let local = chrono::DateTime::from_timestamp(now, 0)
+        .ok_or_else(|| anyhow!("bad timestamp {now}"))?
+        .with_timezone(&tz)
+        .date_naive();
+    let previous = local - chrono::Duration::days(1);
+    Ok(previous
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| anyhow!("cannot resolve previous local midnight"))?
+        .and_utc()
+        .timestamp()
+        - i64::from(offset_min) * 60)
+}
+
+pub fn behind_window(cursor_date: i64, from: i64) -> bool {
+    cursor_date < from
+}
+
+/// Deduplication identity: the exact batch text and the exact target document
+/// bytes. An identical pair means the previous successful run already applied
+/// this material; a changed document must not be skipped.
+pub fn run_digest(batch_text: &str, doc_bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(batch_text.as_bytes());
+    h.update([0u8]);
+    h.update(doc_bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// Per-run scratch directory name. The slug and pid make it impossible for one
+/// document's run to remove another document's scratch directory.
+pub fn scratch_name(slug: &str, pid: u32) -> String {
+    format!("knowledge-{slug}-{pid}")
 }
 
 /// One document entry: a stable key plus its current body.
@@ -407,7 +525,8 @@ fn records(v: &Value, field: &str) -> Result<Vec<Record>> {
             return Err(anyhow!("{field}[{i}] has no key"));
         }
         let text = item
-            .get("text")
+            .get("body")
+            .or_else(|| item.get("text"))
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_string();
@@ -482,6 +601,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_body_field_from_model_schema() {
+        let raw = r#"{"web":{"ok":true,"reason":""},"discourse":[{"key":"2026-11-18-кварц-7","body":"обсуждали релиз","sources":[]}]}"#;
+        let chunk = parse_model_json(raw).unwrap();
+        assert_eq!(chunk.discourse[0].text, "обсуждали релиз");
+    }
+
+    #[test]
     fn repeated_merge_updates_instead_of_duplicating() {
         let mut doc = parse_managed(&new_document(Kind::Discourse));
         let recs = vec![rec("2026-11-05-тема", "первое тело")];
@@ -531,6 +657,69 @@ mod tests {
         assert_eq!(once, twice);
         assert!(once.contains("<!-- knowledge:begin -->"));
         assert!(once.find("просто текст без зоны").unwrap() < once.find(BEGIN).unwrap());
+    }
+
+    #[test]
+    fn slugs_and_array_fields_are_one_mapping() {
+        for kind in kinds() {
+            assert_eq!(Kind::from_slug(kind.slug()), Some(kind));
+            assert_eq!(kind.array_field(), kind.slug());
+        }
+        assert_eq!(Kind::from_slug(" unknown "), None);
+    }
+
+    #[test]
+    fn cursor_round_trips_and_rejects_garbage() {
+        let c = Cursor {
+            date: 1_800_000_000,
+            message_id: 42,
+        };
+        assert_eq!(Cursor::parse(&c.format()).unwrap(), c);
+        assert!(Cursor::parse("").is_err());
+        assert!(Cursor::parse("1795012296").is_err());
+        assert!(Cursor::parse("x:1").is_err());
+        assert!(Cursor::parse("1:y").is_err());
+    }
+
+    #[test]
+    fn window_and_behind_window_are_pure() {
+        assert_eq!(window_plan(10_000, 60), (6_400, 10_000));
+        assert!(behind_window(6_399, 6_400));
+        assert!(!behind_window(6_400, 6_400));
+        let (from, to) = window_plan(10_000, -5);
+        assert_eq!((from, to), (10_000, 10_000));
+    }
+
+    #[test]
+    fn previous_local_day_starts_at_local_midnight() {
+        let now = 1_800_000_000i64;
+        let start = previous_local_day_start(now, 180).unwrap();
+        let tz = chrono::FixedOffset::east_opt(180 * 60).unwrap();
+        let local = chrono::DateTime::from_timestamp(start, 0)
+            .unwrap()
+            .with_timezone(&tz);
+        assert_eq!(local.format("%H:%M:%S").to_string(), "00:00:00");
+        let current = chrono::DateTime::from_timestamp(now, 0)
+            .unwrap()
+            .with_timezone(&tz)
+            .date_naive();
+        assert_eq!(local.date_naive(), current - chrono::Duration::days(1));
+    }
+
+    #[test]
+    fn digest_changes_with_batch_or_document() {
+        let a = run_digest("one", b"doc");
+        assert_eq!(a, run_digest("one", b"doc"));
+        assert_ne!(a, run_digest("two", b"doc"));
+        assert_ne!(a, run_digest("one", b"changed"));
+        assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn scratch_name_is_per_document_and_process() {
+        assert_ne!(scratch_name("discourse", 1), scratch_name("persons", 1));
+        assert_ne!(scratch_name("discourse", 1), scratch_name("discourse", 2));
+        assert_eq!(scratch_name("discourse", 7), "knowledge-discourse-7");
     }
 
     #[test]

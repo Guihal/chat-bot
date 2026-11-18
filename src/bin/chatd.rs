@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
                 }
                 _ => {
                     eprintln!(
-                        "usage: chatd run|sync|summarize|knowledge [--day YYYY-MM-DD]|config --effective|watchdog [--loop]"
+                        "usage: chatd run|sync|summarize|knowledge --doc <discourse|persons|dictionary|donors|events> [--now <unix>]|config --effective|watchdog [--loop]"
                     );
                     std::process::exit(2);
                 }
@@ -288,125 +288,184 @@ fn last_assistant_text(msgs: &[Value]) -> Option<String> {
     None
 }
 
-/// One run of the daily knowledge job: read the whole calendar day, feed it to
-/// an isolated session in chunks, and merge the records into the three managed
-/// documents. Exit status is 0 only when every chunk both reached the web and
-/// produced a parseable answer; a degraded run must not look like a quiet day.
+/// One run of one document's knowledge job: read the new messages after the
+/// persisted cursor, feed them to an isolated session in chunks, and merge only
+/// this document's array. Exit status is 0 only when every chunk reached the
+/// web and produced a parseable answer; a failed chunk leaves the cursor at the
+/// last successful chunk boundary, never at the whole-batch end.
 async fn cmd_knowledge() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(2).collect();
-    let mut day_arg: Option<String> = None;
+    let mut doc_arg: Option<String> = None;
+    let mut now_arg: Option<i64> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--day" => match args.get(i + 1) {
+            "--doc" => match args.get(i + 1) {
                 Some(v) => {
-                    day_arg = Some(v.clone());
+                    doc_arg = Some(v.clone());
                     i += 2;
                 }
                 None => {
-                    eprintln!("usage: chatd knowledge [--day YYYY-MM-DD] (missing value for --day)");
+                    eprintln!("usage: chatd knowledge --doc <discourse|persons|dictionary|donors|events> [--now <unix>] (missing value for --doc)");
+                    std::process::exit(2);
+                }
+            },
+            "--now" => match args.get(i + 1) {
+                Some(v) => match v.parse::<i64>() {
+                    Ok(n) => {
+                        now_arg = Some(n);
+                        i += 2;
+                    }
+                    Err(e) => {
+                        eprintln!("usage: chatd knowledge --doc <slug> [--now <unix>] (bad --now value: {e})");
+                        std::process::exit(2);
+                    }
+                },
+                None => {
+                    eprintln!("usage: chatd knowledge --doc <slug> [--now <unix>] (missing value for --now)");
                     std::process::exit(2);
                 }
             },
             other => {
-                eprintln!("usage: chatd knowledge [--day YYYY-MM-DD] (unknown argument: {other})");
+                eprintln!("usage: chatd knowledge --doc <discourse|persons|dictionary|donors|events> [--now <unix>] (unknown argument: {other})");
                 std::process::exit(2);
             }
         }
     }
+    let Some(slug) = doc_arg else {
+        eprintln!("usage: chatd knowledge --doc <discourse|persons|dictionary|donors|events> [--now <unix>]");
+        std::process::exit(2);
+    };
+    let Some(kind) = chat_bot::knowledge::Kind::from_slug(&slug) else {
+        eprintln!("usage: chatd knowledge --doc <discourse|persons|dictionary|donors|events> (unknown document: {slug})");
+        std::process::exit(2);
+    };
+    let now = now_arg.unwrap_or_else(|| chrono::Utc::now().timestamp());
     let offset_min: i32 = cfg("CHATBOT_KNOWLEDGE_UTC_OFFSET_MIN", "180")
         .parse()
         .unwrap_or(180);
-    let tz = chrono::FixedOffset::east_opt(offset_min * 60)
-        .ok_or_else(|| anyhow!("bad CHATBOT_KNOWLEDGE_UTC_OFFSET_MIN={offset_min}"))?;
-    let today = chrono::Utc::now().with_timezone(&tz).date_naive();
-    let day = match day_arg {
-        Some(raw) => match chrono::NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d") {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("usage: chatd knowledge [--day YYYY-MM-DD] (bad --day value: {e})");
-                std::process::exit(2);
-            }
-        },
-        None => today - chrono::Duration::days(1),
-    };
-    let day_s = day.format("%Y-%m-%d").to_string();
-    let from = day
-        .and_hms_opt(0, 0, 0)
-        .ok_or_else(|| anyhow!("cannot resolve midnight of {day_s}"))?
-        .and_utc()
-        .timestamp()
-        - i64::from(offset_min) * 60;
-    let to = from + 86_400;
+    let window_min: i64 = cfg("CHATBOT_KNOWLEDGE_WINDOW_MIN", "60")
+        .parse()
+        .unwrap_or(60);
+    let cap: i64 = cfg("CHATBOT_KNOWLEDGE_MAX_MESSAGES", "600")
+        .parse()
+        .unwrap_or(600);
     let target_dir = std::path::PathBuf::from(cfg(
         "CHATBOT_KNOWLEDGE_DIR",
         &cfg("CHATBOT_CWD", "."),
     ));
     std::fs::create_dir_all(&target_dir)?;
+    let store = Store::open(&state_dir())?;
+    let cursor_key = format!("knowledge:cursor:{slug}");
+    let digest_key = format!("knowledge:digest:{slug}");
+    let raw_cursor = chat_bot::store::kv_get(&store, &cursor_key, "").await?;
+    let cursor = if raw_cursor.trim().is_empty() {
+        None
+    } else {
+        Some(chat_bot::knowledge::Cursor::parse(&raw_cursor)?)
+    };
+    let (window_from, to) = chat_bot::knowledge::window_plan(now, window_min);
+    let from = match cursor {
+        Some(c) => window_from.min(c.date),
+        None => chat_bot::knowledge::previous_local_day_start(now, offset_min)?,
+    };
     let scratch = std::path::PathBuf::from(cfg("CHATBOT_KNOWLEDGE_TMP", "/tmp"))
-        .join(format!("knowledge-{day_s}"));
+        .join(chat_bot::knowledge::scratch_name(&slug, std::process::id()));
     std::fs::create_dir_all(&scratch)?;
     let scratch_s = scratch.to_string_lossy().to_string();
+    let cursor_note = match cursor {
+        None => "first-run-backfill",
+        Some(c) if chat_bot::knowledge::behind_window(c.date, window_from) => "cursor-backfill",
+        Some(_) => "cursor",
+    };
     println!(
-        "day={day_s} window={from}..{to} offset_min={offset_min} targets={} scratch={scratch_s}",
+        "doc={slug} from={from} to={to} window_min={window_min} offset_min={offset_min} cursor={cursor_note} targets={} scratch={scratch_s}",
         target_dir.display()
     );
     let res = knowledge_run(
-        &day_s,
+        kind,
+        &slug,
+        cursor,
         from,
         to,
         &target_dir,
         &scratch_s,
         &cfg("CHATBOT_SYSTEM", "knowledge-prompt.md"),
+        &store,
+        &cursor_key,
+        &digest_key,
+        cap,
+        offset_min,
     )
     .await;
     let _ = std::fs::remove_dir_all(&scratch);
     res
 }
 
+fn local_day(ts: i64, offset_min: i32) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .and_then(|d| {
+            chrono::FixedOffset::east_opt(offset_min * 60).map(|tz| d.with_timezone(&tz))
+        })
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn knowledge_run(
-    day_s: &str,
+    kind: chat_bot::knowledge::Kind,
+    slug: &str,
+    cursor: Option<chat_bot::knowledge::Cursor>,
     from: i64,
     to: i64,
     target_dir: &std::path::Path,
     scratch: &str,
     system_path: &str,
+    store: &Store,
+    cursor_key: &str,
+    digest_key: &str,
+    cap: i64,
+    offset_min: i32,
 ) -> Result<()> {
-    let kinds = chat_bot::knowledge::kinds();
-    let paths: Vec<std::path::PathBuf> = kinds
-        .iter()
-        .map(|k| target_dir.join(k.file_name()))
-        .collect();
-    let mut docs: Vec<chat_bot::knowledge::Doc> = vec![];
-    for (kind, path) in kinds.iter().zip(&paths) {
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                chat_bot::knowledge::new_document(*kind)
-            }
-            Err(e) => return Err(anyhow!("read {}: {e}", path.display())),
-        };
-        docs.push(chat_bot::knowledge::parse_managed(&text));
-    }
-    let mut ref_hashes: Vec<String> = paths.iter().map(|p| file_hash(p)).collect();
+    let path = target_dir.join(kind.file_name());
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => chat_bot::knowledge::new_document(kind),
+        Err(e) => return Err(anyhow!("read {}: {e}", path.display())),
+    };
+    let mut doc = chat_bot::knowledge::parse_managed(&text);
+    let mut doc_bytes = text.as_bytes().to_vec();
+    let mut ref_hash = file_hash(&path);
     let budget: usize = cfg("CHATBOT_KNOWLEDGE_CHUNK_CHARS", "40000")
         .parse()
         .unwrap_or(40000);
-    let store = Store::open(&state_dir())?;
-    let session = format!("knowledge-{day_s}");
-    let mut cursor = (0i64, 0i64);
-    let mut parts: Vec<(String, usize)> = vec![];
+    let session = format!("knowledge-{slug}-{}", std::process::id());
+    let mut scan = cursor.unwrap_or_default();
+    let mut parts: Vec<(String, usize, chat_bot::knowledge::Cursor)> = vec![];
     let mut lines: Vec<String> = vec![];
     let mut used = 0usize;
     let mut messages = 0i64;
-    loop {
-        let rows = chat_bot::store::knowledge_window_of(&store, from, to, cursor.0, cursor.1, 500)
-            .await?;
+    'paging: loop {
+        let rows = chat_bot::store::knowledge_window_of(
+            store,
+            from,
+            to,
+            scan.date,
+            scan.message_id,
+            500,
+        )
+        .await?;
         if rows.is_empty() {
             break;
         }
         for (mid, date, username, first_name, text) in rows {
-            cursor = (date, mid);
+            if messages >= cap {
+                break 'paging;
+            }
+            scan = chat_bot::knowledge::Cursor {
+                date,
+                message_id: mid,
+            };
             let text = text.unwrap_or_default();
             if text.trim().is_empty() {
                 continue;
@@ -422,66 +481,99 @@ async fn knowledge_run(
             used += line.chars().count() + 1;
             lines.push(line);
             if used >= budget {
-                parts.push((lines.join("\n"), lines.len()));
+                parts.push((lines.join("\n"), lines.len(), scan));
                 lines.clear();
                 used = 0;
             }
         }
     }
-    // The last, partial chunk is real work: without this flush a quiet day
+    // The last, partial chunk is real work: without this flush a quiet hour
     // would report messages>0 but process nothing.
     if !lines.is_empty() {
-        parts.push((lines.join("\n"), lines.len()));
+        parts.push((lines.join("\n"), lines.len(), scan));
     }
+    if messages == 0 {
+        println!("doc={slug} messages=0 NO_NEW");
+        return Ok(());
+    }
+    let full_batch = parts
+        .iter()
+        .map(|p| p.0.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stored_digest = chat_bot::store::kv_get(store, digest_key, "").await?;
+    if stored_digest == chat_bot::knowledge::run_digest(&full_batch, &doc_bytes) {
+        println!("doc={slug} messages={messages} NO_NEW unchanged batch");
+        return Ok(());
+    }
+    let day = local_day(to, offset_min);
+    let mut prefix = String::new();
     let mut chunks = 0usize;
     let mut ok = 0usize;
-    let mut failed = 0usize;
-    let mut web_calls = 0usize;
-    let mut persons = 0usize;
-    for (digest, count) in parts {
+    for (batch, count, chunk_cursor) in parts {
         chunks += 1;
-        match knowledge_chunk(
-            &session,
-            scratch,
-            system_path,
-            &knowledge_prompt_text(day_s, chunks, &digest, &docs),
-        )
-        .await
-        .and_then(|(calls, chunk)| {
-            if !chunk.web_ok {
-                return Err(anyhow!("web.ok=false reason={}", chunk.web_reason));
-            }
-            web_calls += calls;
-            persons += chunk.persons.len();
-            write_chunk(&mut docs, &kinds, &paths, &mut ref_hashes, &chunk, day_s)
-        }) {
-            Ok(stats) => {
-                ok += 1;
-                println!(
-                    "chunk {chunks} messages={count} ok added={} updated={}",
-                    stats.0, stats.1
-                );
-            }
-            Err(e) => {
-                failed += 1;
-                println!("chunk {chunks} FAILED messages={count}: {e:#}");
-            }
+        let prompt = knowledge_prompt_text(
+            kind,
+            chunks,
+            &batch,
+            &chat_bot::knowledge::existing_digest(&doc, &day, 300),
+        );
+        let (calls, chunk) = knowledge_chunk(&session, scratch, system_path, &prompt).await?;
+        if !chunk.web_ok {
+            return Err(anyhow!(
+                "doc={slug} chunk={chunks} web.ok=false reason={}",
+                chunk.web_reason
+            ));
         }
+        let _ = calls;
+        let stats = write_target(
+            kind,
+            &mut doc,
+            &path,
+            &mut ref_hash,
+            chunk.records_for(kind),
+            &day,
+        )?;
+        prefix.push_str(&batch);
+        prefix.push('\n');
+        doc_bytes = std::fs::read(&path)?;
+        chat_bot::store::kv_set(store, cursor_key, &chunk_cursor.format()).await?;
+        chat_bot::store::kv_set(
+            store,
+            digest_key,
+            &chat_bot::knowledge::run_digest(&prefix, &doc_bytes),
+        )
+        .await?;
+        ok += 1;
+        println!(
+            "chunk {chunks} doc={slug} messages={count} ok added={} updated={}",
+            stats.added, stats.updated
+        );
     }
     println!(
-        "day={day_s} messages={messages} chunks={chunks} ok={ok} failed={failed} web_calls={web_calls} persons={persons} hash-guard ok"
+        "doc={slug} messages={messages} chunks={chunks} ok={ok} hash-guard=target"
     );
-    if failed > 0 {
-        return Err(anyhow!(
-            "{failed} of {chunks} chunks failed for {day_s}; the day is not closed"
-        ));
-    }
-    if persons > 0 && web_calls == 0 {
-        return Err(anyhow!(
-            "{persons} persons recorded for {day_s} but no web tool was called: the \"google who this is\" step did not run"
-        ));
-    }
     Ok(())
+}
+
+fn knowledge_prompt_text(
+    kind: chat_bot::knowledge::Kind,
+    part: usize,
+    digest: &str,
+    existing: &str,
+) -> String {
+    format!(
+        "Документ «{}» (массив `{}`), часть {part} переписки (хронологический порядок).\n\n\
+Заполняй ТОЛЬКО массив `{}`; все остальные массивы верни пустыми. Если материала для этого \
+документа нет — верни пустой массив. Сохраняй точные имена, числа и необычные токены из \
+сообщений; не заменяй их обобщением. Уже записано (ключ — что в нём уже описано):\n{existing}\n\n\
+Если содержание куска попадает в такую запись, верни ЕЁ ключ и обновлённое тело; новую \
+запись создавай только для материала, которого нет ни в одной из них.\n\nСообщения:\n{digest}\n\n\
+Ответь ТОЛЬКО JSON по схеме из системного промпта.",
+        kind.title(),
+        kind.array_field(),
+        kind.array_field()
+    )
 }
 
 fn tz_clock(ts: i64) -> String {
@@ -494,26 +586,6 @@ fn tz_clock(ts: i64) -> String {
         })
         .map(|d| d.format("%H:%M").to_string())
         .unwrap_or_default()
-}
-
-fn knowledge_prompt_text(
-    day_s: &str,
-    part: usize,
-    digest: &str,
-    docs: &[chat_bot::knowledge::Doc],
-) -> String {
-    let existing = |i: usize, n: usize| chat_bot::knowledge::existing_digest(&docs[i], day_s, n);
-    format!(
-        "День {day_s}, часть {part} переписки (хронологический порядок).\n\n\
-Уже записано (ключ — что в нём уже описано). Если содержание куска попадает в такую запись, \
-верни ЕЁ ключ и обновлённое тело; новую запись создавай только для материала, которого нет ни в одной \
-из них:\n\nдискурс:\n{}\n\nперсоны:\n{}\n\nсловарь:\n{}\n\n\
-Сообщения:\n{digest}\n\n\
-Ответь ТОЛЬКО JSON по схеме из системного промпта.",
-        existing(0, 200),
-        existing(1, 300),
-        existing(2, 300)
-    )
 }
 
 async fn knowledge_chunk(
@@ -565,41 +637,29 @@ async fn knowledge_turn(
     Ok((web_calls, chat_bot::knowledge::parse_model_json(&text)?))
 }
 
-/// Merge one chunk into the documents and write them atomically. The hash
-/// guard runs BEFORE the merge: the managed zone is ours, every byte outside
-/// it belongs to another writer, and a concurrent change must stop the run
-/// instead of being silently re-rendered away. The reference is refreshed after
-/// our own write so the next chunk compares against our own output.
-fn write_chunk(
-    docs: &mut [chat_bot::knowledge::Doc],
-    kinds: &[chat_bot::knowledge::Kind],
-    paths: &[std::path::PathBuf],
-    ref_hashes: &mut [String],
-    chunk: &chat_bot::knowledge::Chunk,
-    day_s: &str,
-) -> Result<(usize, usize)> {
-    for (i, path) in paths.iter().enumerate() {
-        let now = file_hash(path);
-        if now != ref_hashes[i] {
-            return Err(anyhow!(
-                "hash-guard: {} changed by another writer during the run",
-                path.display()
-            ));
-        }
+/// Merge one chunk into the TARGET document and write it atomically. The hash
+/// guard compares only the target path: another document's job has its own
+/// file and its own cursor, so it must neither fail nor be re-rendered here.
+fn write_target(
+    kind: chat_bot::knowledge::Kind,
+    doc: &mut chat_bot::knowledge::Doc,
+    path: &std::path::Path,
+    ref_hash: &mut String,
+    records: &[chat_bot::knowledge::Record],
+    day: &str,
+) -> Result<chat_bot::knowledge::MergeStats> {
+    let now = file_hash(path);
+    if now != *ref_hash {
+        return Err(anyhow!(
+            "hash-guard: {} changed by another writer during the run",
+            path.display()
+        ));
     }
-    let mut added = 0;
-    let mut updated = 0;
-    for (i, kind) in kinds.iter().enumerate() {
-        let stats = chat_bot::knowledge::merge(&mut docs[i], chunk.records_for(*kind), day_s);
-        added += stats.added;
-        updated += stats.updated;
-    }
-    for (i, path) in paths.iter().enumerate() {
-        let text = chat_bot::knowledge::render(&docs[i], kinds[i]);
-        write_atomic(path, &text)?;
-        ref_hashes[i] = sha256_hex(text.as_bytes());
-    }
-    Ok((added, updated))
+    let stats = chat_bot::knowledge::merge(doc, records, day);
+    let text = chat_bot::knowledge::render(doc, kind);
+    write_atomic(path, &text)?;
+    *ref_hash = sha256_hex(text.as_bytes());
+    Ok(stats)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
