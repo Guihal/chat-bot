@@ -101,10 +101,9 @@ meme_run() {
   seconds=$1
   shift
   if [ "${MEME_NO_SYSTEMD_RUN:-0}" != "1" ] && command -v systemd-run >/dev/null 2>&1; then
-    systemd-run --scope --quiet \
+    nice -n 19 systemd-run --scope --quiet \
       -p MemoryMax=512M \
       -p CPUQuota=50% \
-      -p Nice=19 \
       -- timeout "$seconds" "$@"
     return $?
   fi

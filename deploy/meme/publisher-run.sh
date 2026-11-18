@@ -2,10 +2,14 @@
 set -eu
 
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+CALLER_MEME_ENABLED=${MEME_ENABLED:-}
 if [ -f /etc/omo-chat/meme.env ]; then
   set -a
   . /etc/omo-chat/meme.env
   set +a
+fi
+if [ -n "$CALLER_MEME_ENABLED" ]; then
+  export MEME_ENABLED="$CALLER_MEME_ENABLED"
 fi
 
 . "$HERE/common.sh"
