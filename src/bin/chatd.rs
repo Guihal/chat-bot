@@ -333,8 +333,22 @@ async fn cmd_knowledge() -> Result<()> {
         }
     }
     let Some(slug) = doc_arg else {
-        eprintln!("usage: chatd knowledge --doc <discourse|persons|dictionary|donors|events> [--now <unix>]");
-        std::process::exit(2);
+        // Legacy daily job calls `chatd knowledge` without --doc. Keep that
+        // path until the live daily job is retired after the backfill: run all
+        // five per-document jobs sequentially, each with its own cursor.
+        let exe = std::env::current_exe()?;
+        for slug in ["discourse", "persons", "dictionary", "donors", "events"] {
+            let mut child = std::process::Command::new(&exe);
+            child.arg("knowledge").arg("--doc").arg(slug);
+            if let Some(now) = now_arg {
+                child.arg("--now").arg(now.to_string());
+            }
+            let status = child.status()?;
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
+        return Ok(());
     };
     let Some(kind) = chat_bot::knowledge::Kind::from_slug(&slug) else {
         eprintln!("usage: chatd knowledge --doc <discourse|persons|dictionary|donors|events> (unknown document: {slug})");
