@@ -66,17 +66,17 @@ fn parse_request(args: &Value) -> Result<Request> {
     })
 }
 
-fn is_foreign_script(c: char) -> bool {
+fn is_cyrillic(c: char) -> bool {
     matches!(c as u32,
-        0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff |
-        0xac00..=0xd7af | 0xf900..=0xfaff
+        0x0400..=0x052f | 0x2de0..=0x2dff | 0xa640..=0xa69f
     )
 }
 
 /// Telegram-facing text must be Russian. The model proved it will still leak
-/// CJK/Hangul/Kana and English words, so the daemon strips those at the single
-/// outbound owner instead of trusting the prompt. URLs and @mentions are kept
-/// verbatim: they are addresses, not prose.
+/// non-Cyrillic scripts (Latin, CJK, Arabic and others), so the daemon keeps
+/// only Cyrillic letters plus non-letter characters at the single outbound
+/// owner instead of trusting the prompt. URLs and @mentions are kept verbatim:
+/// they are addresses, not prose.
 fn strip_foreign_words(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -101,7 +101,7 @@ fn strip_foreign_words(text: &str) -> String {
             continue;
         }
         for ch in token.chars() {
-            if !ch.is_ascii_alphabetic() && !is_foreign_script(ch) {
+            if !ch.is_alphabetic() || is_cyrillic(ch) {
                 out.push(ch);
             }
         }
@@ -124,6 +124,10 @@ mod text_tests {
             "на связи, ну он же"
         );
         assert_eq!(strip_foreign_words("Вот он,黑рус будущего"), "Вот он,рус будущего");
+        assert_eq!(
+            strip_foreign_words("сборка от путина هذه раз с дробью"),
+            "сборка от путина  раз с дробью"
+        );
     }
 
     #[test]
