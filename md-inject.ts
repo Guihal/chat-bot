@@ -307,7 +307,9 @@ const RULES: Rule[] = [
     text:
       "База — живая короткая реплика в тоне чата, но содержание не режь ради лимита. Если есть что " +
       "сказать по теме — 2–4 фразы по существу: факт, пример или своё мнение. Длинный разбор — когда " +
-      "тема требует; без вступлений, канцелярита и пересказа чужого. Свои прошлые реплики не повторяй.",
+      "тема требует; без вступлений, канцелярита и пересказа чужого. Свои прошлые реплики не повторяй. " +
+      "Это правило отменяет любые прежние лимиты длины из системного промпта, включая «около 40 знаков»: " +
+      "когда есть мысль или вопрос — 2–4 содержательные фразы, без воды.",
   },
   {
     id: 6,
@@ -365,6 +367,15 @@ function bodyBytes(entry: KnowledgeEntry): number {
  * arrival, exactly one rotation document (heavy or the cwd notes file) after
  * the first. The first arrival carries everything.
  */
+// Older sessions keep their original base prompt; remove its stale brevity cap per turn.
+export function scrubOldBrevity(prompt: string): string {
+  return prompt
+    .replace(/около 40 знаков/gi, "без жёсткого лимита длины")
+    .replace(/длинный разбор только по прямой просьбе/gi, "длинный разбор — когда тема требует")
+    .replace(/одна короткая фраза 20[–-]40 знаков/gi, "2–4 содержательные фразы")
+    .replace(/короткая фраза 20[–-]40 знаков/gi, "2–4 содержательные фразы");
+}
+
 export function plan(basePrompt: string, state: PlanState, ctx: PlanContext = {}): PlanResult {
   const summarySession = ctx.summarySession ?? summarySessionName(ctx.env);
   if (isSummarySession(ctx.sessionName, summarySession)) {
@@ -485,7 +496,9 @@ export default function mdInject(pi: ExtensionApi): void {
 
       const cwd = event?.systemPromptOptions?.cwd;
       const knowledgeDir = resolveKnowledgeDir({ env: process.env, cwd });
-      const result = plan(event?.systemPrompt ?? "", state, {
+      const rawPrompt = event?.systemPrompt ?? "";
+      const basePrompt = scrubOldBrevity(rawPrompt);
+      const result = plan(basePrompt, state, {
         knowledgeDir,
         cwd,
         sessionName,
@@ -504,6 +517,7 @@ export default function mdInject(pi: ExtensionApi): void {
         paths: result.paths,
         rules: result.rules,
         rules_ids: result.rulesIds,
+        base_scrubbed: basePrompt !== rawPrompt,
         knowledge_bytes: result.knowledgeBytes,
         heavy: result.heavy,
         nonce: result.nonce,
