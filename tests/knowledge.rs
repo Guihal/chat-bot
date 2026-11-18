@@ -115,6 +115,50 @@ async fn cursor_paging_resumes_at_the_tail_without_duplicates() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn checkpoint_after_first_chunk_resumes_without_replay() {
+    let (state, store) = temp_store("checkpoint");
+    let from = 1_800_000_000i64;
+    let rows: Vec<_> = (10..15)
+        .map(|i| envelope(-100, i, i, from + i, &format!("строка-{i}")))
+        .collect();
+    chat_bot::store::commit_page(&store, rows, 15)
+        .await
+        .unwrap();
+
+    let first = chat_bot::store::knowledge_window_of(&store, from, from + 100, 0, 0, 2)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 2);
+    let last = first.last().unwrap();
+    // A second-chunk failure leaves the cursor at this committed boundary.
+    let checkpoint = (last.1, last.0);
+
+    let resumed = chat_bot::store::knowledge_window_of(
+        &store,
+        from,
+        from + 100,
+        checkpoint.0,
+        checkpoint.1,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed.len(), 3);
+    assert_eq!(resumed.first().unwrap().4.as_deref(), Some("строка-12"));
+    let first_texts: Vec<_> = first
+        .iter()
+        .map(|row| row.4.clone().unwrap_or_default())
+        .collect();
+    assert!(
+        !resumed
+            .iter()
+            .any(|row| first_texts.contains(&row.4.clone().unwrap_or_default())),
+        "the resumed window replayed a committed chunk"
+    );
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn rerun_of_the_same_keys_does_not_grow_the_document() {
     let mut doc = knowledge::parse_managed(&knowledge::new_document(Kind::Persons));
     let mut first = Record {

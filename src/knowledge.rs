@@ -180,6 +180,16 @@ pub fn run_digest(batch_text: &str, doc_bytes: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// Append one chunk to the digest text with exactly one separator between
+/// chunks and no trailing newline. Both the full-batch comparison and the
+/// per-chunk stored prefix must use this function so their bytes match.
+pub fn append_batch(prefix: &mut String, batch: &str) {
+    if !prefix.is_empty() {
+        prefix.push('\n');
+    }
+    prefix.push_str(batch);
+}
+
 /// Per-run scratch directory name. The slug and pid make it impossible for one
 /// document's run to remove another document's scratch directory.
 pub fn scratch_name(slug: &str, pid: u32) -> String {
@@ -598,6 +608,17 @@ mod tests {
             text: text.into(),
             sources: vec![],
         }
+    }
+
+    #[test]
+    fn append_batch_matches_join_without_trailing_newline() {
+        let parts = ["первый", "второй", "третий"];
+        let mut acc = String::new();
+        for part in parts {
+            append_batch(&mut acc, part);
+        }
+        assert_eq!(acc, parts.join("\n"));
+        assert!(!acc.ends_with('\n'));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use chat_bot::knowledge::{self, Kind};
 use chat_bot::store::{self, Store};
 use chat_bot::{Envelope, MessageId, MessageKey};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -30,6 +31,21 @@ fn copy_profile(source: &Path, target: &Path) {
             std::fs::copy(&from, target.join(name)).unwrap();
         }
     }
+}
+
+/// The stand is the bot's production model, not the task-gate model. Pin it
+/// explicitly so a copied profile without settings.json cannot inherit the
+/// gate provider/model.
+fn pin_stand_model(agent: &Path) {
+    let path = agent.join("settings.json");
+    let mut value: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    value["defaultProvider"] = json!("opencode-go");
+    value["defaultModel"] = json!("hy4-flash-free");
+    value["defaultThinkingLevel"] = json!("low");
+    std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
 }
 
 fn message(chat: i64, message_id: i64, update_id: i64, date: i64, text: &str) -> Envelope {
@@ -91,6 +107,7 @@ async fn per_document_knowledge_uses_the_real_model_and_dedupes() {
     std::fs::create_dir_all(root.join("knowledge")).unwrap();
     std::fs::create_dir_all(root.join("tmp")).unwrap();
     copy_profile(&profile, &root.join("agent"));
+    pin_stand_model(&root.join("agent"));
 
     let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/stand_assets/knowledge");
     for kind in knowledge::kinds() {
@@ -195,6 +212,7 @@ async fn per_document_knowledge_uses_the_real_model_and_dedupes() {
     std::fs::create_dir_all(dictionary_root.join("knowledge")).unwrap();
     std::fs::create_dir_all(dictionary_root.join("tmp")).unwrap();
     copy_profile(&profile, &dictionary_root.join("agent"));
+    pin_stand_model(&dictionary_root.join("agent"));
     let dictionary = dictionary_root
         .join("knowledge")
         .join(Kind::Dictionary.file_name());

@@ -262,30 +262,33 @@ async fn summarize_prompt(sid: &str, sock: &str, digest: &str) -> Result<()> {
     Ok(())
 }
 
-/// Text of the newest assistant message among `--messages` rows. Only the
-/// LAST assistant message counts: earlier ones belong to other turns.
-fn last_assistant_text(msgs: &[Value]) -> Option<String> {
-    for m in msgs.iter().rev() {
-        if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
-            continue;
-        }
-        let mut texts = vec![];
-        if let Some(content) = m.get("content").and_then(|v| v.as_array()) {
-            for c in content {
-                if c.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
-                        if !t.is_empty() {
-                            texts.push(t.to_string());
-                        }
+fn assistant_message_text(m: &Value) -> Option<String> {
+    if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+        return None;
+    }
+    let mut texts = vec![];
+    if let Some(content) = m.get("content").and_then(|v| v.as_array()) {
+        for c in content {
+            if c.get("type").and_then(|v| v.as_str()) == Some("text") {
+                if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
+                    if !t.is_empty() {
+                        texts.push(t.to_string());
                     }
                 }
             }
         }
-        if !texts.is_empty() {
-            return Some(texts.join("\n"));
-        }
     }
-    None
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n"))
+    }
+}
+
+/// Text of the newest assistant message among `--messages` rows. Only the
+/// LAST assistant message counts: earlier ones belong to other turns.
+fn last_assistant_text(msgs: &[Value]) -> Option<String> {
+    msgs.iter().rev().find_map(assistant_message_text)
 }
 
 /// One run of one document's knowledge job: read the new messages after the
@@ -510,11 +513,12 @@ async fn knowledge_run(
         println!("doc={slug} messages=0 NO_NEW");
         return Ok(());
     }
-    let full_batch = parts
-        .iter()
-        .map(|p| p.0.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Compare and store exactly the same text: one '\n' between chunks,
+    // never a trailing newline.
+    let mut full_batch = String::new();
+    for part in &parts {
+        chat_bot::knowledge::append_batch(&mut full_batch, &part.0);
+    }
     let stored_digest = chat_bot::store::kv_get(store, digest_key, "").await?;
     if stored_digest == chat_bot::knowledge::run_digest(&full_batch, &doc_bytes) {
         println!("doc={slug} messages={messages} NO_NEW unchanged batch");
@@ -548,8 +552,7 @@ async fn knowledge_run(
             chunk.records_for(kind),
             &day,
         )?;
-        prefix.push_str(&batch);
-        prefix.push('\n');
+        chat_bot::knowledge::append_batch(&mut prefix, &batch);
         doc_bytes = std::fs::read(&path)?;
         chat_bot::store::kv_set(store, cursor_key, &chunk_cursor.format()).await?;
         chat_bot::store::kv_set(
@@ -625,7 +628,7 @@ async fn knowledge_wait(sid: &str, sock: &str) -> Result<Value> {
 
 async fn knowledge_messages(sid: &str, sock: &str) -> Result<Vec<Value>> {
     let data = omo_on(
-        &["read", sid, "--tail", "10", "--messages"],
+        &["read", sid, "--tail", "50", "--messages"],
         Duration::from_secs(60),
         sock,
     )
@@ -645,6 +648,27 @@ fn knowledge_answer(msgs: &[Value]) -> (usize, Option<String>) {
     (web_calls, last_assistant_text(msgs))
 }
 
+fn assistant_texts_after_last_user(msgs: &[Value]) -> Vec<String> {
+    let start = match msgs
+        .iter()
+        .rposition(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+    {
+        Some(i) => i + 1,
+        None => return vec![],
+    };
+    msgs[start..]
+        .iter()
+        .filter_map(assistant_message_text)
+        .collect()
+}
+
+fn knowledge_parse_any(msgs: &[Value]) -> Option<chat_bot::knowledge::Chunk> {
+    assistant_texts_after_last_user(msgs)
+        .iter()
+        .rev()
+        .find_map(|text| chat_bot::knowledge::parse_model_json(text).ok())
+}
+
 async fn knowledge_turn(
     sid: &str,
     sock: &str,
@@ -653,33 +677,42 @@ async fn knowledge_turn(
     knowledge_wait(sid, sock).await?;
     omo_on(&["prompt", sid, prompt], Duration::from_secs(120), sock).await?;
     knowledge_wait(sid, sock).await?;
-    let msgs = knowledge_messages(sid, sock).await?;
-    let (mut web_calls, mut text) = knowledge_answer(&msgs);
+    let mut msgs = knowledge_messages(sid, sock).await?;
+    let (mut web_calls, _) = knowledge_answer(&msgs);
 
     // A provider can stop right after a tool result with an empty assistant
-    // message (`content: []`, stopReason stop). That is not an answer and must
-    // not abort an hourly job before its document write: ask once for the
-    // required JSON in the same session instead of starting over.
-    if text.is_none() {
-        omo_on(
-            &[
-                "prompt",
-                sid,
-                "Ты не вернул ответ. Верни ТОЛЬКО JSON по схеме из системного промпта и ничего больше. Не вызывай инструменты.",
-            ],
-            Duration::from_secs(120),
-            sock,
-        )
-        .await?;
-        knowledge_wait(sid, sock).await?;
-        let msgs = knowledge_messages(sid, sock).await?;
-        let (more_calls, more_text) = knowledge_answer(&msgs);
-        web_calls += more_calls;
-        text = more_text;
+    // message or emit tool-call markup instead of JSON. Neither is an answer:
+    // ask once for the required JSON in the same session before aborting an
+    // hourly job. Accept any parseable JSON among this turn's assistant texts,
+    // not only the newest one.
+    if let Some(chunk) = knowledge_parse_any(&msgs) {
+        return Ok((web_calls, chunk));
     }
 
-    let text = text.ok_or_else(|| anyhow!("session produced no assistant message after retry"))?;
-    Ok((web_calls, chat_bot::knowledge::parse_model_json(&text)?))
+    omo_on(
+        &[
+            "prompt",
+            sid,
+            "Ты не вернул ответ. Верни ТОЛЬКО JSON по схеме из системного промпта и ничего больше. Не вызывай инструменты.",
+        ],
+        Duration::from_secs(120),
+        sock,
+    )
+    .await?;
+    knowledge_wait(sid, sock).await?;
+    msgs = knowledge_messages(sid, sock).await?;
+    let (more_calls, _) = knowledge_answer(&msgs);
+    web_calls += more_calls;
+
+    if let Some(chunk) = knowledge_parse_any(&msgs) {
+        return Ok((web_calls, chunk));
+    }
+
+    let sample = last_assistant_text(&msgs).unwrap_or_default();
+    Err(anyhow!(
+        "model answer has no JSON object after retry: {}",
+        sample.chars().take(200).collect::<String>()
+    ))
 }
 
 /// Merge one chunk into the TARGET document and write it atomically. The hash
