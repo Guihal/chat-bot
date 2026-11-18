@@ -1,0 +1,10 @@
+{
+  "defaultProvider": "opencode-go",
+  "defaultModel": "hy4-flash-free",
+  "defaultThinkingLevel": "low",
+  "disabledBuiltinExtensions": ["compaction", "ttsr"],
+  "todo": {
+    "firstTurnPlan": "off",
+    "turnEndBackstop": false
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "meme-publisher-extension",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}

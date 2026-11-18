@@ -1,0 +1,29 @@
+{
+  "providers": {
+    "opencode-go": {
+      "models": [
+        {
+          "id": "hy4-flash-free",
+          "name": "Hy4 flash Free",
+          "api": "openai-completions",
+          "baseUrl": "https://opencode.ai/inference/go/openai/v1",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 400000,
+          "maxTokens": 65536,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "compat": {
+            "supportsDeveloperRole": false,
+            "maxTokensField": "max_tokens"
+          },
+          "defaultThinkingLevel": "low"
+        }
+      ]
+    }
+  }
+}
