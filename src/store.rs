@@ -252,6 +252,7 @@ pub fn stored_row(con: &Connection, prep: &PreparedMessage) -> Result<StoredRow>
             file_id,
             media_kind,
             thumb_path: String::new(),
+            sender_chat,
             to_me: false,
         }),
     })
@@ -264,7 +265,7 @@ pub async fn store_prepared(store: &Store, prep: PreparedMessage) -> Result<Stor
 /// The newest `n` messages, newest first.
 pub fn recent_rows(con: &Connection, n: i64) -> Result<Vec<RecentRow>> {
     let mut stmt = con.prepare_cached(
-        "SELECT message_id,user_id,username,first_name,text,media_path,media_kind,file_id FROM messages ORDER BY date DESC, message_id DESC LIMIT ?",
+        "SELECT message_id,user_id,username,first_name,text,media_path,media_kind,file_id,sender_chat FROM messages ORDER BY date DESC, message_id DESC LIMIT ?",
     )?;
     let rows: Vec<RecentRow> = stmt
         .query_map([n], |r| {
@@ -277,6 +278,7 @@ pub fn recent_rows(con: &Connection, n: i64) -> Result<Vec<RecentRow>> {
                 r.get(5)?,
                 r.get(6)?,
                 r.get(7)?,
+                r.get(8)?,
             ))
         })?
         .flatten()
@@ -479,9 +481,10 @@ pub fn batch_rows_by_ids(con: &Connection, ids: &[Value]) -> Result<Vec<BatchMsg
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<i64>,
         )> = con
             .prepare_cached(
-                "SELECT message_id,date,user_id,username,first_name,text,reply_to,media_path,media_kind,file_id FROM messages WHERE message_id=? LIMIT 1",
+                "SELECT message_id,date,user_id,username,first_name,text,reply_to,media_path,media_kind,file_id,sender_chat FROM messages WHERE message_id=? LIMIT 1",
             )
             .and_then(|mut stmt| {
                 stmt.query_row([mid_int], |r| {
@@ -496,11 +499,12 @@ pub fn batch_rows_by_ids(con: &Connection, ids: &[Value]) -> Result<Vec<BatchMsg
                         r.get(7)?,
                         r.get(8)?,
                         r.get(9)?,
+                        r.get(10)?,
                     ))
                 })
             })
             .ok();
-        if let Some((m, d, u, un, f, t, r, mp, kind, fid)) = row {
+        if let Some((m, d, u, un, f, t, r, mp, kind, fid, sc)) = row {
             out.push(BatchMsg {
                 message_id: m.unwrap_or(mid_int),
                 date: d.unwrap_or(0),
@@ -513,6 +517,7 @@ pub fn batch_rows_by_ids(con: &Connection, ids: &[Value]) -> Result<Vec<BatchMsg
                 media_kind: kind.unwrap_or_default(),
                 file_id: fid.unwrap_or_default(),
                 thumb_path: String::new(),
+                sender_chat: sc,
                 to_me: false,
             });
         }

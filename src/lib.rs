@@ -372,6 +372,7 @@ impl Envelope {
             file_id: self.file_id.clone(),
             media_kind: self.media_kind.clone(),
             thumb_path: String::new(),
+            sender_chat: self.sender_chat,
             to_me: false,
         }
     }
@@ -410,6 +411,10 @@ pub struct BatchMsg {
     /// A video never reaches the model as bytes on this wire, so this path is
     /// the only part of it the model can actually look at.
     pub thumb_path: String,
+    /// Telegram `sender_chat.id`: set on the group copy of a linked channel
+    /// post, where `user_id` is Telegram's 777000 service account. It lets the
+    /// renderer recognise the bot's own channel posts.
+    pub sender_chat: Option<i64>,
     pub to_me: bool,
 }
 
@@ -1372,6 +1377,7 @@ pub type RecentRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<i64>,
 );
 
 /// Render the context block from recent rows (owned by the data layer).
@@ -1384,7 +1390,7 @@ pub fn render_recent_context(
     answered: &HashSet<i64>,
 ) -> String {
     let mut blocks = vec![];
-    for (mid, uid, user, first, text, media, media_kind, file_id) in rows.iter().rev() {
+    for (mid, uid, user, first, text, media, media_kind, file_id, sender_chat) in rows.iter().rev() {
         if let Some(m) = mid {
             if batch_ids.contains(m) {
                 continue;
@@ -1399,7 +1405,7 @@ pub fn render_recent_context(
         } else {
             who
         };
-        let mark = if self_id != 0 && *uid == Some(self_id) {
+        let mark = if crate::context::is_own_author(self_id, *uid, *sender_chat) {
             " [это написал ты сам]"
         } else {
             " [фон чата]"
@@ -2187,6 +2193,7 @@ mod tests {
             media_kind: String::new(),
             file_id: String::new(),
             thumb_path: String::new(),
+            sender_chat: None,
             to_me: false,
         };
         let mut exact = fresh.clone();
@@ -2223,10 +2230,56 @@ mod tests {
             media_kind: "".into(),
             file_id: "".into(),
             thumb_path: String::new(),
+            sender_chat: None,
             to_me: true,
         }];
         let s = crate::context::render_batch(&b, &HashMap::new());
         assert!(s.contains("[1] @u: [к тебе] hi"));
+    }
+
+    #[test]
+    fn history_marks_own_channel_posts() {
+        let self_id = 9_287_666_466i64;
+        let rows: Vec<RecentRow> = vec![
+            (
+                Some(1),
+                Some(777_000),
+                Some("Telegram".into()),
+                Some("Telegram".into()),
+                Some("мой мем".into()),
+                None,
+                None,
+                None,
+                Some(crate::context::OWN_CHANNEL_ID),
+            ),
+            (
+                Some(2),
+                Some(7),
+                Some("u".into()),
+                Some("U".into()),
+                Some("чужое".into()),
+                None,
+                None,
+                None,
+                None,
+            ),
+        ];
+        let text = render_recent_context(
+            &rows,
+            &HashSet::new(),
+            50,
+            300,
+            self_id,
+            &HashSet::new(),
+        );
+        assert!(
+            text.contains("[1] @Telegram [это написал ты сам]: мой мем"),
+            "own channel post is not marked: {text}"
+        );
+        assert!(
+            text.contains("[2] @u [фон чата]: чужое"),
+            "ambient history is not marked: {text}"
+        );
     }
 
     #[test]
@@ -2392,6 +2445,7 @@ mod tests {
             media_kind: "".into(),
             file_id: "".into(),
             thumb_path: String::new(),
+            sender_chat: None,
             to_me: true,
         }
     }
@@ -2892,6 +2946,7 @@ mod dedupe_channel_posts_tests {
             media_kind: String::new(),
             file_id: String::new(),
             thumb_path: String::new(),
+            sender_chat: None,
             to_me: false,
         }
     }

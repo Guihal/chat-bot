@@ -122,6 +122,23 @@ pub struct BuiltContext {
 /// message the model can see, including the history block and the gif catalog.
 const BATCH_HEADER: &str = "Пачка: сообщения этой доставки. [к тебе] — обращение к тебе; [в чате] — разговор не с тобой; [это написал ты сам] — твой собственный пост. Не каждое сообщение адресовано тебе. Отвечаешь своими словами обычным сообщением — или не отвечаешь вовсе: это твоё решение, а не сбой. Чужое не цитируешь: ни реплаем, ни в кавычках, ни пересказом.";
 
+/// The bot's own channel. A linked channel post reaches the chat twice: the
+/// channel copy has this negative id as `user_id`, and the group copy has
+/// Telegram's 777000 service account with this id in `sender_chat`.
+pub(crate) const OWN_CHANNEL_ID: i64 = -1004421941006;
+
+/// True when a row is authored by the bot itself or by its own channel.
+pub(crate) fn is_own_author(
+    self_id: i64,
+    user_id: Option<i64>,
+    sender_chat: Option<i64>,
+) -> bool {
+    self_id != 0
+        && (user_id == Some(self_id)
+            || user_id == Some(OWN_CHANNEL_ID)
+            || sender_chat == Some(OWN_CHANNEL_ID))
+}
+
 pub(crate) fn display_who(username: &str, first_name: &str, user_id: Option<i64>) -> String {
     if !username.is_empty() {
         format!("@{username}")
@@ -265,7 +282,7 @@ pub fn render_batch_blocks(blocks: &[BatchBlock], self_id: i64) -> String {
         let m = &block.message;
         let who = display_who(&m.username, &m.first_name, m.user_id);
         let mut head = format!("[{}] {}:", m.message_id, who);
-        if self_id != 0 && m.user_id == Some(self_id) {
+        if is_own_author(self_id, m.user_id, m.sender_chat) {
             head.push_str(" [это написал ты сам]");
         } else if m.to_me {
             head.push_str(" [к тебе]");
@@ -381,6 +398,7 @@ mod tests {
             media_kind: String::new(),
             file_id: String::new(),
             thumb_path: String::new(),
+            sender_chat: None,
             to_me: false,
         }
     }
@@ -597,6 +615,9 @@ mod tests {
         own.user_id = Some(42);
         let mut other = msg(2, "чужое", None);
         other.user_id = Some(7);
+        let mut channel = msg(3, "мой канал", None);
+        channel.user_id = Some(777_000);
+        channel.sender_chat = Some(OWN_CHANNEL_ID);
         let blocks = vec![
             BatchBlock {
                 message: own,
@@ -604,6 +625,10 @@ mod tests {
             },
             BatchBlock {
                 message: other,
+                edge: ReplyEdge::None,
+            },
+            BatchBlock {
+                message: channel,
                 edge: ReplyEdge::None,
             },
         ];
@@ -615,6 +640,10 @@ mod tests {
         assert!(
             rendered.contains("[2] @u: [в чате] чужое"),
             "ambient message is not marked: {rendered}"
+        );
+        assert!(
+            rendered.contains("[3] @u: [это написал ты сам] мой канал"),
+            "own channel post is not marked: {rendered}"
         );
     }
 

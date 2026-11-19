@@ -3171,6 +3171,7 @@ mod channel_twin_tests {
             media_kind: String::new(),
             file_id: String::new(),
             thumb_path: String::new(),
+            sender_chat: None,
             to_me: false,
         }
     }
