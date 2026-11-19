@@ -16,7 +16,7 @@ export MEME_SOURCES_PATH="${MEME_SOURCES_PATH:-$MEME_ROOT/meme-sources.md}"
 PROMPT=$(cat "$HERE/publisher-prompt.md")
 
 set +e
-meme_run "${MEME_PUBLISHER_TIMEOUT:-240}" \
+meme_run "${MEME_PUBLISHER_TIMEOUT:-420}" \
   "$OMO_BIN" -p "$PROMPT" \
   --provider opencode-go \
   --model hy4-flash-free \

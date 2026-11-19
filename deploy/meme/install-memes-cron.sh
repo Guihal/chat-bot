@@ -45,8 +45,8 @@ if now.tzinfo is None:
 now = now.astimezone(datetime.timezone.utc)
 
 roles = [
-    ("discovery", 60, 300, 47),
-    ("publisher", 120, 240, 7),
+    ("discovery", 60, 600, 47),
+    ("publisher", 120, 420, 7),
 ]
 for role, minutes, timeout, minute in roles:
     log_dir = os.path.join(root, "logs", f"meme-{role}")
