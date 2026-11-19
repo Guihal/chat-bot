@@ -137,8 +137,9 @@ meme_run() {
   seconds=$1
   shift
   if [ "${MEME_NO_SYSTEMD_RUN:-0}" != "1" ] && command -v systemd-run >/dev/null 2>&1; then
+    # 1G leaves headroom over the measured ~487 MiB no-model peak; 512M risked OOM.
     nice -n 19 systemd-run --scope --quiet \
-      -p MemoryMax=512M \
+      -p MemoryMax=1G \
       -p CPUQuota=50% \
       -- timeout "$seconds" "$@"
     return $?
