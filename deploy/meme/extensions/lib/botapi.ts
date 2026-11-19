@@ -136,8 +136,10 @@ export async function sendMedia(candidate: Candidate): Promise<SendResult> {
 	}
 	const caption = captionFor(candidate);
 	if (caption.length > 1024) throw new Error("caption exceeds 1024 characters");
+	const fields: Record<string, string> = { chat_id: String(TARGET_CHAT_ID) };
+	if (caption) fields.caption = caption;
 	const multipart = buildMultipart(
-		{ chat_id: String(TARGET_CHAT_ID), caption },
+		fields,
 		field,
 		candidate.media.path,
 		candidate.media.mime,

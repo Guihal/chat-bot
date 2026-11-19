@@ -925,9 +925,9 @@ fn history_window_only_at_session_start_and_after_compact() {
     queue_text(&api, 5001, "turn one question");
     let p1 = read_push(&mut reader, &daemon, 30);
     let t1 = push_text(&p1);
-    assert!(t1.contains("[5001] @smoker: turn one question"), "batch missing: {t1}");
+    assert!(t1.contains("[5001] @smoker: [в чате] turn one question"), "batch missing: {t1}");
     assert!(
-        t1.contains("[4800] @smoker: seeded gif caption"),
+        t1.contains("[4800] @smoker [фон чата]: seeded gif caption"),
         "no history window on the first turn of a session: {t1}"
     );
     accept_push(&stream, &p1);
@@ -940,13 +940,13 @@ fn history_window_only_at_session_start_and_after_compact() {
     queue_text(&api, 5002, "turn two question");
     let p2 = read_push(&mut reader, &daemon, 30);
     let t2 = push_text(&p2);
-    assert!(t2.contains("[5002] @smoker: turn two question"), "batch missing: {t2}");
+    assert!(t2.contains("[5002] @smoker: [в чате] turn two question"), "batch missing: {t2}");
     assert!(
-        !t2.contains("[4800] @smoker:"),
+        !t2.contains("[4800] @smoker [фон чата]:"),
         "history window repeated in an ordinary turn: {t2}"
     );
     assert!(
-        !t2.contains("[5001] @smoker:"),
+        !t2.contains("[5001] @smoker"),
         "the previous turn was repeated as history: {t2}"
     );
     accept_push(&stream, &p2);
@@ -961,9 +961,9 @@ fn history_window_only_at_session_start_and_after_compact() {
     queue_text(&api, 5003, "turn three question");
     let p3 = read_push(&mut reader, &daemon, 30);
     let t3 = push_text(&p3);
-    assert!(t3.contains("[5003] @smoker: turn three question"), "{t3}");
+    assert!(t3.contains("[5003] @smoker: [в чате] turn three question"), "{t3}");
     assert!(
-        t3.contains("[4800] @smoker:") && t3.contains("[5001] @smoker:"),
+        t3.contains("[4800] @smoker [фон чата]:") && t3.contains("[5001] @smoker [фон чата]:"),
         "no history window on the turn after a compaction: {t3}"
     );
     accept_push(&stream, &p3);
@@ -979,9 +979,9 @@ fn history_window_only_at_session_start_and_after_compact() {
     queue_text(&api, 5004, "turn four question");
     let p4 = read_push(&mut reader, &daemon, 30);
     let t4 = push_text(&p4);
-    assert!(t4.contains("[5004] @smoker: turn four question"), "{t4}");
+    assert!(t4.contains("[5004] @smoker: [в чате] turn four question"), "{t4}");
     assert!(
-        !t4.contains("[4800] @smoker:") && !t4.contains("[5003] @smoker:"),
+        !t4.contains("[4800] @smoker [фон чата]:") && !t4.contains("[5003] @smoker"),
         "the post-compact window was never retired: {t4}"
     );
     accept_push(&stream, &p4);
@@ -1018,7 +1018,7 @@ fn retry_keeps_the_window_when_the_document_changed() {
     let p1 = read_push(&mut reader, &daemon, 30);
     let t1 = push_text(&p1);
     assert!(
-        t1.contains("[4800] @smoker: seeded gif caption"),
+        t1.contains("[4800] @smoker [фон чата]: seeded gif caption"),
         "the first turn of the session had no history window: {t1}"
     );
     accept_push(&stream, &p1);
@@ -1044,11 +1044,11 @@ fn retry_keeps_the_window_when_the_document_changed() {
     let t2 = push_text(&p2);
     assert!(t2.contains("attempt one question"), "{t2}");
     assert!(
-        t2.contains("[5401] @smoker: arrived meanwhile"),
+        t2.contains("[5401] @smoker [фон чата]: arrived meanwhile"),
         "the document did not change between the attempts: {t2}"
     );
     assert!(
-        t2.contains("[4800] @smoker: seeded gif caption"),
+        t2.contains("[4800] @smoker [фон чата]: seeded gif caption"),
         "the retry dropped the history window: {t2}"
     );
     assert_eq!(
@@ -1083,7 +1083,7 @@ fn single_window_despite_pending_redelivery() {
     queue_text(&api, 5500, "opening question");
     let p1 = read_push(&mut reader, &daemon, 30);
     assert!(
-        push_text(&p1).contains("[4800] @smoker: seeded gif caption"),
+        push_text(&p1).contains("[4800] @smoker [фон чата]: seeded gif caption"),
         "no window at session start: {}",
         push_text(&p1)
     );
@@ -1102,7 +1102,7 @@ fn single_window_despite_pending_redelivery() {
     let t2 = push_text(&p2);
     assert!(t2.contains("unproven question"), "{t2}");
     assert!(
-        !t2.contains("[4800] @smoker:"),
+        !t2.contains("[4800] @smoker [фон чата]:"),
         "an ordinary turn repeated the history window: {t2}"
     );
     accept_push(&stream, &p2);
@@ -1126,7 +1126,7 @@ fn single_window_despite_pending_redelivery() {
     let t3 = push_text(&p3);
     assert!(t3.contains("unproven question"), "{t3}");
     assert!(
-        t3.contains("[4800] @smoker: seeded gif caption"),
+        t3.contains("[4800] @smoker [фон чата]: seeded gif caption"),
         "the post-compaction rebuild carried no window: {t3}"
     );
     assert_eq!(
@@ -1149,7 +1149,7 @@ fn single_window_despite_pending_redelivery() {
     let t4 = push_text(&p4);
     assert!(t4.contains("after the compact"), "{t4}");
     assert!(
-        !t4.contains("[4800] @smoker:") && !t4.contains("unproven question"),
+        !t4.contains("[4800] @smoker [фон чата]:") && !t4.contains("unproven question"),
         "the post-compact window was not retired: {t4}"
     );
     accept_push(&stream, &p4);
@@ -1300,7 +1300,7 @@ fn media_heal_recreates_with_history_in_the_new_session() {
     let t2 = push_text(&p2);
     accept_push(&stream, &p2);
     assert!(
-        t2.contains("[4800] @smoker: seeded gif caption"),
+        t2.contains("[4800] @smoker [фон чата]: seeded gif caption"),
         "the healed session started without its history: {t2}"
     );
     let log = chatd_log(&daemon);

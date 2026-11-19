@@ -189,11 +189,12 @@ test("discovery tools have no send capability and save once", async () => {
 	expect(JSON.parse(duplicate.content[0].text).status).toBe("duplicate");
 });
 
-test("caption stays within one total budget including attribution", () => {
+test("caption stays within budget and has no source attribution", () => {
 	const candidate = storage.readCandidate("catmodernews__101");
 	const caption = common.captionFor({ ...candidate, text: "я".repeat(3000) });
 	expect(caption.length).toBeLessThanOrEqual(1024);
-	expect(caption).toContain("источник:");
+	expect(caption).not.toContain("источник:");
+	expect(common.captionFor({ ...candidate, text: "   " })).toBe("");
 });
 
 test("publisher sends exactly one multipart to the fixed channel", async () => {
@@ -213,10 +214,32 @@ test("publisher sends exactly one multipart to the fixed channel", async () => {
 	expect(bodyText).toContain('name="chat_id"');
 	expect(bodyText).toContain("-1004421941006");
 	expect(bodyText).toContain('name="caption"');
-	expect(bodyText).toContain("источник:");
+	expect(bodyText).toContain("кот и кварц");
+	expect(bodyText).not.toContain("источник:");
 	expect(lastMultipart.includes(png)).toBe(true);
 	const again = await tools.get("meme_publish").execute("t5", { candidate_id: id });
 	if (!again.isError) throw new Error("second publish must be refused");
+});
+
+test("empty caption omits the multipart caption field", async () => {
+	const discovery = toolsOf(discoveryModule.default);
+	const saved = await discovery.get("meme_candidate_save").execute("t-empty", {
+		source: "catmodernews",
+		post_id: "103",
+		text: "   ",
+		media_url: `http://127.0.0.1:${port}/media/video-frame-42.png`,
+		media_kind: "photo",
+		why_funny: "число 42 на кадре",
+	});
+	const payload = JSON.parse(saved.content[0].text);
+	if (payload.status !== "saved") throw new Error(`empty-caption candidate not saved`);
+	const publisher = toolsOf(publisherModule.default);
+	const published = await publisher
+		.get("meme_publish")
+		.execute("t-empty-pub", { candidate_id: payload.candidate.id });
+	expect(JSON.parse(published.content[0].text).status).toBe("published");
+	const bodyText = lastMultipart.toString("utf8");
+	expect(bodyText).not.toContain('name="caption"');
 });
 
 test("daily cap blocks a second publish", async () => {

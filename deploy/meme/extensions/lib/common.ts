@@ -168,11 +168,9 @@ export async function downloadBounded(rawUrl: string, maxBytes: number): Promise
 }
 
 export function captionFor(candidate: Candidate): string {
-	const attribution = `\n\nисточник: https://t.me/${candidate.source}/${candidate.source_post_id}`;
-	const limit = Math.max(1, 1024 - attribution.length);
-	let text = String(candidate.text || "").trim() || "мем";
-	if (text.length > limit) text = `${text.slice(0, Math.max(1, limit - 1))}…`;
-	return `${text}${attribution}`.slice(0, 1024);
+	const text = String(candidate.text || "").trim();
+	if (!text) return "";
+	return text.length > 1024 ? `${text.slice(0, 1023)}…` : text;
 }
 
 export function appendLedger(record: LedgerRecord): void {

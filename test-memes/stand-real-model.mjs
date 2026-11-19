@@ -257,7 +257,7 @@ async function main() {
 	assert(state.sends.at(-1)?.method === "sendVideo", `publisher used ${state.sends.at(-1)?.method}, not sendVideo`);
 	assert(bodyText.includes("-1004421941006"), `multipart does not target the fixed channel`);
 	assert(bodyText.includes('name="caption"'), `multipart has no caption`);
-	assert(bodyText.includes("источник:"), `caption has no source attribution`);
+	assert(!bodyText.includes("источник:"), `caption still has source attribution`);
 	assert(state.lastMultipart.includes(mp4), `multipart does not contain the saved MP4 bytes`);
 	const published = readCandidates().find((row) => row.id === candidate.id);
 	assert(published?.status === "published", `candidate was not marked published`);

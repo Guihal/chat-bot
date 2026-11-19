@@ -1400,9 +1400,9 @@ pub fn render_recent_context(
             who
         };
         let mark = if self_id != 0 && *uid == Some(self_id) {
-            " [моё]"
+            " [это написал ты сам]"
         } else {
-            ""
+            " [фон чата]"
         };
         let mut head = format!("[{}] {}{}:", mid.unwrap_or(0), who, mark);
         if mid.map(|m| answered.contains(&m)).unwrap_or(false) {
@@ -1439,7 +1439,7 @@ pub fn render_recent_context(
         return String::new();
     }
     format!(
-        "Контекст чата (последние {}):\n{}",
+        "Контекст чата (фон, последние {}):\n{}",
         tail.len(),
         tail.join("\n")
     )

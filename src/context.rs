@@ -47,6 +47,7 @@ pub struct ContextDocument {
     pub guard: String,
     pub catalog: String,
     pub batch: Vec<BatchBlock>,
+    pub self_id: i64,
 }
 
 /// Everything the document needs, read in one pass before assembly.
@@ -119,7 +120,7 @@ pub struct BuiltContext {
 /// reads each turn, so it must match the send contract. Replies are NOT
 /// restricted to this batch (owner, 2026-11-08, twice) — a quote may name any
 /// message the model can see, including the history block and the gif catalog.
-const BATCH_HEADER: &str = "Пачка: сообщения этой доставки. Отвечаешь своими словами обычным сообщением — или не отвечаешь вовсе: это твоё решение, а не сбой. Чужое не цитируешь: ни реплаем, ни в кавычках, ни пересказом.";
+const BATCH_HEADER: &str = "Пачка: сообщения этой доставки. [к тебе] — обращение к тебе; [в чате] — разговор не с тобой; [это написал ты сам] — твой собственный пост. Не каждое сообщение адресовано тебе. Отвечаешь своими словами обычным сообщением — или не отвечаешь вовсе: это твоё решение, а не сбой. Чужое не цитируешь: ни реплаем, ни в кавычках, ни пересказом.";
 
 pub(crate) fn display_who(username: &str, first_name: &str, user_id: Option<i64>) -> String {
     if !username.is_empty() {
@@ -233,6 +234,7 @@ pub fn assemble(snapshot: Snapshot) -> ContextDocument {
         guard: snapshot.guard,
         catalog: catalog::render_prompt(&snapshot.catalog),
         batch,
+        self_id: snapshot.self_id,
     }
 }
 
@@ -247,14 +249,14 @@ pub fn render_document(doc: &ContextDocument) -> String {
     if !doc.catalog.is_empty() {
         parts.push(doc.catalog.clone());
     }
-    parts.push(render_batch_blocks(&doc.batch));
+    parts.push(render_batch_blocks(&doc.batch, doc.self_id));
     parts.join("\n")
 }
 
 /// The batch renderer. The reply marker comes from the pre-resolved edge, so a
 /// parent outside the window cannot sneak text in and a missing parent cannot
 /// acquire invented text.
-pub fn render_batch_blocks(blocks: &[BatchBlock]) -> String {
+pub fn render_batch_blocks(blocks: &[BatchBlock], self_id: i64) -> String {
     if blocks.is_empty() {
         return String::new();
     }
@@ -263,8 +265,12 @@ pub fn render_batch_blocks(blocks: &[BatchBlock]) -> String {
         let m = &block.message;
         let who = display_who(&m.username, &m.first_name, m.user_id);
         let mut head = format!("[{}] {}:", m.message_id, who);
-        if m.to_me {
+        if self_id != 0 && m.user_id == Some(self_id) {
+            head.push_str(" [это написал ты сам]");
+        } else if m.to_me {
             head.push_str(" [к тебе]");
+        } else {
+            head.push_str(" [в чате]");
         }
         match &block.edge {
             ReplyEdge::None => {}
@@ -317,7 +323,7 @@ pub fn render_batch(batch: &[BatchMsg], parents: &HashMap<i64, ReplyParent>) -> 
             edge: edge_for(m, parents),
         })
         .collect();
-    render_batch_blocks(&blocks)
+    render_batch_blocks(&blocks, 0)
 }
 
 /// The single entry point for a fresh batch, a rebuild and a recovery: pure
@@ -472,14 +478,14 @@ mod tests {
         let batch = vec![msg(103, "fresh", None)];
         let with = render_document(&assemble(snapshot_sync(&con, &state, &batch)));
         assert!(
-            with.contains("[100] @u:") && with.contains("[102] @u:"),
+            with.contains("[100] @u [фон чата]:") && with.contains("[102] @u [фон чата]:"),
             "history missing from the windowed document: {with}"
         );
         let without = render_document(&assemble(
             snapshot_sync(&con, &state, &batch).with_window(false),
         ));
         assert!(
-            !without.contains("[100] @u:") && !without.contains("[102] @u:"),
+            !without.contains("[100] @u [фон чата]:") && !without.contains("[102] @u [фон чата]:"),
             "history leaked into a turn that already has it: {without}"
         );
         assert!(
@@ -586,6 +592,33 @@ mod tests {
     }
 
     #[test]
+    fn own_and_ambient_markers_are_explicit() {
+        let mut own = msg(1, "мой пост", None);
+        own.user_id = Some(42);
+        let mut other = msg(2, "чужое", None);
+        other.user_id = Some(7);
+        let blocks = vec![
+            BatchBlock {
+                message: own,
+                edge: ReplyEdge::None,
+            },
+            BatchBlock {
+                message: other,
+                edge: ReplyEdge::None,
+            },
+        ];
+        let rendered = render_batch_blocks(&blocks, 42);
+        assert!(
+            rendered.contains("[1] @u: [это написал ты сам] мой пост"),
+            "own post is not marked: {rendered}"
+        );
+        assert!(
+            rendered.contains("[2] @u: [в чате] чужое"),
+            "ambient message is not marked: {rendered}"
+        );
+    }
+
+    #[test]
     fn absent_parent_is_explicit_and_present_parent_is_one_hop() {
         let state = temp_state("edge");
         std::env::set_var("CHATBOT_CHAT_ID", "-100");
@@ -597,7 +630,7 @@ mod tests {
             message: absent[0].clone(),
             edge: edge_for(&absent[0], &HashMap::new()),
         }];
-        let rendered = render_batch_blocks(&blocks);
+        let rendered = render_batch_blocks(&blocks, 0);
         assert!(
             rendered.contains("(ответ на [899]: сообщения нет в базе)"),
             "missing parent state not explicit: {rendered}"
