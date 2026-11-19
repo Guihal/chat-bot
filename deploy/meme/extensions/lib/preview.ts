@@ -119,11 +119,16 @@ export function parsePreview(html: string, username: string, base = previewBase(
 		let media: PreviewMedia | undefined;
 		const videoSrc = /<video[^>]*\ssrc="([^"]+)"/.exec(block)?.[1];
 		const poster = /<video[^>]*\sposter="([^"]+)"/.exec(block)?.[1];
+		const thumbStyle =
+			/<i[^>]*class="[^"]*tgme_widget_message_video_thumb[^"]*"[^>]*style="([^"]*)"/i.exec(block)?.[1] ||
+			/<i[^>]*style="([^"]*)"[^>]*class="[^"]*tgme_widget_message_video_thumb[^"]*"/i.exec(block)?.[1] ||
+			"";
+		const thumbUrl = /background-image:\s*url\((['"]?)([^'")]+)\1\)/i.exec(thumbStyle)?.[2];
 		if (videoSrc) {
 			const url = resolveMedia(videoSrc, base);
 			if (url) {
 				const kind = /\.gif($|\?)/i.test(url) ? "animation" : "video";
-				const thumbnail = resolveMedia(poster, base);
+				const thumbnail = resolveMedia(poster || thumbUrl, base);
 				media = { kind, url, ...(thumbnail ? { thumbnail } : {}) };
 			}
 		} else {

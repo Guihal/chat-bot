@@ -16,7 +16,7 @@ PROMPT=$(cat "$HERE/discovery-prompt.md")
 
 set +e
 meme_run "${MEME_DISCOVERY_TIMEOUT:-300}" \
-  env -u CHATBOT_TOKEN_FILE -u TG_BOT_TOKEN -u TELEGRAM_BOT_TOKEN -u MEME_BOT_TOKEN_FILE -u TG_NOTIFY_ENV \
+  env -u CHATBOT_TOKEN_FILE -u TG_BOT_TOKEN -u TELEGRAM_BOT_TOKEN -u MEME_BOT_TOKEN_FILE \
   "$OMO_BIN" -p "$PROMPT" \
   --provider opencode-go \
   --model hy4-flash-free \

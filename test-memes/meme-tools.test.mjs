@@ -46,6 +46,11 @@ beforeAll(async () => {
 				res.end(fs.readFileSync(path.join(fixtures, "preview-catmodernews.html")));
 				return;
 			}
+			if (url === "/s/catmodernewsvideo") {
+				res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+				res.end(fs.readFileSync(path.join(fixtures, "preview-catmodernews-video.html")));
+				return;
+			}
 			if (url === "/s/second") {
 				res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
 				res.end(fs.readFileSync(path.join(fixtures, "preview-second.html")));
@@ -138,6 +143,22 @@ test("preview parser extracts posts and image content", async () => {
 	expect(images.length).toBeGreaterThanOrEqual(1);
 	expect(images[0].type).toBe("image");
 	expect(images[0].mimeType).toBe("image/png");
+});
+
+test("video thumbnail falls back to live video_thumb markup", async () => {
+	const posts = await preview.fetchPreview("catmodernewsvideo");
+	expect(posts.length).toBe(1);
+	expect(posts[0].media?.kind).toBe("video");
+	expect(posts[0].media?.thumbnail || "").toContain("video-frame-42.png");
+});
+
+test("discovery tool errors raise a once-per-day alert", async () => {
+	const tools = toolsOf(discoveryModule.default);
+	const marker = path.join(common.ALERTS_DIR, `${new Date().toISOString().slice(0, 10)}-discovery-tool`);
+	fs.rmSync(marker, { force: true });
+	const result = await tools.get("meme_preview_fetch").execute("alert", { source: "not_allowed" });
+	expect(result.isError).toBe(true);
+	expect(fs.existsSync(marker)).toBe(true);
 });
 
 test("discovery tools have no send capability and save once", async () => {

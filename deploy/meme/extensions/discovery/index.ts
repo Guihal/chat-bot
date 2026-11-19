@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@code-yeongyu/senpi";
 import {
+	alertOnce,
 	assertAllowedMediaUrl,
 	downloadBounded,
 	mediaLimit,
@@ -88,7 +89,9 @@ export default function memeDiscovery(pi: ExtensionAPI): void {
 					],
 				};
 			} catch (error) {
-				return fail((error as Error).message);
+				const message = (error as Error).message;
+				alertOnce("discovery-tool", `preview: ${message}`);
+				return fail(message);
 			}
 		},
 	});
@@ -155,7 +158,9 @@ export default function memeDiscovery(pi: ExtensionAPI): void {
 				});
 				return text(result);
 			} catch (error) {
-				return fail((error as Error).message);
+				const message = (error as Error).message;
+				alertOnce("discovery-tool", `save: ${message}`);
+				return fail(message);
 			}
 		},
 	});
