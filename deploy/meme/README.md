@@ -11,8 +11,8 @@ The model does the work through its tools. The shell scripts only preflight, loc
 
 | Job | Interval | Timeout | Seeded phase |
 |---|---|---|---|
-| `meme-discovery` | 60 min | 300 s | first run near `:47Z` |
-| `meme-publisher` | 120 min | 240 s | first run near `:07Z` |
+| `meme-discovery` | 60 min | 600 s | first run near `:47Z` |
+| `meme-publisher` | 120 min | 420 s | first run near `:07Z` |
 
 The installer seeds each job state's `last_run` once. omo-cron computes the next run as `last_run + minutes*60`, so later wall-clock drift is possible while the hourly / two-hourly spacing holds.
 

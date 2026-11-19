@@ -16,7 +16,7 @@ import os
 import sys
 
 root = sys.argv[1]
-expected = {"discovery": (60, 300, 47), "publisher": (120, 240, 7)}
+expected = {"discovery": (60, 600, 47), "publisher": (120, 420, 7)}
 for role, (minutes, timeout, minute) in expected.items():
     job = json.load(open(os.path.join(root, "jobs", f"meme-{role}.json"), encoding="utf-8"))
     assert job["schedule"] == {"type": "interval", "minutes": minutes}, job["schedule"]
