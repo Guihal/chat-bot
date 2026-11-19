@@ -187,6 +187,10 @@ function startServer() {
 
 async function main() {
 	for (const role of ["discovery", "publisher"]) prepareProfile(role);
+	if (process.env.CHATBOT_STAND_CREDS_DELETE === "1") {
+		fs.rmSync(creds, { recursive: true, force: true });
+		assert(!fs.existsSync(creds), "stand credentials directory still exists");
+	}
 	fs.mkdirSync(dataDir, { recursive: true });
 	fs.writeFileSync(tokenPath, "123456:STANDTOKEN\n", { mode: 0o600 });
 	fs.chmodSync(tokenPath, 0o600);
@@ -267,9 +271,16 @@ async function main() {
 	  );
 	}
 
-	console.log(`DISCOVERY_WHY_FUNNY ${candidate.why_funny}`);
-	console.log(`PUBLISHED_ID ${candidate.id}`);
-	console.log(`MULTIPART_HASH ${state.lastMultipart.length}`);
+	const summary = {
+		whyFunny: candidate.why_funny,
+		publishedId: candidate.id,
+		multipartLength: state.lastMultipart.length,
+	};
+	cleanup();
+	assert(!fs.existsSync(root), "stand temp directory still exists");
+	console.log(`DISCOVERY_WHY_FUNNY ${summary.whyFunny}`);
+	console.log(`PUBLISHED_ID ${summary.publishedId}`);
+	console.log(`MULTIPART_HASH ${summary.multipartLength}`);
 	console.log("STAND_MEME_DISCOVERY_OK");
 	console.log("STAND_MEME_PUBLISHER_OK");
 	console.log("STAND_MEME_DEDUPE_OK");
