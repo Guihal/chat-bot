@@ -10,6 +10,10 @@ const fixtures = path.join(import.meta.dir, "fixtures");
 const tokenPath = path.join(root, "token");
 fs.writeFileSync(tokenPath, "123456:TESTTOKEN\n", { mode: 0o600 });
 fs.chmodSync(tokenPath, 0o600);
+const notifyPath = path.join(root, "tg-notify");
+fs.writeFileSync(notifyPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+fs.chmodSync(notifyPath, 0o755);
+process.env.MEME_TG_NOTIFY_BIN = notifyPath;
 fs.writeFileSync(
 	path.join(root, "meme-sources.md"),
 	"# sources\nhttps://t.me/catmodernews weight=high\nhttps://t.me/second\n",
@@ -354,6 +358,22 @@ test("alerts are rate limited once per day and kind", () => {
 	const kind = `negative-${Date.now()}`;
 	expect(common.alertOnce(kind, "first" )).toBe(true);
 	expect(common.alertOnce(kind, "second" )).toBe(false);
+});
+
+test("alert marker is written only after tg-notify succeeds", () => {
+	const failing = path.join(root, "tg-notify-fail");
+	fs.writeFileSync(failing, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+	fs.chmodSync(failing, 0o755);
+	const previous = process.env.MEME_TG_NOTIFY_BIN;
+	process.env.MEME_TG_NOTIFY_BIN = failing;
+	const kind = `failed-${Date.now()}`;
+	try {
+		expect(common.alertOnce(kind, "must not mark" )).toBe(false);
+		const marker = path.join(common.ALERTS_DIR, `${new Date().toISOString().slice(0, 10)}-${kind}`);
+		expect(fs.existsSync(marker)).toBe(false);
+	} finally {
+		process.env.MEME_TG_NOTIFY_BIN = previous || notifyPath;
+	}
 });
 
 test("save fails closed above the storage hard limit", () => {

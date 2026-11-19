@@ -69,4 +69,26 @@ for runner in discovery-run.sh publisher-run.sh; do
   printf 'PASS %s honors caller kill switch over meme.env\n' "$runner"
 done
 
+NOTIFY_OK="$ROOT/bin/tg-notify-ok"
+NOTIFY_FAIL="$ROOT/bin/tg-notify-fail"
+printf '#!/bin/sh\nexit 0\n' >"$NOTIFY_OK"
+printf '#!/bin/sh\nexit 1\n' >"$NOTIFY_FAIL"
+chmod +x "$NOTIFY_OK" "$NOTIFY_FAIL"
+
+ALERT_KIND="alert-$$"
+MEME_TG_NOTIFY_BIN="$NOTIFY_OK" sh -c '. "$COMMON_DIR/common.sh"; meme_alert_once "$1" "ok"' sh "$ALERT_KIND"
+if [ ! -e "$MEME_ROOT/alerts/$(date -u +%F)-$ALERT_KIND" ]; then
+  printf 'FAIL successful alert did not write its marker\n' >&2
+  exit 1
+fi
+printf 'PASS successful alert writes marker\n'
+
+ALERT_FAIL_KIND="alert-fail-$$"
+MEME_TG_NOTIFY_BIN="$NOTIFY_FAIL" sh -c '. "$COMMON_DIR/common.sh"; meme_alert_once "$1" "fail"' sh "$ALERT_FAIL_KIND"
+if [ -e "$MEME_ROOT/alerts/$(date -u +%F)-$ALERT_FAIL_KIND" ]; then
+  printf 'FAIL failed alert wrote its marker\n' >&2
+  exit 1
+fi
+printf 'PASS failed alert leaves no marker\n'
+
 printf 'COMMON_TESTS_OK\n'

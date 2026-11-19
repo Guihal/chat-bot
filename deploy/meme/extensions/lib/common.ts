@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import type { Candidate, LedgerRecord, MediaKind } from "./types.js";
 
 export const TARGET_CHAT_ID = -1004421941006;
@@ -223,14 +223,14 @@ export function alertOnce(kind: string, message: string): boolean {
 		const day = new Date().toISOString().slice(0, 10);
 		const marker = path.join(ALERTS_DIR, `${day}-${kind}`);
 		if (fs.existsSync(marker)) return false;
-		fs.writeFileSync(marker, `${nowIso()} ${message}\n`, { mode: 0o600 });
-		const child = spawn("/root/bin/tg-notify", [message], {
+		const bin = env("MEME_TG_NOTIFY_BIN", "/root/bin/tg-notify");
+		const result = spawnSync(bin, [message], {
 			env: process.env,
 			stdio: "ignore",
-			detached: true,
+			timeout: 5000,
 		});
-		child.on("error", () => {});
-		child.unref();
+		if (result.error || result.status !== 0) return false;
+		fs.writeFileSync(marker, `${nowIso()} ${message}\n`, { mode: 0o600 });
 		return true;
 	} catch {
 		return false;

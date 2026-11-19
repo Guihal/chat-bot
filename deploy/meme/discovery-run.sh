@@ -7,8 +7,6 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
 meme_preflight discovery
 
-unset CHATBOT_TOKEN_FILE TG_BOT_TOKEN TELEGRAM_BOT_TOKEN TG_NOTIFY_ENV MEME_BOT_TOKEN_FILE
-
 PROFILE=${MEME_DISCOVERY_PROFILE:-/opt/omo-chat/state/meme-discovery-agent}
 export OMO_CODING_AGENT_DIR="$PROFILE"
 export MEME_DATA_DIR="$MEME_ROOT"
@@ -18,6 +16,7 @@ PROMPT=$(cat "$HERE/discovery-prompt.md")
 
 set +e
 meme_run "${MEME_DISCOVERY_TIMEOUT:-300}" \
+  env -u CHATBOT_TOKEN_FILE -u TG_BOT_TOKEN -u TELEGRAM_BOT_TOKEN -u MEME_BOT_TOKEN_FILE -u TG_NOTIFY_ENV \
   "$OMO_BIN" -p "$PROMPT" \
   --provider opencode-go \
   --model hy4-flash-free \

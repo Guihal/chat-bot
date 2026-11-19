@@ -34,10 +34,16 @@ meme_alert_once() {
   day=$(date -u +%Y-%m-%d)
   marker="$MEME_ROOT/alerts/$day-$kind"
   [ -e "$marker" ] && return 0
-  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >"$marker"
-  if [ -x /root/bin/tg-notify ]; then
-    /root/bin/tg-notify "$*" >/dev/null 2>&1 || true
+  notify=${MEME_TG_NOTIFY_BIN:-/root/bin/tg-notify}
+  if [ ! -x "$notify" ]; then
+    meme_log "alert not sent: $notify is not executable"
+    return 0
   fi
+  if ! "$notify" "$*" >/dev/null 2>&1; then
+    meme_log "alert not sent: $notify failed"
+    return 0
+  fi
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >"$marker"
 }
 
 meme_mem_available_mib() {
