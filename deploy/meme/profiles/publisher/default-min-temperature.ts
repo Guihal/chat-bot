@@ -69,7 +69,7 @@ import type {
   ExtensionContext,
 } from "@code-yeongyu/senpi";
 
-import { projectSampling } from "./sampling-payload.ts";
+import { projectSampling } from "./lib/sampling-payload.ts";
 
 type SamplingParams = {
   temperature?: number;

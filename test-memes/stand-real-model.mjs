@@ -74,7 +74,7 @@ function prepareProfile(role) {
 	);
 	copyFile(
 		path.join(source, "profiles", role, "sampling-payload.ts"),
-		path.join(profile, "extensions/sampling-payload.ts"),
+		path.join(profile, "extensions/lib/sampling-payload.ts"),
 	);
 	copyFile(path.join(source, "skills/task/SKILL.md"), path.join(profile, "skills/task/SKILL.md"));
 	return profile;

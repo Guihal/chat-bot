@@ -23,7 +23,11 @@ for role in discovery publisher; do
   cp "$HERE/extensions/$role/index.ts" "$profile/extensions/$role/index.ts"
   cp "$HERE/extensions/$role/package.json" "$profile/extensions/$role/package.json"
   cp "$HERE/profiles/$role/default-min-temperature.ts" "$profile/extensions/default-min-temperature.ts"
-  cp "$HERE/profiles/$role/sampling-payload.ts" "$profile/extensions/sampling-payload.ts"
+  # The projection helper is imported by default-min-temperature.ts, not an
+  # extension entry. Keep it under lib/ so the loader does not try to call a
+  # named-only export as a factory; remove the legacy flat copy if present.
+  rm -f "$profile/extensions/sampling-payload.ts"
+  cp "$HERE/profiles/$role/sampling-payload.ts" "$profile/extensions/lib/sampling-payload.ts"
   cp "$HERE/skills/task/SKILL.md" "$profile/skills/task/SKILL.md"
 done
 
